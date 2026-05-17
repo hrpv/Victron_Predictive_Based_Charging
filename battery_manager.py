@@ -145,9 +145,14 @@ def setup_logging(cfg: dict) -> logging.Logger:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
+    # StreamHandler nur wenn NICHT unter Systemd (kein doppeltes Logging).
+    # Systemd setzt INVOCATION_ID; beim manuellen Start fehlt diese Variable.
+    import os
+    if not os.environ.get("INVOCATION_ID"):
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+    logger.propagate = False
     return logger
 
 
