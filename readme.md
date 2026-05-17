@@ -439,6 +439,8 @@ Balkendiagramm: PV-Ertrag vs. Verbrauch pro Stunde, aktuelle Stunde hervorgehobe
 Stündliche Vorschau mit projiziertem SOC-Verlauf, Aktion und geplantem Ladestrom.
 
 ---
+<img width="1648" height="765" alt="image" src="https://github.com/user-attachments/assets/91d0421a-c964-4641-9af8-ac2c41ecd2ee" />
+
 
 ## 10. Betrieb & Monitoring
 
