@@ -1,0 +1,9 @@
+# Solar Batterie Manager - Abhängigkeiten
+# Installation: pip install -r requirements.txt
+
+pymodbus>=3.6.0         # Modbus TCP Client für Cerbo GX (kein MQTT nötig)
+requests>=2.31.0        # HTTP für Wetterprognose API + evcc REST API
+pyyaml>=6.0.1           # Konfigurationsdatei parsen
+flask>=3.0.0            # Web Dashboard (optional)
+
+# Kein paho-mqtt nötig – Kommunikation läuft komplett über Modbus TCP

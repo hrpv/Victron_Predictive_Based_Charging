@@ -1,0 +1,33 @@
+# /etc/systemd/system/solar-battery.service
+# Autostart des Solar Batterie Managers auf dem Raspberry Pi
+#
+# Installation:
+#   sudo cp solar-battery.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable solar-battery
+#   sudo systemctl start solar-battery
+#
+# Status prüfen:
+#   sudo systemctl status solar-battery
+#   journalctl -u solar-battery -f
+
+[Unit]
+Description=Solar Batterie Manager (Prognosebasiertes Laden)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/solar_battery
+ExecStart=/home/pi/solar_battery/venv/bin/python3 /home/pi/solar_battery/battery_manager.py /home/pi/solar_battery/config.yaml
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/pi/solar_battery/battery_manager.log
+StandardError=append:/home/pi/solar_battery/battery_manager.log
+
+# Umgebungsvariablen
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
