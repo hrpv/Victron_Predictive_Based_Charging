@@ -794,6 +794,16 @@ class ChargeController:
         self._ramp_current: float = 0.0
         self._state_file = Path(cfg["dashboard"].get("state_file", "state.json"))
         self._load_persistent()
+        # Hysterese: Mindestdauer einer Ladeentscheidung
+        self._last_decision_ts: float = 0.0
+        self._last_decision_result: tuple[float, str, str] = (0.0, "idle", "Initialisierung")
+        self._min_charge_duration_s: float = self.cc.get("min_charge_duration_minutes", 10) * 60
+        # Letzter geschriebener Wert (nach Rampe) fuer Schreib-Hysterese
+        self._last_written_ramped_a: float = 0.0
+        # Hysterese: Mindestdauer einer Ladeentscheidung
+        self._last_decision_ts: float = 0.0
+        self._last_decision_result: tuple[float, str, str] = (0.0, "idle", "Initialisierung")
+        self._min_charge_duration_s: float = self.cc.get("min_charge_duration_minutes", 10) * 60
 
     def _load_persistent(self):
         if not self._state_file.exists():
@@ -1002,12 +1012,42 @@ class ChargeController:
 
     def run_cycle(self):
         """Fuehrt einen Regelzyklus aus."""
-        target_a, mode, reason = self.decide()
+        now = time.monotonic()
+        min_dur = self._min_charge_duration_s
 
+        # Sofort-Entscheidung bei kritischen Zuständen (Sicherheit)
+        force_new = False
+        if self.state.soc <= self.cc.get("emergency_charge_soc", 25):
+            force_new = True
+        if self._needs_full_charge() and self.state.soc < self.bat["max_soc"] - self.cc.get("soc_hysteresis", 2):
+            force_new = True
+
+        # Neue Entscheidung nur wenn Hysterese abgelaufen oder forced
+        if force_new or (now - self._last_decision_ts) >= min_dur:
+            target_a, mode, reason = self.decide()
+            self._last_decision_ts = now
+            self._last_decision_result = (target_a, mode, reason)
+        else:
+            target_a, mode, reason = self._last_decision_result
+            # Reason ergänzen, dass Hysterese aktiv ist
+            if not reason.endswith("(Hysterese)"):
+                reason = reason + " (Hysterese)"
+
+        # Schreiben nur wenn Hysterese abgelaufen UND sich gerampter Wert geaendert hat
+        write_performed = False
         if target_a >= 0:
-            # Sanft rampen und schreiben
             ramped = self._ramp(target_a)
-            self.victron.set_max_charge_current(ramped)
+            # Schreib-Hysterese: nur bei Ablauf der Entscheidungs-Hysterese
+            # oder wenn der gerampete Wert sich tatsaechlich geaendert hat
+            hysterese_abgelaufen = (now - self._last_decision_ts) < 1.0  # soeben neu entschieden
+            wert_geaendert = abs(ramped - self._last_written_ramped_a) >= 1.0
+            if hysterese_abgelaufen or wert_geaendert:
+                if self.victron.set_max_charge_current(ramped):
+                    self._last_written_ramped_a = ramped
+                    write_performed = True
+            else:
+                # Kein Schreiben: state auf letzten geschriebenen Wert belassen
+                self.state.charge_current_setpoint = self._last_written_ramped_a
         # Bei target_a == -1 (evcc Prioritaet): nichts schreiben
 
         self.state.charge_mode              = mode
@@ -1016,7 +1056,8 @@ class ChargeController:
 
         if self.cfg["logging"].get("log_decisions", True):
             a = self.state.charge_current_setpoint
-            self.logger.info(f"[{mode.upper()}] {a:.0f}A | {reason[:120]}")
+            log_suffix = " [KEIN WRITE]" if (target_a >= 0 and not write_performed) else ""
+            self.logger.info(f"[{mode.upper()}] {a:.0f}A | {reason[:120]}{log_suffix}")
 
 
 # ─────────────────────────────────────────────
