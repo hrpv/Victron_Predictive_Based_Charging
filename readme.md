@@ -201,6 +201,9 @@ mbpoll -a 100 -r 2902 -c 1 192.168.178.61
 # MaxChargeCurrent schreiben (Test 10A)
 mbpoll -a 100 -r 2706 -t 4 192.168.178.61 10
 ```
+Register 2705 DVCC MaxChargeCurrent
+
+<img width="467" height="277" alt="image" src="https://github.com/user-attachments/assets/1a35310f-cd22-43b7-8007-3f091916b0e3" />
 
 ---
 
