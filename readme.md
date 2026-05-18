@@ -17,7 +17,7 @@
 10. [Betrieb & Monitoring](#10-betrieb--monitoring)
 11. [Fehlerbehebung](#11-fehlerbehebung)
 12. [Deployment-Optionen](#12-deployment-optionen)
-
+13. [VRM Forecast API](#13-VRM-Forecast-API)
 ---
 
 ## 1. Systemübersicht
@@ -588,37 +588,6 @@ free -h
 top -b -n1 | grep -E "evcc|python"
 ```
 
----
-
-## Anhang: Dateiübersicht
-
-| Datei | Zweck |
-|---|---|
-| `battery_manager.py` | Hauptskript (~1200 Zeilen) |
-| `config.yaml` | Alle Einstellungen |
-| `requirements.txt` | Python-Abhängigkeiten |
-| `install.sh` | Automatisches Installationsskript |
-| `solar-battery.service` | Systemd-Service-Definition |
-| `state.json` | Persistenter Zustand (auto-generiert) |
-| `battery_manager.log` | Laufendes Log (auto-generiert) |
-
-## Anhang: Python-Abhängigkeiten
-
-| Paket | Version | Zweck |
-|---|---|---|
-| pymodbus | ≥ 3.6 | Modbus TCP Client |
-| flask | ≥ 3.0 | Web-Dashboard |
-| requests | ≥ 2.31 | HTTP für Prognose-API + evcc |
-| pyyaml | ≥ 6.0 | config.yaml parsen |
-
-## Anhang: Victron Modbus-Dokumentation
-
-Offizielle Register-Tabelle:
-https://www.victronenergy.com/upload/documents/CCGX-Modbus-TCP-register-list-3.71.xlsx
-
----
-
-*Erstellt: Mai 2026 | Getestet mit: Victron Cerbo GX Venus OS, Raspberry Pi OS Bookworm, pymodbus 3.13*
 
 ---
 
@@ -631,7 +600,7 @@ Victron nutzt für die Prognose **Solcast-Satellitendaten** kombiniert mit einem
 Quellen:
 - Victron Blog: https://www.victronenergy.com/blog/2023/07/05/new-vrm-solar-production-forecast-feature/
 - VRM API Docs: https://vrm-api-docs.victronenergy.com/
-- Ähnliches Projekt (Node-RED): https://github.com/hrpv/Victron_Predictive_Based_Charging
+- Ähnliches Projekt (Node-RED): https://akkudoktor.net/t/eine-art-netzdienliches-laden-mit-victron-node-red-flow/33885
 
 ### Voraussetzungen
 
@@ -756,3 +725,38 @@ Tagessumme Verbrauch [Wh] ÷ 24h × Nachtstunden (21–6 Uhr = 9h)
 ```
 
 Damit wird `avg_daily_consumption_kwh` in `config.yaml` nur noch als Fallback genutzt, wenn VRM nicht verfügbar ist.
+
+---
+
+## Anhang: Dateiübersicht
+
+| Datei | Zweck |
+|---|---|
+| `battery_manager.py` | Hauptskript (~1200 Zeilen) |
+| `config.yaml` | Alle Einstellungen |
+| `requirements.txt` | Python-Abhängigkeiten |
+| `install.sh` | Automatisches Installationsskript |
+| `solar-battery.service` | Systemd-Service-Definition |
+| `state.json` | Persistenter Zustand (auto-generiert) |
+| `battery_manager.log` | Laufendes Log (auto-generiert) |
+
+## Anhang: Python-Abhängigkeiten
+
+| Paket | Version | Zweck |
+|---|---|---|
+| pymodbus | ≥ 3.6 | Modbus TCP Client |
+| flask | ≥ 3.0 | Web-Dashboard |
+| requests | ≥ 2.31 | HTTP für Prognose-API + evcc |
+| pyyaml | ≥ 6.0 | config.yaml parsen |
+
+## Anhang: Victron Modbus-Dokumentation
+
+Offizielle Register-Tabelle:
+https://www.victronenergy.com/upload/documents/CCGX-Modbus-TCP-register-list-3.71.xlsx
+
+---
+
+*Erstellt: Mai 2026 | Getestet mit: Victron Cerbo GX Venus OS, Raspberry Pi OS Bookworm, pymodbus 3.13*
+
+---
+
