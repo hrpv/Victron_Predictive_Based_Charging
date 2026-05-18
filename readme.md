@@ -439,8 +439,6 @@ Balkendiagramm: PV-Ertrag vs. Verbrauch pro Stunde, aktuelle Stunde hervorgehobe
 Stündliche Vorschau mit projiziertem SOC-Verlauf, Aktion und geplantem Ladestrom.
 
 ---
-<img width="1648" height="765" alt="image" src="https://github.com/user-attachments/assets/91d0421a-c964-4641-9af8-ac2c41ecd2ee" />
-
 
 ## 10. Betrieb & Monitoring
 
@@ -621,3 +619,140 @@ https://www.victronenergy.com/upload/documents/CCGX-Modbus-TCP-register-list-3.7
 ---
 
 *Erstellt: Mai 2026 | Getestet mit: Victron Cerbo GX Venus OS, Raspberry Pi OS Bookworm, pymodbus 3.13*
+
+---
+
+## 13. VRM Forecast API
+
+### Hintergrund
+
+Victron nutzt für die Prognose **Solcast-Satellitendaten** kombiniert mit einem eigenen Machine-Learning-Modell, das auf der historischen Produktions- und Verbrauchshistorie der eigenen Anlage trainiert wurde. Das Ergebnis ist deutlich genauer als generische Wetterdaten.
+
+Quellen:
+- Victron Blog: https://www.victronenergy.com/blog/2023/07/05/new-vrm-solar-production-forecast-feature/
+- VRM API Docs: https://vrm-api-docs.victronenergy.com/
+- Ähnliches Projekt (Node-RED): https://github.com/hrpv/Victron_Predictive_Based_Charging
+
+### Voraussetzungen
+
+| Bedingung | Details |
+|---|---|
+| VRM-Registrierung | Anlage muss in VRM registriert sein |
+| Mindest-Historie | mind. 30 Tage Ertragsdaten in VRM |
+| Standort gesetzt | GPS-Koordinaten in VRM hinterlegt |
+| AC-gekoppelter PV-WR | wird vollständig unterstützt |
+
+### Einrichtung
+
+**1. Access Token erstellen**
+```
+https://vrm.victronenergy.com/access-tokens
+→ "Add Token" → Name: battery_manager → kein Ablaufdatum → Create
+→ Token sofort kopieren (wird nur einmal angezeigt!)
+```
+
+**2. Installation ID ermitteln**
+```
+VRM Portal → Einstellungen → Allgemein
+→ "VRM-Installations-ID" (z.B. 318602)
+```
+
+**3. config.yaml**
+```yaml
+vrm:
+  enabled: true
+  access_token: "dein-token"   # geheim halten, nicht in Git!
+  installation_id: "318602"
+  timeout_seconds: 10
+```
+
+### API-Endpunkt
+
+```
+GET https://vrmapi.victronenergy.com/v2/installations/{id}/stats
+    ?type=forecast
+    &start={unix_timestamp_jetzt - 60s}
+    &end={unix_timestamp_sonnenuntergang}
+    &interval=hours
+
+Header: x-authorization: Token {access_token}
+```
+
+### API-Antwort
+
+```json
+{
+  "success": true,
+  "records": {
+    "solar_yield_forecast": [
+      [1690675200000, 870.39],   // [unix_ms, Wh]
+      [1690678800000, 2540.12],
+      ...
+    ],
+    "vrm_consumption_fc": [
+      [1690675200000, 320.5],
+      ...
+    ]
+  },
+  "totals": {
+    "solar_yield_forecast": 26249.63,   // Wh gesamt
+    "vrm_consumption_fc":   14065.60
+  }
+}
+```
+
+Wichtige Details:
+- Zeitstempel sind **Unix-Millisekunden** (÷ 1000 für Python `datetime.fromtimestamp()`)
+- Werte sind **Wh pro Stunde** (÷ 1000 → kWh)
+- Abfrage von `jetzt − 60s` bis Sonnenuntergang liefert den **Restwert heute**
+- Verbrauchsprognose (`vrm_consumption_fc`) basiert auf historischem Verbrauchsmuster
+- Solar-Prognose für AC-gekoppelten PV-Wechselrichter: Feld `solar_yield_forecast` (Summe aller Quellen)
+
+### Rollierende Tagesprognose
+
+Die Strategie aus der Community (bewährt, Genauigkeit ±1–2 kWh):
+
+```python
+# Abfrage: (jetzt - 60s) bis Sonnenuntergang
+start = int(time.time()) - 60
+end   = heute_21_uhr_unix
+
+# Ergebnis = verbleibende PV für heute
+# Gesamtprognose = bereits_erzeugt_heute + verbleibend
+```
+
+Im battery_manager ist das in `VrmForecastManager.fetch()` implementiert.
+
+### Fallback-Kette
+
+```
+VRM API verfügbar?
+  JA  → VRM-Prognose verwenden (beste Qualität)
+  NEIN → Solcast (falls konfiguriert)
+       → Open-Meteo (immer verfügbar, kein Key)
+       → Dummy-Profil (Gauss-Kurve als Notfall)
+```
+
+Dashboard zeigt die aktive Quelle:
+- **VRM ★** – VRM API aktiv
+- **Solcast** – Solcast API aktiv
+- **Open-Meteo** – generische Wetterprognose
+- **Dummy ⚠️** – kein Internet, Notfall-Profil
+
+### Genauigkeit & Einschränkungen
+
+- Prognose ist tagesgenau für **heute** (rollierend)
+- Morgen-Prognose (next-day): in VRM-Portal sichtbar, aber API liefert nur 24–48h
+- Bei **vollständig geladenem Akku** kann VRM die Erzeugung unterschätzen (Feed-in beschränkt den Ertrag)
+- Neue Anlagen: bis zu 48h warten bis Prognose verfügbar ist
+- Token hat vollen VRM-Zugriff → **niemals in Git einchecken**
+
+### Verbrauchsprognose
+
+`vrm_consumption_fc` ist besonders nützlich für die Nacht-Schätzung:
+```
+Tagessumme Verbrauch [Wh] ÷ 24h × Nachtstunden (21–6 Uhr = 9h)
+→ Prognose nächtlicher Verbrauch
+```
+
+Damit wird `avg_daily_consumption_kwh` in `config.yaml` nur noch als Fallback genutzt, wenn VRM nicht verfügbar ist.

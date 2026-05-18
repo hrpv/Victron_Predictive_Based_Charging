@@ -57,7 +57,15 @@ location:
   altitude_m: 300
   timezone: "Europe/Berlin"
 
+
 # --- Wetterprognose API ---
+# --- Victron VRM API Prognose ---
+vrm:
+  enabled: true
+  access_token: "xxx"
+  installation_id: "xxx"
+  timeout_seconds: 10
+
 # Kostenlose Option: Open-Meteo (kein API-Key nötig)
 forecast:
   provider: "open_meteo"         # open_meteo | solcast (kostenpflichtig)

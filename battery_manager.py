@@ -94,6 +94,7 @@ class SystemState:
     target_soc: float = 80.0
     modbus_connected: bool = False
     forecast_updated: str = ""
+    forecast_source: str = ""        # vrm | solcast | open_meteo | dummy
     evcc_active: bool = False               # Auto wird gerade geladen (Info)
     evcc_discharge_locked: bool = False     # evcc hat Reg 2901 erhoeht → kein Entladen
     evcc_mode: str = ""                     # "off"|"now"|"minpv"|"pv"
@@ -451,12 +452,162 @@ class EvccMonitor:
             self.logger.warning(f"evcc REST Fehler: {e}")
 
 
+
+# ─────────────────────────────────────────────
+# VRM API Prognose
+# ─────────────────────────────────────────────
+
+class VrmForecastManager:
+    """
+    Holt PV- und Verbrauchsprognose direkt von der Victron VRM API.
+
+    Vorteile gegenueber Open-Meteo:
+    - Solcast-Satellitendaten + ML-Modell auf deiner Anlagenhistorie
+    - Anlagenspezifisch kalibriert (kennt deine realen Ertragsdaten)
+    - Zusaetzlich: Verbrauchsprognose basierend auf historischem Muster
+    - Rollierende Tagesprognose: Restwert + bereits erzeugte Energie
+
+    Voraussetzungen:
+    - Anlage muss in VRM registriert sein (mind. 30 Tage Daten)
+    - VRM Access Token (VRM Portal → Einstellungen → Integrationen → Access Tokens)
+    - Installation ID (Zahl in der VRM-URL: vrm.victronenergy.com/installation/XXXXX)
+
+    Fallback: bei Fehler wird Open-Meteo verwendet.
+    """
+
+    BASE_URL = "https://vrmapi.victronenergy.com/v2"
+
+    def __init__(self, cfg: dict, logger: logging.Logger):
+        self.cfg    = cfg
+        self.logger = logger
+        vrm = cfg.get("vrm", {})
+        self.enabled      = vrm.get("enabled", False)
+        self.token        = vrm.get("access_token", "")
+        self.install_id   = vrm.get("installation_id", "")
+        self.timeout      = vrm.get("timeout_seconds", 10)
+        self._cache: Optional[list] = None
+        self._cache_ts: float = 0.0
+        self._consumption_night_kwh: float = 0.0
+
+    def _headers(self) -> dict:
+        return {"x-authorization": f"Token {self.token}",
+                "Content-Type": "application/json"}
+
+    def _sundown_unix(self) -> int:
+        """Naherung Sonnenuntergang: 21 Uhr Ortszeit als Unix-Timestamp."""
+        import calendar
+        now = datetime.now()
+        sundown = now.replace(hour=21, minute=0, second=0, microsecond=0)
+        if sundown < now:
+            sundown = sundown + timedelta(days=1)
+        return int(calendar.timegm(sundown.timetuple()))
+
+    def fetch(self, force: bool = False) -> Optional[list]:
+        """
+        Gibt stundliche HourlyForecast-Liste zurueck oder None bei Fehler.
+        Strategie: Abfrage von jetzt bis Sonnenuntergang, Zusammenfuehren
+        mit bereits heute erzeugter Energie aus dem State.
+        """
+        if not self.enabled or not self.token or not self.install_id:
+            return None
+
+        interval_s = self.cfg.get("forecast", {}).get(
+            "update_interval_minutes", 60) * 60
+        if not force and self._cache and (
+                time.monotonic() - self._cache_ts) < interval_s:
+            return self._cache
+
+        try:
+            now_unix = int(time.time()) - 60   # 60s Puffer
+            end_unix = self._sundown_unix()
+            avg_h    = self.cfg["charging"].get(
+                "avg_daily_consumption_kwh", 8.0) / 24
+
+            url = (f"{self.BASE_URL}/installations/{self.install_id}/stats"
+                   f"?type=forecast"
+                   f"&start={now_unix}"
+                   f"&end={end_unix}"
+                   f"&interval=hours")
+
+            resp = requests.get(url, headers=self._headers(),
+                                timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+
+            records = data.get("records", {})
+            # VRM liefert: [[unix_ms, wh], [unix_ms, wh], ...]
+            pv_raw   = records.get("solar_yield_forecast", [])
+            cons_raw = records.get("vrm_consumption_fc",   [])
+
+            if not pv_raw:
+                self.logger.warning("VRM API: keine PV-Prognosedaten")
+                return None
+
+            # Verbrauchsprognose fuer die Nacht berechnen
+            # VRM gibt Tagessumme – wir schätzen den Nacht-Anteil proportional
+            cons_total_wh = data.get("totals", {}).get("vrm_consumption_fc", 0)
+            if cons_total_wh:
+                ns  = self.cfg["charging"].get("night_start_hour", 21)
+                ne  = self.cfg["charging"].get("night_end_hour",   6)
+                night_hours = (24 - ns) + ne
+                self._consumption_night_kwh = (
+                    cons_total_wh / 1000.0 / 24.0 * night_hours)
+            else:
+                self._consumption_night_kwh = 0.0
+
+            # Konsumprognose als Dict {stunde: kwh}
+            cons_by_hour: dict = {}
+            for ts_ms, wh in cons_raw:
+                h = datetime.fromtimestamp(ts_ms / 1000).hour
+                cons_by_hour[h] = wh / 1000.0
+
+            # PV-Prognose in HourlyForecast umwandeln
+            out = []
+            total_pv_kwh = 0.0
+            for ts_ms, wh in pv_raw:
+                h      = datetime.fromtimestamp(ts_ms / 1000).hour
+                pv_kwh = wh / 1000.0
+                c_kwh  = cons_by_hour.get(h, avg_h)
+                out.append(HourlyForecast(
+                    hour=h,
+                    pv_kwh=round(pv_kwh, 3),
+                    consumption_kwh=round(c_kwh, 3),
+                    net_kwh=round(pv_kwh - c_kwh, 3)
+                ))
+                total_pv_kwh += pv_kwh
+
+            if not out:
+                return None
+
+            self._cache    = out
+            self._cache_ts = time.monotonic()
+            self.logger.info(
+                f"VRM-Prognose: {total_pv_kwh:.2f} kWh PV verbleibend heute"
+                + (f", Nachtverbrauch ~{self._consumption_night_kwh:.1f} kWh"
+                   if self._consumption_night_kwh else ""))
+            return out
+
+        except requests.exceptions.HTTPError as e:
+            self.logger.warning(f"VRM API HTTP-Fehler: {e} – Fallback Open-Meteo")
+        except requests.exceptions.ConnectionError:
+            self.logger.warning("VRM API nicht erreichbar – Fallback Open-Meteo")
+        except Exception as e:
+            self.logger.warning(f"VRM API Fehler: {e} – Fallback Open-Meteo")
+        return None
+
+    def night_consumption_kwh(self) -> Optional[float]:
+        """Gibt VRM-Verbrauchsprognose fuer die Nacht zurueck, oder None."""
+        return self._consumption_night_kwh if self._consumption_night_kwh else None
+
 # ─────────────────────────────────────────────
 # PV-Prognose
 # ─────────────────────────────────────────────
 
 class ForecastManager:
-    """Holt stundliche PV-Prognose (Open-Meteo kostenlos oder Solcast)."""
+    """
+    Holt stundliche PV-Prognose.
+    Prioritaet: VRM API (anlagenspezifisch) → Solcast → Open-Meteo → Dummy
+    """
 
     def __init__(self, cfg: dict, logger: logging.Logger):
         self.cfg = cfg
@@ -466,18 +617,29 @@ class ForecastManager:
         self.fc_cfg = cfg["forecast"]
         self._cache: Optional[list] = None
         self._cache_ts: float = 0.0
+        # VRM als primäre Prognose-Quelle
+        self.vrm = VrmForecastManager(cfg, logger)
 
     def get_forecast(self, force: bool = False) -> list:
         interval_s = self.fc_cfg.get("update_interval_minutes", 60) * 60
         if not force and self._cache and (time.monotonic() - self._cache_ts) < interval_s:
             return self._cache
+
+        # 1. VRM API (beste Qualitaet: Solcast + Anlagenhistorie)
+        vrm_fc = self.vrm.fetch(force=force)
+        if vrm_fc:
+            self._cache    = vrm_fc
+            self._cache_ts = time.monotonic()
+            return vrm_fc  # forecast_source wird in main() gesetzt
+
+        # 2. Fallback: Solcast oder Open-Meteo
         try:
             provider = self.fc_cfg.get("provider", "open_meteo")
             if provider == "solcast":
                 fc = self._fetch_solcast()
             else:
                 fc = self._fetch_open_meteo()
-            self._cache = fc
+            self._cache    = fc
             self._cache_ts = time.monotonic()
             self.logger.info(
                 f"Prognose ({provider}): {sum(f.pv_kwh for f in fc):.2f} kWh heute")
@@ -559,6 +721,10 @@ class ForecastManager:
         return sum(f.pv_kwh for f in self.get_forecast())
 
     def night_consumption_kwh(self) -> float:
+        """VRM-Verbrauchsprognose bevorzugt, sonst Durchschnitt."""
+        vrm_val = self.vrm.night_consumption_kwh()
+        if vrm_val:
+            return vrm_val
         ns  = self.cfg["charging"].get("night_start_hour", 21)
         ne  = self.cfg["charging"].get("night_end_hour",   6)
         avg = self.cfg["charging"].get("avg_daily_consumption_kwh", 8.0) / 24
@@ -961,6 +1127,7 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
     <div class="lbl">PV Prognose heute</div>
     <div class="val" id="fcp">-<span class="unt">kWh</span></div>
     <div class="sub" id="fcr">Verbleibend: -</div>
+    <div class="sub" id="fcs" style="color:var(--acc)"></div>
   </div>
   <div class="card">
     <div class="lbl">Nachtverbrauch</div>
@@ -970,7 +1137,13 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
 </div>
 <div class="rea"><div class="rl">Entscheidung</div><div id="rea">Lade...</div></div>
 <div class="sec">
-  <h2>PV &amp; Verbrauch heute (kWh/h)</h2>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+    <h2>PV &amp; Verbrauch heute (kWh/h)</h2>
+    <div style="display:flex;gap:16px;font-size:0.78rem">
+      <span><span style="display:inline-block;width:12px;height:12px;background:var(--acc);border-radius:2px;margin-right:5px;vertical-align:middle"></span>PV-Erzeugung</span>
+      <span><span style="display:inline-block;width:12px;height:12px;background:#ef4444;opacity:0.7;border-radius:2px;margin-right:5px;vertical-align:middle"></span>Verbrauch</span>
+    </div>
+  </div>
   <div class="pan"><div class="chart" id="chart"></div></div>
 </div>
 <div class="sec">
@@ -1030,6 +1203,9 @@ async function refresh(){
     document.getElementById('fcr').textContent=`Verbleibend: ${(d.forecast_pv_remaining_kwh||0).toFixed(1)} kWh`;
     document.getElementById('fcn').innerHTML=`${(d.forecast_consumption_night_kwh||0).toFixed(1)}<span class="unt">kWh</span>`;
     document.getElementById('fct').textContent=`Ziel-SOC: ${(d.target_soc||80).toFixed(0)}%`;
+    const srcMap={'vrm':'VRM ★','solcast':'Solcast','open_meteo':'Open-Meteo','dummy':'Dummy ⚠️','':`Open-Meteo`};
+    document.getElementById('fcs').textContent=srcMap[d.forecast_source||'']||d.forecast_source||'';
+
     document.getElementById('rea').textContent=d.charge_reason||'-';
     const sc2=d.planned_charge_schedule||[],nH=new Date().getHours();
     const mx=Math.max(...sc2.map(s=>Math.max(s.pv_kwh,s.consumption_kwh)),0.1);
@@ -1101,6 +1277,15 @@ def start_dashboard(cfg: dict, state: SystemState, logger: logging.Logger):
 # Hauptprogramm
 # ─────────────────────────────────────────────
 
+def _forecast_source(forecast: "ForecastManager") -> str:
+    """Ermittelt welche Prognose-Quelle zuletzt verwendet wurde."""
+    if forecast.vrm.enabled and forecast.vrm._cache:
+        return "vrm"
+    provider = forecast.fc_cfg.get("provider", "open_meteo")
+    if forecast._cache:
+        return provider
+    return "dummy"
+
 def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
     cfg    = load_config(config_path)
@@ -1121,6 +1306,7 @@ def main():
         fc = forecast.get_forecast(force=True)
         state.forecast_pv_today_kwh = round(sum(f.pv_kwh for f in fc), 2)
         state.forecast_updated      = datetime.now().isoformat()
+        state.forecast_source       = _forecast_source(forecast)
     except Exception as e:
         logger.error(f"Prognose-Fehler beim Start: {e}")
 
