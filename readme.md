@@ -662,7 +662,7 @@ VRM Portal → Einstellungen → Allgemein
 vrm:
   enabled: true
   access_token: "dein-token"   # geheim halten, nicht in Git!
-  installation_id: "318602"
+  installation_id: "deine-id"
   timeout_seconds: 10
 ```
 
