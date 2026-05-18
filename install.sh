@@ -30,3 +30,15 @@ echo "  3. Dashboard: http://$(hostname -I | awk '{print $1}'):5000"
 echo ""
 echo "Logs:   journalctl -u solar-battery -f"
 echo "Status: sudo systemctl status solar-battery"
+
+
+# Installation nach geändertem Service File, mit journal logging statt logfile
+# sudo cp solar-battery.service /etc/systemd/system/
+# sudo systemctl daemon-reload
+# sudo systemctl enable solar-battery
+# sudo systemctl start solar-battery
+
+# # Abfragen
+# sudo systemctl status solar-battery
+# sudo journalctl -u solar-battery -f        # Live-Log
+# sudo journalctl -u solar-battery --since today

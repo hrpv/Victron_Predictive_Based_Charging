@@ -9,7 +9,7 @@
 #
 # Status prüfen:
 #   sudo systemctl status solar-battery
-#   journalctl -u solar-battery -f
+#   sudo journalctl -u solar-battery -f
 
 [Unit]
 Description=Solar Batterie Manager (Prognosebasiertes Laden)
@@ -23,8 +23,9 @@ WorkingDirectory=/home/pi/solar_battery
 ExecStart=/home/pi/solar_battery/venv/bin/python3 /home/pi/solar_battery/battery_manager.py /home/pi/solar_battery/config.yaml
 Restart=on-failure
 RestartSec=30
-StandardOutput=append:/home/pi/solar_battery/battery_manager.log
-StandardError=append:/home/pi/solar_battery/battery_manager.log
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solar-battery
 
 # Umgebungsvariablen
 Environment="PYTHONUNBUFFERED=1"

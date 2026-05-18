@@ -113,7 +113,10 @@ dashboard:
 # --- Logging ---
 logging:
   level: "INFO"                  # DEBUG | INFO | WARNING | ERROR
-  file: "/home/pi/solar_battery/battery_manager.log"
+# option:addditional logfile
+# file: "/home/pi/solar_battery/battery_manager.log"
+# no logfile
+  file:
   max_size_mb: 10
   backup_count: 3
   # Detailliertes Logging der Ladeentscheidungen

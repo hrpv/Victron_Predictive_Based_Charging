@@ -133,7 +133,6 @@ def setup_logging(cfg: dict) -> logging.Logger:
     max_bytes = log_cfg.get("max_size_mb", 10) * 1024 * 1024
     backup = log_cfg.get("backup_count", 3)
 
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("BatteryManager")
     if logger.handlers:
         return logger
@@ -141,18 +140,34 @@ def setup_logging(cfg: dict) -> logging.Logger:
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
 
-    fh = logging.handlers.RotatingFileHandler(
-        log_file, maxBytes=max_bytes, backupCount=backup)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    # StreamHandler nur wenn NICHT unter Systemd (kein doppeltes Logging).
-    # Systemd setzt INVOCATION_ID; beim manuellen Start fehlt diese Variable.
     import os
-    if not os.environ.get("INVOCATION_ID"):
+    is_systemd = bool(os.environ.get("INVOCATION_ID"))
+
+    if is_systemd:
+        # Systemd-Journal: stdout/stderr werden von journalctl erfasst.
+        # FileHandler nur wenn explizit gewuenscht (nicht 'journal' oder leer).
+        if log_file and log_file.lower() not in ("", "null", "/dev/null", "journal"):
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=max_bytes, backupCount=backup)
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+        # StreamHandler fuer journalctl (StandardOutput=journal im Service)
         ch = logging.StreamHandler()
         ch.setFormatter(fmt)
         logger.addHandler(ch)
+    else:
+        # Manueller Start: File + Console
+        if log_file:
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=max_bytes, backupCount=backup)
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+
     logger.propagate = False
     return logger
 
@@ -800,6 +815,8 @@ class ChargeController:
         self._min_charge_duration_s: float = self.cc.get("min_charge_duration_minutes", 10) * 60
         # Letzter geschriebener Wert (nach Rampe) fuer Schreib-Hysterese
         self._last_written_ramped_a: float = 0.0
+        # Persistenter Zustand: nur alle 5 Minuten auf SD-Karte schreiben
+        self._last_persistent_save: float = 0.0
         # Hysterese: Mindestdauer einer Ladeentscheidung
         self._last_decision_ts: float = 0.0
         self._last_decision_result: tuple[float, str, str] = (0.0, "idle", "Initialisierung")
@@ -827,8 +844,12 @@ class ChargeController:
             self._state_file.write_text(json.dumps({
                 "last_full_charge_date":   self.state.last_full_charge_date,
                 "days_since_full_charge":  self.state.days_since_full_charge,
+                "soc":                     self.state.soc,
+                "charge_mode":             self.state.charge_mode,
+                "charge_current_setpoint": self.state.charge_current_setpoint,
                 "timestamp":               datetime.now().isoformat()
             }, indent=2))
+            self._last_persistent_save = time.monotonic()
         except Exception as e:
             self.logger.error(f"Zustand nicht speicherbar: {e}")
 
@@ -1048,11 +1069,15 @@ class ChargeController:
             else:
                 # Kein Schreiben: state auf letzten geschriebenen Wert belassen
                 self.state.charge_current_setpoint = self._last_written_ramped_a
-        # Bei target_a == -1 (evcc Prioritaet): nichts schreiben
+        # target_a ist immer >= 0 (0 = kein Laden, >0 = Ladestrom)
 
         self.state.charge_mode              = mode
         self.state.charge_reason            = reason
         self.state.planned_charge_schedule  = self.build_schedule()
+
+        # Persistenter Zustand alle 2 Stunden speichern (SD-Karte schonen)
+        if time.monotonic() - self._last_persistent_save > 7200:
+            self._save_persistent()
 
         if self.cfg["logging"].get("log_decisions", True):
             a = self.state.charge_current_setpoint
