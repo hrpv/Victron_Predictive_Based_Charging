@@ -509,19 +509,18 @@ class VrmForecastManager:
                 "Content-Type": "application/json"}
 
     def _sundown_unix(self) -> int:
-        """Naherung Sonnenuntergang: 21 Uhr Ortszeit als Unix-Timestamp."""
-        import calendar
+        """Sonnenuntergang heute: 21 Uhr Ortszeit als Unix-Timestamp."""
         now = datetime.now()
         sundown = now.replace(hour=21, minute=0, second=0, microsecond=0)
         if sundown < now:
             sundown = sundown + timedelta(days=1)
-        return int(calendar.timegm(sundown.timetuple()))
+        return int(sundown.timestamp())   # mktime-Aequivalent, Lokalzeit korrekt
 
     def fetch(self, force: bool = False) -> Optional[list]:
         """
         Gibt stundliche HourlyForecast-Liste zurueck oder None bei Fehler.
-        Strategie: Abfrage von jetzt bis Sonnenuntergang, Zusammenfuehren
-        mit bereits heute erzeugter Energie aus dem State.
+        Strategie: Ganzen heutigen Tag abfragen (00:00 bis 23:59),
+        damit alle Stunden verfuegbar sind und Gesamttag korrekt summiert wird.
         """
         if not self.enabled or not self.token or not self.install_id:
             return None
@@ -533,14 +532,20 @@ class VrmForecastManager:
             return self._cache
 
         try:
-            now_unix = int(time.time()) - 60   # 60s Puffer
-            end_unix = self._sundown_unix()
-            avg_h    = self.cfg["charging"].get(
+            import calendar
+            now   = datetime.now()
+            # Start: Mitternacht heute (Lokalzeit → UTC)
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            # End: 23:59 heute
+            end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
+            start_unix = int(calendar.timegm(start.timetuple()))
+            end_unix   = int(calendar.timegm(end.timetuple()))
+            avg_h = self.cfg["charging"].get(
                 "avg_daily_consumption_kwh", 8.0) / 24
 
             url = (f"{self.BASE_URL}/installations/{self.install_id}/stats"
                    f"?type=forecast"
-                   f"&start={now_unix}"
+                   f"&start={start_unix}"
                    f"&end={end_unix}"
                    f"&interval=hours")
 
@@ -572,16 +577,28 @@ class VrmForecastManager:
 
             # Konsumprognose als Dict {stunde: kwh}
             cons_by_hour: dict = {}
-            for ts_ms, wh in cons_raw:
-                h = datetime.fromtimestamp(ts_ms / 1000).hour
-                cons_by_hour[h] = wh / 1000.0
+            for entry in cons_raw:
+                ts_raw, wh = entry[0], entry[1]
+                if wh is None:
+                    continue
+                ts_sec = ts_raw / 1000 if ts_raw > 1e10 else ts_raw
+                h = datetime.fromtimestamp(ts_sec).hour
+                cons_by_hour[h] = float(wh) / 1000.0
 
             # PV-Prognose in HourlyForecast umwandeln
+            # VRM liefert [timestamp_sekunden, Wh_pro_Stunde]
+            # Timestamp-Erkennung: >1e10 = Millisekunden, sonst Sekunden
             out = []
             total_pv_kwh = 0.0
-            for ts_ms, wh in pv_raw:
-                h      = datetime.fromtimestamp(ts_ms / 1000).hour
-                pv_kwh = wh / 1000.0
+            for entry in pv_raw:
+                ts_raw, wh = entry[0], entry[1]
+                if wh is None:
+                    continue
+                # Timestamp normalisieren
+                ts_sec = ts_raw / 1000 if ts_raw > 1e10 else ts_raw
+                h      = datetime.fromtimestamp(ts_sec).hour
+                # Einheit: VRM liefert Wh → kWh
+                pv_kwh = float(wh) / 1000.0
                 c_kwh  = cons_by_hour.get(h, avg_h)
                 out.append(HourlyForecast(
                     hour=h,
@@ -989,18 +1006,31 @@ class ChargeController:
         return self._ramp_current
 
     def build_schedule(self) -> list:
-        """Stundlicher Ladeplan fuer das Dashboard."""
+        """
+        Stundlicher Ladeplan – simuliert dieselbe Entscheidungslogik wie decide(),
+        damit Ladeplan und tatsaechliches Verhalten uebereinstimmen.
+        """
         fc      = self.forecast.get_forecast()
         now_h   = datetime.now().hour
         soc_sim = self.state.soc
         cap     = self.bat["capacity_kwh"]
         min_soc = self.bat["min_soc"]
         max_soc = self.bat["max_soc"]
-        target  = self.state.target_soc
         nom_v   = self.bat.get("voltage_nominal", 48.0)
+        max_a   = self.bat["max_charge_current"]
+        target_n = self.bat["target_soc_normal"]
+        hyst    = self.cc.get("soc_hysteresis", 2)
         ns      = self.cc.get("night_start_hour", 21)
         ne      = self.cc.get("night_end_hour",   6)
+        morn_s  = self.cc.get("morning_delay_start_hour", 6)
+        morn_e  = self.cc.get("morning_delay_end_hour", 10)
         result  = []
+
+        # Verbleibende PV ab jeder simulierten Stunde berechnen
+        def pv_remaining_from(hour: int) -> float:
+            return sum(f.pv_kwh for f in fc if f.hour >= hour)
+
+        needs_full = self._needs_full_charge()
 
         for f in fc:
             h         = f.hour
@@ -1009,15 +1039,57 @@ class ChargeController:
             night     = h >= ns or h < ne
 
             if night:
+                # Nacht: Akku entlaedt sich
                 action  = "discharging"
                 soc_sim = max(min_soc, soc_sim - (f.consumption_kwh / cap) * 100)
-            elif f.pv_kwh > f.consumption_kwh and soc_sim < target:
-                action    = "charging"
-                current_a = int(min((f.net_kwh * 1000 / nom_v), self.bat["max_charge_current"]))
-                soc_sim   = min(max_soc, soc_sim + (f.net_kwh / cap) * 100)
+
+            elif needs_full and soc_sim < max_soc - hyst:
+                # Vollladung faellig
+                action    = "full_charge"
+                current_a = max_a
+                soc_sim   = min(max_soc, soc_sim + (f.pv_kwh / cap) * 100)
+
             else:
-                deficit = max(0.0, f.consumption_kwh - f.pv_kwh)
-                soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+                # Dynamisches Ziel fuer diese Stunde simulieren
+                pv_rem   = pv_remaining_from(h)
+                proj_eve = min(max_soc, soc_sim + (pv_rem / cap) * 100)
+                if proj_eve >= target_n:
+                    dyn_target = target_n
+                else:
+                    shortfall  = target_n - proj_eve
+                    dyn_target = min(target_n + shortfall * 0.5, max_soc)
+
+                if soc_sim >= dyn_target - hyst:
+                    # Ziel erreicht
+                    action  = "idle"
+                    deficit = max(0.0, f.consumption_kwh - f.pv_kwh)
+                    soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+
+                elif morn_s <= h < morn_e:
+                    # Morgen-Verzoegerungsfenster: dieselbe Logik wie decide()
+                    if proj_eve >= target_n:
+                        action  = "idle"   # PV reicht -> warten
+                    elif soc_sim > target_n - 15:
+                        action  = "idle"   # SOC noch ok -> warten
+                    else:
+                        action    = "trickle"
+                        current_a = self.bat.get("trickle_current", 5)
+                        soc_sim   = min(max_soc, soc_sim + (current_a * nom_v / 1000 / cap) * 100)
+
+                    deficit = max(0.0, f.consumption_kwh - f.pv_kwh)
+                    if action == "idle":
+                        soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+
+                elif f.net_kwh > 0:
+                    # PV-Ueberschuss -> laden
+                    action    = "charging"
+                    current_a = int(min(f.net_kwh * 1000 / nom_v, max_a))
+                    soc_sim   = min(max_soc, soc_sim + (f.net_kwh / cap) * 100)
+
+                else:
+                    # Kein Ueberschuss
+                    deficit = max(0.0, f.consumption_kwh - f.pv_kwh)
+                    soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
 
             result.append({
                 "hour":             h,
@@ -1126,13 +1198,8 @@ body{background:var(--bg);color:var(--txt);font-family:system-ui,sans-serif;min-
 .sec{padding:0 14px 14px}
 .sec h2{font-size:.88rem;font-weight:600;margin-bottom:8px}
 .pan{background:var(--bg2);border:1px solid var(--brd);border-radius:10px;padding:14px;overflow-x:auto}
-.chart{display:flex;align-items:flex-end;gap:3px;height:150px;min-width:560px}
-.bg{flex:1;display:flex;flex-direction:column;align-items:center;height:100%}
-.bw{flex:1;display:flex;flex-direction:column;justify-content:flex-end;width:100%}
-.b{width:100%;border-radius:3px 3px 0 0;min-height:2px}
-.bpv{background:var(--acc)}.bld{background:rgba(239,68,68,.6)}
-.bl{font-size:.58rem;color:var(--mut);margin-top:2px}
-.nc .bpv{box-shadow:0 0 0 2px var(--acc)}
+.chart-svg{width:100%;overflow-x:auto}
+.chart-svg svg{display:block;min-width:560px}
 table{width:100%;border-collapse:collapse;font-size:.78rem;min-width:540px}
 th{text-align:left;padding:6px 9px;color:var(--mut);font-weight:500;border-bottom:1px solid var(--brd)}
 td{padding:6px 9px;border-bottom:1px solid var(--brd)}
@@ -1203,14 +1270,8 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
 </div>
 <div class="rea"><div class="rl">Entscheidung</div><div id="rea">Lade...</div></div>
 <div class="sec">
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-    <h2>PV &amp; Verbrauch heute (kWh/h)</h2>
-    <div style="display:flex;gap:16px;font-size:0.78rem">
-      <span><span style="display:inline-block;width:12px;height:12px;background:var(--acc);border-radius:2px;margin-right:5px;vertical-align:middle"></span>PV-Erzeugung</span>
-      <span><span style="display:inline-block;width:12px;height:12px;background:#ef4444;opacity:0.7;border-radius:2px;margin-right:5px;vertical-align:middle"></span>Verbrauch</span>
-    </div>
-  </div>
-  <div class="pan"><div class="chart" id="chart"></div></div>
+  <h2>PV &amp; Verbrauch heute (kWh/h)</h2>
+  <div class="pan chart-svg"><svg id="chart" height="220"></svg></div>
 </div>
 <div class="sec">
   <h2>Stundlicher Ladeplan + projizierter SOC</h2>
@@ -1274,15 +1335,88 @@ async function refresh(){
 
     document.getElementById('rea').textContent=d.charge_reason||'-';
     const sc2=d.planned_charge_schedule||[],nH=new Date().getHours();
-    const mx=Math.max(...sc2.map(s=>Math.max(s.pv_kwh,s.consumption_kwh)),0.1);
-    document.getElementById('chart').innerHTML=sc2.map(s=>{
-      const ph=Math.max(2,(s.pv_kwh/mx)*138),lh=Math.max(2,(s.consumption_kwh/mx)*138);
-      const nc=s.hour===nH?' nc':'';
-      return`<div class="bg${nc}">
-        <div class="bw"><div class="b bpv" style="height:${ph}px" title="PV ${s.pv_kwh}kWh"></div></div>
-        <div class="bw"><div class="b bld" style="height:${lh}px" title="Last ${s.consumption_kwh}kWh"></div></div>
-        <div class="bl">${s.hour}h</div></div>`;
-    }).join('');
+    (function buildChart(data,nowH){
+      const svg=document.getElementById('chart');
+      const W=Math.max(svg.parentElement.clientWidth-28,560);
+      svg.setAttribute('width',W);
+      const H=220,PAD={t:16,r:16,b:32,l:44};
+      const iW=W-PAD.l-PAD.r, iH=H-PAD.t-PAD.b;
+      const n=data.length||1;
+      const grpW=iW/n;
+      const barW=Math.max(2,grpW*0.38);
+      const gap=Math.max(1,grpW*0.04);
+      const maxY=Math.max(...data.map(s=>Math.max(s.pv_kwh,s.consumption_kwh)),0.5);
+      // round up to nice number
+      const niceMax=maxY<=1?1:maxY<=2?2:maxY<=3?3:maxY<=5?5:maxY<=6?6:Math.ceil(maxY);
+      const sc=v=>iH*(1-v/niceMax);
+      // Y gridlines & labels
+      const ticks=[0,niceMax*0.25,niceMax*0.5,niceMax*0.75,niceMax];
+      let out=`<g transform="translate(${PAD.l},${PAD.t})">`;
+      // grid
+      ticks.forEach(t=>{
+        const y=sc(t);
+        out+=`<line x1="0" y1="${y.toFixed(1)}" x2="${iW}" y2="${y.toFixed(1)}"
+          stroke="rgba(255,255,255,0.07)" stroke-width="1"/>`;
+        out+=`<text x="-6" y="${(y+4).toFixed(1)}" text-anchor="end"
+          font-size="10" fill="#64748b">${t%1===0?t:t.toFixed(1)}</text>`;
+      });
+      // bars
+      data.forEach((s,i)=>{
+        const x=i*grpW;
+        const cx=x+grpW/2;
+        const isNow=(s.hour===nowH);
+        const pvH=Math.max(1,iH-sc(s.pv_kwh));
+        const ldH=Math.max(1,iH-sc(s.consumption_kwh));
+        const pvY=sc(s.pv_kwh);
+        const ldY=sc(s.consumption_kwh);
+        // highlight current hour
+        if(isNow) out+=`<rect x="${(x+1).toFixed(1)}" y="0" width="${(grpW-2).toFixed(1)}" height="${iH}"
+          fill="rgba(245,158,11,0.07)" rx="2"/>`;
+        // PV bar (left of pair)
+        const pvOp=s.is_past?'0.35':'1';
+        out+=`<rect x="${(cx-barW-gap/2).toFixed(1)}" y="${pvY.toFixed(1)}"
+          width="${barW.toFixed(1)}" height="${pvH.toFixed(1)}"
+          fill="#f59e0b" opacity="${pvOp}" rx="2">
+          <title>${s.hour}:00 PV ${s.pv_kwh.toFixed(2)} kWh</title></rect>`;
+        // Consumption bar (right of pair)
+        out+=`<rect x="${(cx+gap/2).toFixed(1)}" y="${ldY.toFixed(1)}"
+          width="${barW.toFixed(1)}" height="${ldH.toFixed(1)}"
+          fill="#ef4444" opacity="${s.is_past?'0.25':'0.65'}" rx="2">
+          <title>${s.hour}:00 Verbrauch ${s.consumption_kwh.toFixed(2)} kWh</title></rect>`;
+        // hour label
+        if(i%2===0||n<=14)
+          out+=`<text x="${cx.toFixed(1)}" y="${(iH+18).toFixed(1)}"
+            text-anchor="middle" font-size="10" fill="${isNow?'#f59e0b':'#64748b'}"
+            font-weight="${isNow?'700':'400'}">${s.hour}h</text>`;
+      });
+      // SOC line (secondary axis, right side)
+      const socData=data.filter(s=>s.projected_soc!==undefined);
+      if(socData.length>1){
+        const socY=v=>iH*(1-v/100);
+        const pts=socData.map((s,i)=>{
+          const x=i*grpW+grpW/2;
+          return`${x.toFixed(1)},${socY(s.projected_soc).toFixed(1)}`;
+        }).join(' ');
+        out+=`<polyline points="${pts}" fill="none" stroke="#22c55e"
+          stroke-width="1.5" stroke-dasharray="4,3" opacity="0.7"/>`;
+        // SOC axis label on right
+        out+=`<text x="${iW+4}" y="12" font-size="9" fill="#22c55e" opacity="0.7">SOC%</text>`;
+        // SOC right axis ticks 0/50/100
+        [0,50,100].forEach(t=>{
+          const y=socY(t);
+          out+=`<text x="${iW+4}" y="${(y+3).toFixed(1)}" font-size="9" fill="#22c55e" opacity="0.5">${t}</text>`;
+        });
+      }
+      // Legend top-right
+      out+=`<g transform="translate(${iW-160},0)">
+        <rect width="10" height="10" fill="#f59e0b" rx="2" y="1"/>
+        <text x="14" y="10" font-size="10" fill="#94a3b8">PV-Erzeugung</text>
+        <rect x="90" width="10" height="10" fill="#ef4444" opacity="0.65" rx="2" y="1"/>
+        <text x="104" y="10" font-size="10" fill="#94a3b8">Verbrauch</text>
+      </g>`;
+      out+=`</g>`;
+      svg.innerHTML=out;
+    })(sc2,nH);
     document.getElementById('tb').innerHTML=sc2.map(s=>{
       const cl=s.is_past?'past':s.hour===nH?'now':'';
       const sur=s.surplus_kwh>=0
