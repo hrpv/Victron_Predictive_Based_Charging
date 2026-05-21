@@ -13,17 +13,15 @@ modbus:
   # Einstellungen → Dienste → Modbus TCP → Ein
   # (läuft meist schon wenn evcc funktioniert)
 
-# --- evcc Koordination ---
-# evcc und battery_manager schreiben beide auf Register 2705 (MaxChargeCurrent).
-# Im Modus "now" (Schnellladen) hat evcc Vorrang → battery_manager pausiert.
+# --- evcc Koordination, NUR INFO ---
+  # evcc schreibt beim Schnellladen Register 2901 (ESS MinSoc) auf ~aktuellen SOC
+  # um Akkuentladung zu verhindern. Register 2705 (MaxChargeCurrent) wird von
+  # evcc NICHT beschrieben → kein Schreibkonflikt, Laden läuft normal weiter.
 evcc:
   enabled: tr
   api_url: "http://192.168.178.58:7070/api/state"  # evcc IP anpassen
   timeout_seconds: 5
   poll_interval_seconds: 30
-  # evcc schreibt beim Schnellladen Register 2901 (ESS MinSoc) auf ~aktuellen SOC
-  # um Akkuentladung zu verhindern. Register 2705 (MaxChargeCurrent) wird von
-  # evcc NICHT beschrieben → kein Schreibkonflikt, Laden läuft normal weiter.
 
 # --- Batterie ---
 battery:
