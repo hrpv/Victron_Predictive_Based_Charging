@@ -77,13 +77,13 @@ class SystemState:
     pv_power_w: float = 0.0
     pv_energy_today_kwh: float = 0.0        # intern aufsummiert
     load_power_w: float = 0.0
-    load_energy_today_kwh: float = 0.0      # intern aufsummiert
+    load_energy_today_kwh: float = 0.0      # intern aufsummiert (EnergyAccumulator)
     grid_power_w: float = 0.0              # + = Bezug, - = Einspeisung
     battery_voltage: float = 0.0
     battery_current: float = 0.0           # + = laden, - = entladen
     battery_power_w: float = 0.0            # int16, direkt W, + = laden, - = entladen
     charge_current_setpoint: float = 0.0   # zuletzt geschriebener Wert [A]
-    charge_mode: str = "idle"              # idle|charging|trickle|full_charge|evcc_priority
+    charge_mode: str = "idle"              # idle|charging|full_charge
     charge_reason: str = ""
     last_full_charge_date: str = ""
     days_since_full_charge: int = 0
@@ -91,6 +91,7 @@ class SystemState:
     forecast_pv_remaining_kwh: float = 0.0
     forecast_consumption_night_kwh: float = 0.0
     planned_charge_schedule: list = field(default_factory=list)
+    history_buffer: list = field(default_factory=list)  # [HourlyHistory, ...]
     target_soc: float = 80.0
     modbus_connected: bool = False
     forecast_updated: str = ""
@@ -113,6 +114,32 @@ class HourlyForecast:
 # ─────────────────────────────────────────────
 # Konfiguration
 # ─────────────────────────────────────────────
+
+
+
+@dataclass
+class HourlyHistory:
+    """Speichert den tatsaechlichen Zustand einer vergangenen Stunde.
+
+    WICHTIG: Diese Dataclass wird in build_schedule() per Punkt-Notation
+    zugegriffen (hist.date_iso, hist.hour, etc.), NICHT per Dictionary!
+    """
+    date_iso: str          # YYYY-MM-DD
+    hour: int
+    pv_kwh: float          # Stuendliche PV-Erzeugung (nicht kumulativ!)
+    consumption_kwh: float # Stuendlicher Verbrauch (nicht kumulativ!)
+    surplus_kwh: float
+    action: str            # idle|charging|full_charge|discharging
+    charge_current_a: float
+    soc_start: float       # SOC zu Stundenbeginn
+    soc_end: float         # SOC zu Stundenende (letzter Messwert)
+    is_actual: bool = True
+    # Interne Felder fuer Differenzberechnung (nicht im Dashboard sichtbar)
+    _raw_pv_total: float = 0.0      # Tageskumulativ PV (intern)
+    _raw_cons_total: float = 0.0    # Tageskumulativ Verbrauch (intern)
+    # NEU: Kumulativwerte zu Stundenbeginn (fuer korrekte Stundensumme)
+    _hour_start_pv_total: float = 0.0
+    _hour_start_cons_total: float = 0.0
 
 def load_config(config_path: str = "config.yaml") -> dict:
     path = Path(config_path)
@@ -205,6 +232,7 @@ class VictronModbus:
         "grid_l1":  (820,  1.0,  True),    # W signed, + = Bezug, - = Einspeisung
         "grid_l2":  (821,  1.0,  True),
         "grid_l3":  (822,  1.0,  True),
+
     }
     REG_MAX_CHARGE = 2705   # DVCC MaxChargeCurrent [A]
     UNIT_ID = 100           # Cerbo GX Modbus Unit-ID
@@ -527,19 +555,24 @@ class VrmForecastManager:
 
         interval_s = self.cfg.get("forecast", {}).get(
             "update_interval_minutes", 60) * 60
+        # Cache bei Tageswechsel immer verwerfen (neue VRM-Prognose verfügbar)
+        cache_day = getattr(self, "_cache_day", None)
+        today = datetime.now().date()
+        if cache_day != today:
+            force = True
+            self._cache_day = today
         if not force and self._cache and (
                 time.monotonic() - self._cache_ts) < interval_s:
             return self._cache
 
         try:
-            import calendar
             now   = datetime.now()
-            # Start: Mitternacht heute (Lokalzeit → UTC)
+            # Start: Mitternacht heute Lokalzeit (timestamp() berücksichtigt Zeitzone)
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            # End: 23:59 heute
+            # End: 23:59 heute Lokalzeit
             end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
-            start_unix = int(calendar.timegm(start.timetuple()))
-            end_unix   = int(calendar.timegm(end.timetuple()))
+            start_unix = int(start.timestamp())   # korrekte Lokalzeit → Unix
+            end_unix   = int(end.timestamp())
             avg_h = self.cfg["charging"].get(
                 "avg_daily_consumption_kwh", 8.0) / 24
 
@@ -549,22 +582,32 @@ class VrmForecastManager:
                    f"&end={end_unix}"
                    f"&interval=hours")
 
+            self.logger.info(f"VRM API Request: {url}")
+            self.logger.info(
+                f"VRM Zeitbereich lokal: {start} bis {end}  |  "
+                f"UTC: {datetime.utcfromtimestamp(start_unix)} bis "
+                f"{datetime.utcfromtimestamp(end_unix)}"
+            )
+
             resp = requests.get(url, headers=self._headers(),
                                 timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
 
             records = data.get("records", {})
-            # VRM liefert: [[unix_ms, wh], [unix_ms, wh], ...]
             pv_raw   = records.get("solar_yield_forecast", [])
             cons_raw = records.get("vrm_consumption_fc",   [])
+
+            self.logger.info(
+                f"VRM API Eintraege: PV={len(pv_raw)}, Cons={len(cons_raw)}"
+            )
+            self.logger.debug(f"VRM API raw (trunc): {str(data)[:500]}")
 
             if not pv_raw:
                 self.logger.warning("VRM API: keine PV-Prognosedaten")
                 return None
 
             # Verbrauchsprognose fuer die Nacht berechnen
-            # VRM gibt Tagessumme – wir schätzen den Nacht-Anteil proportional
             cons_total_wh = data.get("totals", {}).get("vrm_consumption_fc", 0)
             if cons_total_wh:
                 ns  = self.cfg["charging"].get("night_start_hour", 21)
@@ -575,31 +618,37 @@ class VrmForecastManager:
             else:
                 self._consumption_night_kwh = 0.0
 
-            # Konsumprognose als Dict {stunde: kwh}
+            # KORREKTUR: Aggregation pro Stunde (mehrere Eintraege werden summiert)
+            pv_by_hour: dict = {}
             cons_by_hour: dict = {}
-            for entry in cons_raw:
+
+            for entry in pv_raw:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
                 ts_raw, wh = entry[0], entry[1]
                 if wh is None:
                     continue
                 ts_sec = ts_raw / 1000 if ts_raw > 1e10 else ts_raw
                 h = datetime.fromtimestamp(ts_sec).hour
-                cons_by_hour[h] = float(wh) / 1000.0
+                pv_by_hour[h] = pv_by_hour.get(h, 0.0) + float(wh)
 
-            # PV-Prognose in HourlyForecast umwandeln
-            # VRM liefert [timestamp_sekunden, Wh_pro_Stunde]
-            # Timestamp-Erkennung: >1e10 = Millisekunden, sonst Sekunden
-            out = []
-            total_pv_kwh = 0.0
-            for entry in pv_raw:
+            for entry in cons_raw:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
                 ts_raw, wh = entry[0], entry[1]
                 if wh is None:
                     continue
-                # Timestamp normalisieren
                 ts_sec = ts_raw / 1000 if ts_raw > 1e10 else ts_raw
-                h      = datetime.fromtimestamp(ts_sec).hour
-                # Einheit: VRM liefert Wh → kWh
+                h = datetime.fromtimestamp(ts_sec).hour
+                cons_by_hour[h] = cons_by_hour.get(h, 0.0) + float(wh)
+
+            # PV-Prognose in HourlyForecast umwandeln
+            out = []
+            total_pv_kwh = 0.0
+            for h in sorted(pv_by_hour.keys()):
+                wh = pv_by_hour[h]
                 pv_kwh = float(wh) / 1000.0
-                c_kwh  = cons_by_hour.get(h, avg_h)
+                c_kwh  = cons_by_hour.get(h, avg_h * 1000) / 1000.0 if h in cons_by_hour else avg_h
                 out.append(HourlyForecast(
                     hour=h,
                     pv_kwh=round(pv_kwh, 3),
@@ -611,10 +660,18 @@ class VrmForecastManager:
             if not out:
                 return None
 
+            # DEBUG: Stunden 10-12 fuer Vergleich mit Portal loggen
+            for hf in out:
+                if 10 <= hf.hour <= 12:
+                    self.logger.info(
+                        f"VRM Stunde {hf.hour:02d}:00 -> PV={hf.pv_kwh:.3f} kWh, "
+                        f"Cons={hf.consumption_kwh:.3f} kWh"
+                    )
+
             self._cache    = out
             self._cache_ts = time.monotonic()
             self.logger.info(
-                f"VRM-Prognose: {total_pv_kwh:.2f} kWh PV verbleibend heute"
+                f"VRM-Prognose: {total_pv_kwh:.2f} kWh PV heute"
                 + (f", Nachtverbrauch ~{self._consumption_night_kwh:.1f} kWh"
                    if self._consumption_night_kwh else ""))
             return out
@@ -654,6 +711,12 @@ class ForecastManager:
 
     def get_forecast(self, force: bool = False) -> list:
         interval_s = self.fc_cfg.get("update_interval_minutes", 60) * 60
+        # Cache bei Tageswechsel immer verwerfen
+        cache_day = getattr(self, "_cache_day", None)
+        today = datetime.now().date()
+        if cache_day != today:
+            force = True
+            self._cache_day = today
         if not force and self._cache and (time.monotonic() - self._cache_ts) < interval_s:
             return self._cache
 
@@ -826,6 +889,11 @@ class ChargeController:
         self._ramp_current: float = 0.0
         self._state_file = Path(cfg["dashboard"].get("state_file", "state.json"))
         self._load_persistent()
+        # Energiebasis nach Neustart: persistiert in state.json
+        # damit der EnergyAccumulator nach Neustart korrekt weiterlaeuft
+        self._energy_base_pv:   float = 0.0
+        self._energy_base_load: float = 0.0
+        self._load_energy_base()
         # Hysterese: Mindestdauer einer Ladeentscheidung
         self._last_decision_ts: float = 0.0
         self._last_decision_result: tuple[float, str, str] = (0.0, "idle", "Initialisierung")
@@ -834,10 +902,27 @@ class ChargeController:
         self._last_written_ramped_a: float = 0.0
         # Persistenter Zustand: nur alle 5 Minuten auf SD-Karte schreiben
         self._last_persistent_save: float = 0.0
-        # Hysterese: Mindestdauer einer Ladeentscheidung
-        self._last_decision_ts: float = 0.0
-        self._last_decision_result: tuple[float, str, str] = (0.0, "idle", "Initialisierung")
-        self._min_charge_duration_s: float = self.cc.get("min_charge_duration_minutes", 10) * 60
+
+    def _load_energy_base(self):
+        """Laedt letzten bekannten Energie-Akkumulatorstand aus state.json."""
+        try:
+            if self._state_file.exists():
+                data = json.loads(self._state_file.read_text())
+                saved_date = data.get("energy_date", "")
+                today = date.today().isoformat()
+                if saved_date == today:
+                    # Selber Tag: Basis wiederherstellen
+                    self._energy_base_pv   = float(data.get("energy_base_pv",   0.0))
+                    self._energy_base_load = float(data.get("energy_base_load", 0.0))
+                    self.logger.info(
+                        f"Energie-Basis geladen: PV={self._energy_base_pv:.3f} kWh, "
+                        f"Last={self._energy_base_load:.3f} kWh")
+                else:
+                    # Neuer Tag: Basis auf 0 (Tageswechsel)
+                    self._energy_base_pv   = 0.0
+                    self._energy_base_load = 0.0
+        except Exception as e:
+            self.logger.warning(f"Energie-Basis konnte nicht geladen werden: {e}")
 
     def _load_persistent(self):
         if not self._state_file.exists():
@@ -858,13 +943,20 @@ class ChargeController:
     def _save_persistent(self):
         try:
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            # Aktuellen Gesamtenergie-Stand = Akkumulator + Basis aus letztem Neustart
+            pv_total   = self.state.pv_energy_today_kwh   + self._energy_base_pv
+            load_total = self.state.load_energy_today_kwh + self._energy_base_load
             self._state_file.write_text(json.dumps({
                 "last_full_charge_date":   self.state.last_full_charge_date,
                 "days_since_full_charge":  self.state.days_since_full_charge,
                 "soc":                     self.state.soc,
                 "charge_mode":             self.state.charge_mode,
                 "charge_current_setpoint": self.state.charge_current_setpoint,
-                "timestamp":               datetime.now().isoformat()
+                "timestamp":               datetime.now().isoformat(),
+                # Energiebasis fuer Neustart-Wiederherstellung
+                "energy_date":             date.today().isoformat(),
+                "energy_base_pv":          round(pv_total,   3),
+                "energy_base_load":        round(load_total, 3),
             }, indent=2))
             self._last_persistent_save = time.monotonic()
         except Exception as e:
@@ -1005,106 +1097,321 @@ class ChargeController:
             self._ramp_current = max(self._ramp_current - step, target_a)
         return self._ramp_current
 
-    def build_schedule(self) -> list:
+    def _simulate_hour(self, h: int, fc: HourlyForecast, soc_sim: float, 
+                       needs_full: bool, pv_rem_total: float, night_cons: float,
+                       is_forecast: bool = True) -> tuple[str, float, float]:
         """
-        Stundlicher Ladeplan – simuliert dieselbe Entscheidungslogik wie decide(),
-        damit Ladeplan und tatsaechliches Verhalten uebereinstimmen.
+        Simuliert EINE Stunde mit der exakten decide()-Logik.
+        Gibt (action, current_a, new_soc_sim) zurueck.
         """
-        fc      = self.forecast.get_forecast()
-        now_h   = datetime.now().hour
-        soc_sim = self.state.soc
-        cap     = self.bat["capacity_kwh"]
+        cap = self.bat["capacity_kwh"]
         min_soc = self.bat["min_soc"]
         max_soc = self.bat["max_soc"]
-        nom_v   = self.bat.get("voltage_nominal", 48.0)
-        max_a   = self.bat["max_charge_current"]
+        nom_v = self.bat.get("voltage_nominal", 48.0)
+        max_a = self.bat["max_charge_current"]
         target_n = self.bat["target_soc_normal"]
-        hyst    = self.cc.get("soc_hysteresis", 2)
-        ns      = self.cc.get("night_start_hour", 21)
-        ne      = self.cc.get("night_end_hour",   6)
-        morn_s  = self.cc.get("morning_delay_start_hour", 6)
-        morn_e  = self.cc.get("morning_delay_end_hour", 10)
-        result  = []
+        hyst = self.cc.get("soc_hysteresis", 2)
+        morn_s = self.cc.get("morning_delay_start_hour", 6)
+        morn_e = self.cc.get("morning_delay_end_hour", 10)
 
-        # Verbleibende PV ab jeder simulierten Stunde berechnen
-        def pv_remaining_from(hour: int) -> float:
-            return sum(f.pv_kwh for f in fc if f.hour >= hour)
+        action = "idle"
+        current_a = 0.0
+        night = h >= self.cc.get("night_start_hour", 21) or h < self.cc.get("night_end_hour", 6)
+
+        # Notfall-SOC
+        if soc_sim <= self.cc.get("emergency_charge_soc", 25):
+            action = "charging"
+            current_a = max_a
+            soc_sim = min(max_soc, soc_sim + (current_a * nom_v / 1000 / cap) * 100)
+            return action, current_a, soc_sim
+
+        if night:
+            action = "discharging"
+            deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+            soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+            return action, current_a, soc_sim
+
+        # Maximale Ladeenergie pro Stunde durch Strombegrenzung
+        max_charge_kwh = max_a * nom_v / 1000.0  # z.B. 50A * 48V / 1000 = 2.4 kWh
+
+        if needs_full and soc_sim < max_soc - hyst:
+            action = "full_charge"
+            current_a = max_a
+            charge_kwh = min(fc.pv_kwh, max_charge_kwh)
+            soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+            return action, current_a, soc_sim
+
+        # Dynamisches Ziel (exakt wie in decide())
+        # proj_eve mit Strombegrenzung: max. max_charge_kwh pro Stunde
+        pv_rem_capped = min(pv_rem_total, max_charge_kwh * 24)
+        proj_eve = min(max_soc, soc_sim + (pv_rem_capped / cap) * 100)
+        if proj_eve >= target_n:
+            dyn_target = target_n
+        else:
+            shortfall = target_n - proj_eve
+            dyn_target = min(target_n + shortfall * 0.5, max_soc)
+
+        # Ziel erreicht?
+        if soc_sim >= dyn_target - hyst:
+            action = "idle"
+            deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+            soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+            return action, current_a, soc_sim
+
+        # Morgen-Verzoegerung
+        if morn_s <= h < morn_e:
+            if proj_eve >= target_n:
+                action = "idle"
+                deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+                soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+            elif soc_sim > target_n - 15:
+                action = "idle"
+                deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+                soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+            else:
+                action = "trickle"
+                current_a = self.bat.get("trickle_current", 5)
+                # trickle: eigener Strom, kein PV-Ueberschuss-Limit noetig
+                soc_sim = min(max_soc, soc_sim + (current_a * nom_v / 1000 / cap) * 100)
+            return action, current_a, soc_sim
+
+        # PV-Ueberschuss, begrenzt durch Strombegrenzung
+        if fc.net_kwh > 0:
+            action = "charging"
+            current_a = min(fc.net_kwh * 1000 / nom_v, max_a)
+            charge_kwh = min(fc.net_kwh, max_charge_kwh)
+            soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+        else:
+            action = "idle"
+            deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+            soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+
+        return action, current_a, soc_sim
+
+    def build_schedule(self) -> list:
+        """
+        Stundlicher Ladeplan:
+        - Vergangene Stunden: Tatsaechliche Werte aus history_buffer (heute)
+        - Zukuenftige Stunden: Prognose via _simulate_hour() mit exakter decide()-Logik
+        """
+        fc_list = self.forecast.get_forecast()
+        today_iso = date.today().isoformat()
+        now_h = datetime.now().hour
+        now_m = datetime.now().minute
+
+        result = []
+
+        # --- VERGANGENE STUNDEN: History (nur von heute) ---
+        # WICHTIG: history_buffer enthaelt HourlyHistory-Dataclass-Objekte!
+        # Zugriff NUR per Punkt-Notation (h.date_iso), NICHT per h.get() oder h["key"]!
+        today_history = [h for h in self.state.history_buffer if h.date_iso == today_iso]
+
+        for hist in today_history:
+            h = hist.hour
+            # Aktuelle Stunde nur als Vergangenheit wenn > 55 Minuten
+            if h == now_h and now_m < 55:
+                continue
+            if h > now_h:
+                continue
+            result.append({
+                "hour": h,
+                "pv_kwh": hist.pv_kwh,
+                "consumption_kwh": hist.consumption_kwh,
+                "surplus_kwh": round(hist.surplus_kwh, 3),
+                "action": hist.action,
+                "charge_current_a": round(hist.charge_current_a, 1),
+                "projected_soc": round(hist.soc_end, 1),
+                "is_past": True,
+                "is_actual": True,
+            })
+
+        # Stunden ohne History-Eintrag markieren (nur wenn vor Start)
+        # SOC-Schaetzung: naechster bekannter History-SOC, sonst aktueller SOC.
+        covered_hours = {h.hour for h in today_history if not (h.hour == now_h and now_m < 55)}
+        hist_soc_by_hour = {h.hour: h.soc_end for h in today_history}
+        for h in range(now_h + 1):
+            if h in covered_hours or (h == now_h and now_m < 55):
+                continue
+            # Naechsten bekannten SOC-Wert suchen (vorwaerts, dann aktueller SOC)
+            gap_soc = next(
+                (hist_soc_by_hour[hh] for hh in range(h, now_h + 1) if hh in hist_soc_by_hour),
+                self.state.soc
+            )
+            result.append({
+                "hour": h,
+                "pv_kwh": 0.0,
+                "consumption_kwh": 0.0,
+                "surplus_kwh": 0.0,
+                "action": "unknown",
+                "charge_current_a": 0,
+                "projected_soc": round(gap_soc, 1),
+                "is_past": True,
+                "is_actual": False,
+            })
+
+        result.sort(key=lambda x: x["hour"])
+
+        # --- ZUKUENFTIGE STUNDEN: Prognose via _simulate_hour ---
+        # Startpunkt: letzter tatsaechlicher SOC aus History (genauer als self.state.soc
+        # falls der aktuelle Messwert kurzzeitig springt). Fallback: aktueller Messwert.
+        last_actual_soc = self.state.soc
+        if today_history:
+            past_entries = [h for h in today_history
+                            if h.hour <= now_h and not (h.hour == now_h and now_m < 55)]
+            if past_entries:
+                last_actual_soc = past_entries[-1].soc_end
+        soc_sim = last_actual_soc
 
         needs_full = self._needs_full_charge()
+        pv_rem_total = self.forecast.pv_remaining_kwh()
+        night_cons = self.forecast.night_consumption_kwh()
 
-        for f in fc:
-            h         = f.hour
-            action    = "idle"
-            current_a = 0
-            night     = h >= ns or h < ne
+        fc_by_hour = {f.hour: f for f in fc_list}
 
-            if night:
-                # Nacht: Akku entlaedt sich
-                action  = "discharging"
-                soc_sim = max(min_soc, soc_sim - (f.consumption_kwh / cap) * 100)
+        for h in range(now_h, 24):
+            if h == now_h and now_m >= 55:
+                continue
 
-            elif needs_full and soc_sim < max_soc - hyst:
-                # Vollladung faellig
-                action    = "full_charge"
-                current_a = max_a
-                soc_sim   = min(max_soc, soc_sim + (f.pv_kwh / cap) * 100)
+            fc = fc_by_hour.get(h)
+            if not fc:
+                avg_cons = self.cc.get("avg_daily_consumption_kwh", 8.0) / 24
+                fc = HourlyForecast(hour=h, pv_kwh=0.0, consumption_kwh=avg_cons, net_kwh=-avg_cons)
 
-            else:
-                # Dynamisches Ziel fuer diese Stunde simulieren
-                pv_rem   = pv_remaining_from(h)
-                proj_eve = min(max_soc, soc_sim + (pv_rem / cap) * 100)
-                if proj_eve >= target_n:
-                    dyn_target = target_n
-                else:
-                    shortfall  = target_n - proj_eve
-                    dyn_target = min(target_n + shortfall * 0.5, max_soc)
-
-                if soc_sim >= dyn_target - hyst:
-                    # Ziel erreicht
-                    action  = "idle"
-                    deficit = max(0.0, f.consumption_kwh - f.pv_kwh)
-                    soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
-
-                elif morn_s <= h < morn_e:
-                    # Morgen-Verzoegerungsfenster: dieselbe Logik wie decide()
-                    if proj_eve >= target_n:
-                        action  = "idle"   # PV reicht -> warten
-                    elif soc_sim > target_n - 15:
-                        action  = "idle"   # SOC noch ok -> warten
-                    else:
-                        action    = "trickle"
-                        current_a = self.bat.get("trickle_current", 5)
-                        soc_sim   = min(max_soc, soc_sim + (current_a * nom_v / 1000 / cap) * 100)
-
-                    deficit = max(0.0, f.consumption_kwh - f.pv_kwh)
-                    if action == "idle":
-                        soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
-
-                elif f.net_kwh > 0:
-                    # PV-Ueberschuss -> laden
-                    action    = "charging"
-                    current_a = int(min(f.net_kwh * 1000 / nom_v, max_a))
-                    soc_sim   = min(max_soc, soc_sim + (f.net_kwh / cap) * 100)
-
-                else:
-                    # Kein Ueberschuss
-                    deficit = max(0.0, f.consumption_kwh - f.pv_kwh)
-                    soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+            action, current_a, soc_sim = self._simulate_hour(
+                h, fc, soc_sim, needs_full, pv_rem_total, night_cons
+            )
 
             result.append({
-                "hour":             h,
-                "pv_kwh":           f.pv_kwh,
-                "consumption_kwh":  f.consumption_kwh,
-                "surplus_kwh":      round(f.net_kwh, 3),
-                "action":           action,
-                "charge_current_a": current_a,
-                "projected_soc":    round(soc_sim, 1),
-                "is_past":          h < now_h,
+                "hour": h,
+                "pv_kwh": fc.pv_kwh,
+                "consumption_kwh": fc.consumption_kwh,
+                "surplus_kwh": round(fc.net_kwh, 3),
+                "action": action,
+                "charge_current_a": round(current_a, 1),
+                "projected_soc": round(soc_sim, 1),
+                "is_past": False,
+                "is_actual": False,
             })
+
+            pv_rem_total = max(0.0, pv_rem_total - fc.pv_kwh)
+
         return result
+
+    def _update_history(self):
+        """
+        Speichert stuendliche Werte im History-Ringpuffer.
+        Berechnet stuendliche Energiedifferenzen aus den Tageskumulativen.
+
+        KORREKTUR: pv_kwh/consumption_kwh speichern jetzt die GESAMTSUMME
+        der Stunde (seit Stundenbeginn), nicht nur den Diff des letzten Updates.
+        Zusaetzlich: Energie-Basis nach Neustart wird beruecksichtigt.
+
+        Erzeugt HourlyHistory-Dataclass-Objekte (keine Dictionaries!)
+        """
+        now = datetime.now()
+        today_iso = now.date().isoformat()
+        current_hour = now.hour
+
+        # Letzten Eintrag suchen (gleiche Stunde oder vorherige)
+        last_entry = None
+        for i, h in enumerate(self.state.history_buffer):
+            if h.date_iso == today_iso and h.hour <= current_hour:
+                last_entry = h
+
+        # Energie-Totals: aus EnergyAccumulator + persistierter Basis nach Neustart
+        pv_total   = self.state.pv_energy_today_kwh   + self._energy_base_pv
+        load_total = self.state.load_energy_today_kwh + self._energy_base_load
+
+        if last_entry and last_entry.hour == current_hour:
+            # Gleiche Stunde: Update mit GESAMTDIFF seit Stundenbeginn
+            # (nicht nur Diff seit letztem Update!)
+            pv_hour_total = max(0.0, pv_total - last_entry._hour_start_pv_total)
+            cons_hour_total = max(0.0, load_total - last_entry._hour_start_cons_total)
+
+            last_entry.pv_kwh = round(pv_hour_total, 3)
+            last_entry.consumption_kwh = round(cons_hour_total, 3)
+            last_entry.surplus_kwh = round(pv_hour_total - cons_hour_total, 3)
+            last_entry.action = self.state.charge_mode
+            last_entry.charge_current_a = self.state.charge_current_setpoint
+            last_entry.soc_end = round(self.state.soc, 1)
+            # Aktuelle Kumulativwerte fuer naechsten Update speichern
+            last_entry._raw_pv_total  = pv_total
+            last_entry._raw_cons_total = load_total
+
+        elif last_entry and last_entry.hour < current_hour:
+            # NEUE STUNDE: Letzten Eintrag der VORHERIGEN Stunde abschliessen
+            # (auf den letzten bekannten Zustand setzen, falls kein Update mehr kam)
+            pv_hour_total = max(0.0, last_entry._raw_pv_total - last_entry._hour_start_pv_total)
+            cons_hour_total = max(0.0, last_entry._raw_cons_total - last_entry._hour_start_cons_total)
+            last_entry.pv_kwh = round(pv_hour_total, 3)
+            last_entry.consumption_kwh = round(cons_hour_total, 3)
+            last_entry.surplus_kwh = round(pv_hour_total - cons_hour_total, 3)
+            last_entry.soc_end = round(self.state.soc, 1)
+
+            # Neuen Eintrag fuer aktuelle Stunde erstellen
+            new_entry = HourlyHistory(
+                date_iso=today_iso,
+                hour=current_hour,
+                pv_kwh=0.0,
+                consumption_kwh=0.0,
+                surplus_kwh=0.0,
+                action=self.state.charge_mode,
+                charge_current_a=self.state.charge_current_setpoint,
+                soc_start=round(self.state.soc, 1),
+                soc_end=round(self.state.soc, 1),
+                is_actual=True,
+            )
+            # Stundenbeginn-Kumulativwerte speichern (inkl. Energie-Basis)
+            new_entry._hour_start_pv_total = pv_total
+            new_entry._hour_start_cons_total = load_total
+            new_entry._raw_pv_total  = pv_total
+            new_entry._raw_cons_total = load_total
+            self.state.history_buffer.append(new_entry)
+
+        else:
+            # Erster Eintrag des Tages
+            new_entry = HourlyHistory(
+                date_iso=today_iso,
+                hour=current_hour,
+                pv_kwh=0.0,
+                consumption_kwh=0.0,
+                surplus_kwh=0.0,
+                action=self.state.charge_mode,
+                charge_current_a=self.state.charge_current_setpoint,
+                soc_start=round(self.state.soc, 1),
+                soc_end=round(self.state.soc, 1),
+                is_actual=True,
+            )
+            new_entry._hour_start_pv_total = pv_total
+            new_entry._hour_start_cons_total = load_total
+            new_entry._raw_pv_total  = pv_total
+            new_entry._raw_cons_total = load_total
+            self.state.history_buffer.append(new_entry)
+
+        # DEBUG: Logge letzte Stunde fuer Vergleich mit VRM Portal
+        if last_entry and last_entry.hour >= 0:
+            self.logger.debug(
+                f"History H{last_entry.hour:02d}: PV={last_entry.pv_kwh:.3f} kWh, "
+                f"Cons={last_entry.consumption_kwh:.3f} kWh, "
+                f"Surplus={last_entry.surplus_kwh:.3f} kWh, "
+                f"SOC={last_entry.soc_end:.1f}%, "
+                f"Action={last_entry.action}"
+            )
+
+        # Alte Eintraege entfernen (nur heute und gestern behalten)
+        cutoff = (now.date() - timedelta(days=1)).isoformat()
+        self.state.history_buffer = [
+            h for h in self.state.history_buffer 
+            if h.date_iso >= cutoff
+        ]
+
+        if len(self.state.history_buffer) > 48:
+            self.state.history_buffer = self.state.history_buffer[-48:]
+
 
     def run_cycle(self):
         """Fuehrt einen Regelzyklus aus."""
+        self._update_history()
         now = time.monotonic()
         min_dur = self._min_charge_duration_s
 
@@ -1147,8 +1454,9 @@ class ChargeController:
         self.state.charge_reason            = reason
         self.state.planned_charge_schedule  = self.build_schedule()
 
-        # Persistenter Zustand alle 2 Stunden speichern (SD-Karte schonen)
-        if time.monotonic() - self._last_persistent_save > 7200:
+        # Persistenter Zustand alle 30 Minuten speichern
+        # (Kompromiss: SD-Karte schonen vs. max. Datenverlust nach Neustart)
+        if time.monotonic() - self._last_persistent_save > 1800:
             self._save_persistent()
 
         if self.cfg["logging"].get("log_decisions", True):
@@ -1221,7 +1529,7 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
     <div class="sp" id="ts"></div>
   </div>
 </div>
-<div id="evb" class="evb" style="display:none">&#9889; evcc laedt das Auto - Batteriesteuerung pausiert</div>
+<div id="evb" style="display:none"></div>
 <div class="grid">
   <div class="card">
     <div class="lbl">Batterie SOC</div>
@@ -1289,7 +1597,7 @@ const REFRESH=__REFRESH__*1000, CAP=__CAP__;
 function sc(s){return s>=80?'var(--grn)':s>=40?'var(--acc)':'var(--red)'}
 function bdg(a){
   const m={charging:['Laden','bc'],trickle:['Sanft','bt'],full_charge:['Vollladung','bf'],
-    idle:['Pause','bi'],evcc_priority:['evcc','be'],discharging:['Entladen','bd']};
+    idle:['Pause','bi'],discharging:['Entladen','bd']};
   const[l,c]=m[a]||['-','bi'];
   return`<span class="bdg ${c}">${l}</span>`;
 }
@@ -1305,7 +1613,6 @@ async function refresh(){
     if(d.evcc_active){ed.className='dot warn';es.textContent='evcc '+d.evcc_mode;}
     else if(d.evcc_charge_power_w>0){ed.className='dot ok';es.textContent='evcc PV';}
     else{ed.className='dot';es.textContent='evcc -';}
-    document.getElementById('evb').style.display=d.evcc_active?'block':'none';
     const soc=d.soc??0;
     document.getElementById('soc').innerHTML=`${soc.toFixed(1)}<span class="unt">%</span>`;
     const sb=document.getElementById('sbar');sb.style.width=soc+'%';sb.style.background=sc(soc);
@@ -1345,7 +1652,7 @@ async function refresh(){
       const grpW=iW/n;
       const barW=Math.max(2,grpW*0.38);
       const gap=Math.max(1,grpW*0.04);
-      const maxY=Math.max(...data.map(s=>Math.max(s.pv_kwh,s.consumption_kwh)),0.5);
+      const maxY=Math.max(...data.map(s=>Math.max(s.pv_kwh||0,s.consumption_kwh||0)),0.5);
       // round up to nice number
       const niceMax=maxY<=1?1:maxY<=2?2:maxY<=3?3:maxY<=5?5:maxY<=6?6:Math.ceil(maxY);
       const sc=v=>iH*(1-v/niceMax);
@@ -1365,8 +1672,8 @@ async function refresh(){
         const x=i*grpW;
         const cx=x+grpW/2;
         const isNow=(s.hour===nowH);
-        const pvH=Math.max(1,iH-sc(s.pv_kwh));
-        const ldH=Math.max(1,iH-sc(s.consumption_kwh));
+        const pvH=Math.max(1,iH-sc(s.pv_kwh||0));
+        const ldH=Math.max(1,iH-sc(s.consumption_kwh||0));
         const pvY=sc(s.pv_kwh);
         const ldY=sc(s.consumption_kwh);
         // highlight current hour
@@ -1377,12 +1684,12 @@ async function refresh(){
         out+=`<rect x="${(cx-barW-gap/2).toFixed(1)}" y="${pvY.toFixed(1)}"
           width="${barW.toFixed(1)}" height="${pvH.toFixed(1)}"
           fill="#f59e0b" opacity="${pvOp}" rx="2">
-          <title>${s.hour}:00 PV ${s.pv_kwh.toFixed(2)} kWh</title></rect>`;
+          <title>${s.hour}:00 PV ${(s.pv_kwh||0).toFixed(2)} kWh</title></rect>`;
         // Consumption bar (right of pair)
         out+=`<rect x="${(cx+gap/2).toFixed(1)}" y="${ldY.toFixed(1)}"
           width="${barW.toFixed(1)}" height="${ldH.toFixed(1)}"
           fill="#ef4444" opacity="${s.is_past?'0.25':'0.65'}" rx="2">
-          <title>${s.hour}:00 Verbrauch ${s.consumption_kwh.toFixed(2)} kWh</title></rect>`;
+          <title>${s.hour}:00 Verbrauch ${(s.consumption_kwh||0).toFixed(2)} kWh</title></rect>`;
         // hour label
         if(i%2===0||n<=14)
           out+=`<text x="${cx.toFixed(1)}" y="${(iH+18).toFixed(1)}"
@@ -1395,7 +1702,7 @@ async function refresh(){
         const socY=v=>iH*(1-v/100);
         const pts=socData.map((s,i)=>{
           const x=i*grpW+grpW/2;
-          return`${x.toFixed(1)},${socY(s.projected_soc).toFixed(1)}`;
+          return`${x.toFixed(1)},${socY(s.projected_soc||0).toFixed(1)}`;
         }).join(' ');
         out+=`<polyline points="${pts}" fill="none" stroke="#22c55e"
           stroke-width="1.5" stroke-dasharray="4,3" opacity="0.7"/>`;
@@ -1419,15 +1726,15 @@ async function refresh(){
     })(sc2,nH);
     document.getElementById('tb').innerHTML=sc2.map(s=>{
       const cl=s.is_past?'past':s.hour===nH?'now':'';
-      const sur=s.surplus_kwh>=0
-        ?`<span style="color:var(--grn)">+${s.surplus_kwh.toFixed(2)}</span>`
-        :`<span style="color:var(--red)">${s.surplus_kwh.toFixed(2)}</span>`;
+      const sur=(s.surplus_kwh||0)>=0
+        ?`<span style="color:var(--grn)">+${(s.surplus_kwh||0).toFixed(2)}</span>`
+        :`<span style="color:var(--red)">${(s.surplus_kwh||0).toFixed(2)}</span>`;
       return`<tr class="${cl}">
         <td>${String(s.hour).padStart(2,'0')}:00</td>
-        <td>${s.pv_kwh.toFixed(3)}</td><td>${s.consumption_kwh.toFixed(3)}</td>
+        <td>${(s.pv_kwh||0).toFixed(3)}</td><td>${(s.consumption_kwh||0).toFixed(3)}</td>
         <td>${sur}</td><td>${bdg(s.action)}</td>
         <td>${s.charge_current_a>0?s.charge_current_a+'A':'-'}</td>
-        <td><span style="color:${sc(s.projected_soc)}">${s.projected_soc.toFixed(1)}%</span></td>
+        <td><span style="color:${sc(s.projected_soc||0)}">${(s.projected_soc||0).toFixed(1)}%</span></td>
       </tr>`;
     }).join('');
     document.getElementById('ft').textContent=
@@ -1479,7 +1786,8 @@ def start_dashboard(cfg: dict, state: SystemState, logger: logging.Logger):
 
 def _forecast_source(forecast: "ForecastManager") -> str:
     """Ermittelt welche Prognose-Quelle zuletzt verwendet wurde."""
-    if forecast.vrm.enabled and forecast.vrm._cache:
+    # Pruefe ob aktueller Cache von VRM stammt (nicht ob VRM jemals einen hatte)
+    if forecast.vrm.enabled and forecast._cache is forecast.vrm._cache:
         return "vrm"
     provider = forecast.fc_cfg.get("provider", "open_meteo")
     if forecast._cache:
@@ -1520,6 +1828,7 @@ def main():
     if cur is not None:
         logger.info(f"Aktueller MaxChargeCurrent laut Cerbo: {cur} A")
         state.charge_current_setpoint = cur
+        victron._last_written_a = cur   # verhindert unnötigen Write beim Start
 
     # evcc Monitor
     evcc = EvccMonitor(cfg, state, victron, logger)
