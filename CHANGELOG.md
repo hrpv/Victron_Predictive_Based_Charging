@@ -1,4 +1,7 @@
 # Changelog — battery_manager.py
+### Commits on May 22, 2026 
+•	Add energy tracking, history buffer, fix startup Modbus write, details see changelog.md 73aa2fef0ff7b33a4afb18923c88939ac213dacb
+
 **GitHub (master) → lokale Version**
 Vergleich: 1.586 Zeilen (GitHub) vs. 1.894 Zeilen (lokal, inkl. heutiger Bugfix)
 
