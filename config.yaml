@@ -106,13 +106,13 @@ dashboard:
   # Aktualisierungsintervall der Webseite [Sekunden]
   refresh_interval_seconds: 30
   # Datei für Statusspeicherung (JSON)
-  state_file: "/home/pi/solar_battery/state.json"
+  state_file: "/var/log/solar_battery/state.json"
 
 # --- Logging ---
 logging:
   level: "INFO"                  # DEBUG | INFO | WARNING | ERROR
 # option:addditional logfile
-# file: "/home/pi/solar_battery/battery_manager.log"
+# file: "/var/log/solar_battery/battery_manager.log"
 # no logfile
   file:
   max_size_mb: 10

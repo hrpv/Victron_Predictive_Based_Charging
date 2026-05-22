@@ -42,3 +42,8 @@ echo "Status: sudo systemctl status solar-battery"
 # sudo systemctl status solar-battery
 # sudo journalctl -u solar-battery -f        # Live-Log
 # sudo journalctl -u solar-battery --since today
+
+# logfile und state.json verlegen nach /var/log/solar_battery, config.yaml anpassen
+sudo mkdir -p /var/log/solar_battery
+sudo chown pi:pi /var/log/solar_battery
+sudo chmod 755 /var/log/solar_battery
