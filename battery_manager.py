@@ -316,17 +316,15 @@ class VictronModbus:
     def set_max_charge_current(self, current_a: float) -> bool:
         """
         Schreibt DVCC MaxChargeCurrent (Register 2705).
-        Schreibt nur bei Aenderung >= 1 A um Modbus-Kollisionen mit evcc zu minimieren.
+        Der Aufrufer (ChargeController) ist fuer Hysterese/Entprellung
+        verantwortlich. Diese Methode fuehrt den Modbus-Write immer
+        aus, wenn sie aufgerufen wird, und gibt True nur bei
+        tatsaechlichem Erfolg zurueck.
         """
         bat = self.cfg["battery"]
         current_a = max(float(bat["min_charge_current"]),
                         min(float(bat["max_charge_current"]), current_a))
         current_a = round(current_a)
-
-        # Schreiben nur wenn Aenderung gross genug
-        if (self._last_written_a is not None
-                and abs(current_a - self._last_written_a) < 1):
-            return True
 
         client = self._new_client()
         try:
@@ -833,6 +831,11 @@ class ForecastManager:
 class EnergyAccumulator:
     """Integriert Leistungsmesswerte trapezfoermig zu Tages-Energiewerten."""
 
+    # Mindestabstand zwischen zwei Integrationsschritten.
+    # Verhindert verrauschte Energiestatistiken bei sehr schnellen
+    # aufeinanderfolgenden Aufrufen (z.B. Modbus-Retry-Bursts).
+    MIN_UPDATE_INTERVAL_S: float = 1.0
+
     def __init__(self):
         self._last_ts: Optional[float] = None
         self._last_pv:  float = 0.0
@@ -848,7 +851,15 @@ class EnergyAccumulator:
             self.pv_kwh = self.load_kwh = 0.0
         self._day = today
         if self._last_ts is not None:
-            dt_h = (now_ts - self._last_ts) / 3600.0
+            dt_s = now_ts - self._last_ts
+            # Zu schnelle Updates ueberspringen – Messwert wird gemerkt,
+            # Zeitstempel aber NICHT aktualisiert, damit das naechste
+            # gueltiges Update das korrekte Intervall sieht.
+            if dt_s < self.MIN_UPDATE_INTERVAL_S:
+                self._last_pv = pv_w
+                self._last_ld = load_w
+                return
+            dt_h = dt_s / 3600.0
             self.pv_kwh   += self._last_pv * dt_h / 1000.0
             self.load_kwh += self._last_ld * dt_h / 1000.0
         self._last_ts = now_ts
@@ -942,11 +953,12 @@ class ChargeController:
 
     def _save_persistent(self):
         try:
+            import tempfile, os
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
             # Aktuellen Gesamtenergie-Stand = Akkumulator + Basis aus letztem Neustart
             pv_total   = self.state.pv_energy_today_kwh   + self._energy_base_pv
             load_total = self.state.load_energy_today_kwh + self._energy_base_load
-            self._state_file.write_text(json.dumps({
+            payload = json.dumps({
                 "last_full_charge_date":   self.state.last_full_charge_date,
                 "days_since_full_charge":  self.state.days_since_full_charge,
                 "soc":                     self.state.soc,
@@ -957,7 +969,20 @@ class ChargeController:
                 "energy_date":             date.today().isoformat(),
                 "energy_base_pv":          round(pv_total,   3),
                 "energy_base_load":        round(load_total, 3),
-            }, indent=2))
+            }, indent=2)
+            # Atomic write: erst in Temp-Datei, dann atomares rename().
+            # Verhindert korrupte state.json bei Stromausfall waehrend des Schreibens.
+            fd, tmp_path = tempfile.mkstemp(
+                dir=self._state_file.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())   # sicherstellen, dass Daten auf SD sind
+                os.replace(tmp_path, self._state_file)  # atomares rename
+            except Exception:
+                os.unlink(tmp_path)        # Temp aufraemen bei Fehler
+                raise
             self._last_persistent_save = time.monotonic()
         except Exception as e:
             self.logger.error(f"Zustand nicht speicherbar: {e}")
@@ -1193,82 +1218,77 @@ class ChargeController:
         Stundlicher Ladeplan:
         - Vergangene Stunden: Tatsaechliche Werte aus history_buffer (heute)
         - Zukuenftige Stunden: Prognose via _simulate_hour() mit exakter decide()-Logik
+
+        BUGFIX: Jede Stunde ist entweder Vergangenheit ODER Zukunft.
+        Keine Stunde kann verschwinden oder doppelt auftreten.
         """
         fc_list = self.forecast.get_forecast()
         today_iso = date.today().isoformat()
-        now_h = datetime.now().hour
-        now_m = datetime.now().minute
+        now = datetime.now()
+        now_h = now.hour
+        now_m = now.minute
 
         result = []
 
         # --- VERGANGENE STUNDEN: History (nur von heute) ---
-        # WICHTIG: history_buffer enthaelt HourlyHistory-Dataclass-Objekte!
-        # Zugriff NUR per Punkt-Notation (h.date_iso), NICHT per h.get() oder h["key"]!
         today_history = [h for h in self.state.history_buffer if h.date_iso == today_iso]
+        history_by_hour = {h.hour: h for h in today_history}
 
-        for hist in today_history:
-            h = hist.hour
-            # Aktuelle Stunde nur als Vergangenheit wenn > 55 Minuten
-            if h == now_h and now_m < 55:
-                continue
-            if h > now_h:
-                continue
-            result.append({
-                "hour": h,
-                "pv_kwh": hist.pv_kwh,
-                "consumption_kwh": hist.consumption_kwh,
-                "surplus_kwh": round(hist.surplus_kwh, 3),
-                "action": hist.action,
-                "charge_current_a": round(hist.charge_current_a, 1),
-                "projected_soc": round(hist.soc_end, 1),
-                "is_past": True,
-                "is_actual": True,
-            })
-
-        # Stunden ohne History-Eintrag markieren (nur wenn vor Start)
-        # SOC-Schaetzung: naechster bekannter History-SOC, sonst aktueller SOC.
-        covered_hours = {h.hour for h in today_history if not (h.hour == now_h and now_m < 55)}
-        hist_soc_by_hour = {h.hour: h.soc_end for h in today_history}
+        # Alle Stunden bis now_h als Vergangenheit behandeln,
+        # aber die aktuelle Stunde nur wenn sie fast vorbei ist (>= 55 Min).
         for h in range(now_h + 1):
-            if h in covered_hours or (h == now_h and now_m < 55):
-                continue
-            # Naechsten bekannten SOC-Wert suchen (vorwaerts, dann aktueller SOC)
-            gap_soc = next(
-                (hist_soc_by_hour[hh] for hh in range(h, now_h + 1) if hh in hist_soc_by_hour),
-                self.state.soc
-            )
-            result.append({
-                "hour": h,
-                "pv_kwh": 0.0,
-                "consumption_kwh": 0.0,
-                "surplus_kwh": 0.0,
-                "action": "unknown",
-                "charge_current_a": 0,
-                "projected_soc": round(gap_soc, 1),
-                "is_past": True,
-                "is_actual": False,
-            })
+            if h == now_h and now_m < 55:
+                continue  # Aktuelle Stunde noch laufend -> Zukunft
 
-        result.sort(key=lambda x: x["hour"])
+            hist = history_by_hour.get(h)
+            if hist:
+                result.append({
+                    "hour": h,
+                    "pv_kwh": hist.pv_kwh,
+                    "consumption_kwh": hist.consumption_kwh,
+                    "surplus_kwh": round(hist.surplus_kwh, 3),
+                    "action": hist.action,
+                    "charge_current_a": round(hist.charge_current_a, 1),
+                    "projected_soc": round(hist.soc_end, 1),
+                    "is_past": True,
+                    "is_actual": True,
+                })
+            elif h < now_h:
+                # Luecke in der History (z.B. nach Neustart oder Ausfall)
+                gap_soc = next(
+                    (history_by_hour[hh].soc_end for hh in range(h, now_h + 1)
+                     if hh in history_by_hour and not (hh == now_h and now_m < 55)),
+                    self.state.soc
+                )
+                result.append({
+                    "hour": h,
+                    "pv_kwh": 0.0,
+                    "consumption_kwh": 0.0,
+                    "surplus_kwh": 0.0,
+                    "action": "unknown",
+                    "charge_current_a": 0,
+                    "projected_soc": round(gap_soc, 1),
+                    "is_past": True,
+                    "is_actual": False,
+                })
 
         # --- ZUKUENFTIGE STUNDEN: Prognose via _simulate_hour ---
-        # Startpunkt: letzter tatsaechlicher SOC aus History (genauer als self.state.soc
-        # falls der aktuelle Messwert kurzzeitig springt). Fallback: aktueller Messwert.
+        # Startpunkt: letzter tatsaechlicher SOC aus History.
+        # Wenn die aktuelle Stunde schon als Vergangenheit laeuft, nimm deren SOC.
         last_actual_soc = self.state.soc
-        if today_history:
-            past_entries = [h for h in today_history
-                            if h.hour <= now_h and not (h.hour == now_h and now_m < 55)]
-            if past_entries:
-                last_actual_soc = past_entries[-1].soc_end
-        soc_sim = last_actual_soc
+        past_entries = [h for h in today_history
+                        if h.hour < now_h or (h.hour == now_h and now_m >= 55)]
+        if past_entries:
+            last_actual_soc = past_entries[-1].soc_end
 
+        soc_sim = last_actual_soc
         needs_full = self._needs_full_charge()
         pv_rem_total = self.forecast.pv_remaining_kwh()
         night_cons = self.forecast.night_consumption_kwh()
-
         fc_by_hour = {f.hour: f for f in fc_list}
 
         for h in range(now_h, 24):
+            # Aktuelle Stunde nur als Zukunft wenn sie noch laeuft (< 55 Min)
             if h == now_h and now_m >= 55:
                 continue
 
@@ -1412,6 +1432,18 @@ class ChargeController:
     def run_cycle(self):
         """Fuehrt einen Regelzyklus aus."""
         self._update_history()
+
+        # ── days_since_full_charge immer aktuell aus Datum berechnen ──────────
+        # Verhindert, dass der Wert nach einem langen Programmlauf (mehrere Tage
+        # ohne Neustart) auf dem Stand des letzten Neustarts eingefroren bleibt.
+        if self.state.last_full_charge_date:
+            try:
+                d = date.fromisoformat(self.state.last_full_charge_date)
+                self.state.days_since_full_charge = (date.today() - d).days
+            except ValueError:
+                pass
+        # ──────────────────────────────────────────────────────────────────────
+
         now = time.monotonic()
         min_dur = self._min_charge_duration_s
 
@@ -1784,6 +1816,53 @@ def start_dashboard(cfg: dict, state: SystemState, logger: logging.Logger):
 # Hauptprogramm
 # ─────────────────────────────────────────────
 
+def validate_config(cfg: dict, logger: logging.Logger) -> bool:
+    """
+    Prueft kritische Konfigurationswerte beim Start.
+    Fail-Fast: lieber sofort mit klarer Fehlermeldung abbrechen
+    als zur Laufzeit kryptische Fehler zu produzieren.
+    """
+    issues = []
+
+    bat = cfg.get("battery", {})
+    if not bat:
+        issues.append("Abschnitt 'battery' fehlt komplett")
+    else:
+        if bat.get("capacity_kwh", 0) <= 0:
+            issues.append("battery.capacity_kwh muss > 0 sein")
+        if bat.get("max_charge_current", 0) <= 0:
+            issues.append("battery.max_charge_current muss > 0 sein")
+        if bat.get("min_charge_current", 0) < 0:
+            issues.append("battery.min_charge_current muss >= 0 sein")
+        min_soc = bat.get("min_soc", None)
+        max_soc = bat.get("max_soc", None)
+        if min_soc is None:
+            issues.append("battery.min_soc fehlt")
+        if max_soc is None:
+            issues.append("battery.max_soc fehlt")
+        if min_soc is not None and max_soc is not None and min_soc >= max_soc:
+            issues.append(
+                f"battery.min_soc ({min_soc}) muss kleiner als max_soc ({max_soc}) sein")
+
+    modbus = cfg.get("modbus", {})
+    if not modbus.get("host"):
+        issues.append("modbus.host fehlt")
+
+    charging = cfg.get("charging", {})
+    if charging.get("control_interval_seconds", 60) < 5:
+        issues.append("charging.control_interval_seconds muss >= 5 sein")
+
+    loc = cfg.get("location", {})
+    if "latitude" not in loc or "longitude" not in loc:
+        issues.append("location.latitude / location.longitude fehlen")
+
+    if issues:
+        for issue in issues:
+            logger.error(f"Config-Fehler: {issue}")
+        return False
+    return True
+
+
 def _forecast_source(forecast: "ForecastManager") -> str:
     """Ermittelt welche Prognose-Quelle zuletzt verwendet wurde."""
     # Pruefe ob aktueller Cache von VRM stammt (nicht ob VRM jemals einen hatte)
@@ -1803,6 +1882,11 @@ def main():
     logger.info("Solar Batterie Manager v2.0  (Modbus TCP)")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
+
+    # Config-Validierung: lieber jetzt abbrechen als kryptische Laufzeitfehler
+    if not validate_config(cfg, logger):
+        logger.critical("Ungueltige Konfiguration – Programm wird beendet.")
+        sys.exit(1)
 
     state  = SystemState()
     energy = EnergyAccumulator()

@@ -172,3 +172,19 @@ als Quelle angezeigt.
 
 Hauptursachen: `HourlyHistory`, `EnergyAccumulator`, `_update_history()`,
 erweitertes `build_schedule()`, `_load_energy_base()`, Dashboard-Erweiterungen.
+
+### 24.05.2026
+ battery_manager v2.0.1 – Änderungsübersicht
+
+Hier ist die vollständig korrigierte Datei zum Download.
+
+## Zusammenfassung aller Änderungen gegenüber dem Original
+
+| # | Fix | Datei/Funktion | Beschreibung |
+|---|-----|----------------|--------------|
+| 1 | **Atomic Write** | `ChargeController._save_persistent()` | `tempfile.mkstemp` + `os.fsync` + `os.replace` – verhindert korrupte `state.json` bei Stromausfall |
+| 2 | **Min-Intervall** | `EnergyAccumulator.update()` | `MIN_UPDATE_INTERVAL_S = 1.0` – überspringt zu schnelle Updates, merkt aber Messwerte für nächstes gültiges Intervall |
+| 3 | **Config-Validierung** | `validate_config()` (neu) | Fail-fast Prüfung von `capacity_kwh`, `max_charge_current`, `min_soc`/`max_soc`, `modbus.host`, `control_interval_seconds`, Koordinaten |
+| A | **Bug A – Schedule** | `ChargeController.build_schedule()` | Klare Trennung Vergangenheit/Zukunft: Stunde ist entweder History (≥55 Min) oder Prognose (<55 Min), nie beides, nie keine |
+| B | **Bug B – Hysterese** | `VictronModbus.set_max_charge_current()` | Interne Hysterese entfernt; Methode führt Write immer aus wenn aufgerufen; Entscheidung „ob geschrieben wird" liegt einzig beim `ChargeController` via `_last_written_ramped_a` |
+| C | **days_since_full_charge** | days_since_full_charge immer aktuell aus Datum berechnen | Verhindert, dass der Wert nach einem langen Programmlauf nicht neuberechnet wird |
