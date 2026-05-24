@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 2.0.0  (Modbus TCP, kein MQTT)
+Version: 2.0.2  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -1141,19 +1141,12 @@ class ChargeController:
 
         action = "idle"
         current_a = 0.0
-        night = h >= self.cc.get("night_start_hour", 21) or h < self.cc.get("night_end_hour", 6)
 
         # Notfall-SOC
         if soc_sim <= self.cc.get("emergency_charge_soc", 25):
             action = "charging"
             current_a = max_a
             soc_sim = min(max_soc, soc_sim + (current_a * nom_v / 1000 / cap) * 100)
-            return action, current_a, soc_sim
-
-        if night:
-            action = "discharging"
-            deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-            soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
             return action, current_a, soc_sim
 
         # Maximale Ladeenergie pro Stunde durch Strombegrenzung
@@ -1176,23 +1169,22 @@ class ChargeController:
             shortfall = target_n - proj_eve
             dyn_target = min(target_n + shortfall * 0.5, max_soc)
 
+        def _apply_deficit(soc: float) -> tuple[str, float]:
+            """Berechnet Deficit und setzt action: discharging wenn Ueberschuss negativ, sonst idle."""
+            deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+            new_soc = max(min_soc, soc - (deficit / cap) * 100)
+            act = "discharging" if fc.net_kwh < 0 else "idle"
+            return act, new_soc
+
         # Ziel erreicht?
         if soc_sim >= dyn_target - hyst:
-            action = "idle"
-            deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-            soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+            action, soc_sim = _apply_deficit(soc_sim)
             return action, current_a, soc_sim
 
         # Morgen-Verzoegerung
         if morn_s <= h < morn_e:
-            if proj_eve >= target_n:
-                action = "idle"
-                deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-                soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
-            elif soc_sim > target_n - 15:
-                action = "idle"
-                deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-                soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+            if proj_eve >= target_n or soc_sim > target_n - 15:
+                action, soc_sim = _apply_deficit(soc_sim)
             else:
                 action = "trickle"
                 current_a = self.bat.get("trickle_current", 5)
@@ -1207,9 +1199,7 @@ class ChargeController:
             charge_kwh = min(fc.net_kwh, max_charge_kwh)
             soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
         else:
-            action = "idle"
-            deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-            soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+            action, soc_sim = _apply_deficit(soc_sim)
 
         return action, current_a, soc_sim
 
@@ -1879,7 +1869,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v2.0  (Modbus TCP)")
+    logger.info("Solar Batterie Manager v2.0.2  (Modbus TCP)")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

@@ -173,7 +173,7 @@ als Quelle angezeigt.
 Hauptursachen: `HourlyHistory`, `EnergyAccumulator`, `_update_history()`,
 erweitertes `build_schedule()`, `_load_energy_base()`, Dashboard-Erweiterungen.
 
-### 24.05.2026
+### 24.05.2026 (1)
  battery_manager v2.0.1 – Änderungsübersicht
 
 Hier ist die vollständig korrigierte Datei zum Download.
@@ -188,3 +188,24 @@ Hier ist die vollständig korrigierte Datei zum Download.
 | A | **Bug A – Schedule** | `ChargeController.build_schedule()` | Klare Trennung Vergangenheit/Zukunft: Stunde ist entweder History (≥55 Min) oder Prognose (<55 Min), nie beides, nie keine |
 | B | **Bug B – Hysterese** | `VictronModbus.set_max_charge_current()` | Interne Hysterese entfernt; Methode führt Write immer aus wenn aufgerufen; Entscheidung „ob geschrieben wird" liegt einzig beim `ChargeController` via `_last_written_ramped_a` |
 | C | **days_since_full_charge** | days_since_full_charge immer aktuell aus Datum berechnen | Verhindert, dass der Wert nach einem langen Programmlauf nicht neuberechnet wird |
+
+---
+
+### 24.05.2026 (2)
+battery_manager v2.0.2 – Änderungsübersicht
+
+## Zusammenfassung aller Änderungen gegenüber v2.0.1
+
+| # | Fix | Datei/Funktion | Beschreibung |
+|---|-----|----------------|--------------|
+| 1 | **Konsistente Aktion „Entladen"** | `ChargeController._simulate_hour()` | `night`-Variable und `if night:`-Block entfernt; neue Hilfsfunktion `_apply_deficit()` setzt `action = "discharging"` wenn `fc.net_kwh < 0`, sonst `"idle"` – gilt einheitlich für alle Stunden ohne Tag/Nacht-Unterscheidung |
+
+### Hintergrund
+Bisher wurde `"discharging"` nur für Stunden ab `night_start_hour` (Standard: 21 Uhr) gesetzt.
+Stunden wie 19–20 Uhr zeigten `"idle"` obwohl der Akku ebenfalls entladen wurde (Verbrauch > PV).
+Die Unterscheidung war rein durch die Uhrzeit gesteuert, nicht durch den tatsächlichen Energiefluss.
+
+### Neues Verhalten
+- `net_kwh < 0` → `"discharging"` (Verbrauch übersteigt PV, Akku gibt Energie ab)
+- `net_kwh >= 0` → `"idle"` (kein Ladebefehl, aber kein Nettodefizit)
+- Gilt für alle Stunden gleichwertig – keine separate Nachtlogik mehr
