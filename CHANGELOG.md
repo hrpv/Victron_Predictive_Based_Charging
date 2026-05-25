@@ -269,3 +269,54 @@ if fc.net_kwh >= -hyst_kwh:
 - Deficits kleiner als `hyst_kwh` (z.B. −0.06 kWh < −0.28 kWh) → SOC bleibt geklemmt
 - Deficits größer als `hyst_kwh` (z.B. −0.47 kWh ab 20:00) → SOC darf sinken
 - Entspricht dem realen Hysterese-Verhalten von DVCC exakter als die `>= 0`-Prüfung
+
+---
+
+### 25.05.2026 (3)
+battery_manager v2.0.5 – Änderungsübersicht
+
+## Zusammenfassung aller Änderungen gegenüber v2.0.4
+
+| # | Fix | Datei/Funktion | Beschreibung |
+|---|-----|----------------|--------------|
+| 1 | **Schwerer Bug: Modbus-Write jede Minute – Decision-Logik** | `ChargeController.run_cycle()` | Flags `hysterese_abgelaufen` und `wert_geaendert` entfernt; Write findet jetzt ausschließlich statt wenn `abs(ramped - _last_written_ramped_a) >= 1.0` |
+| 2 | **Shadow-Variable im Modbus-Layer** | `VictronModbus.set_max_charge_current()` | Zweite, unabhängige Schutzschicht: identischer Wert wird nie ein zweites Mal auf den Bus geschrieben, unabhängig von der Decision-Logik |
+
+### Ursache Fix 1 (Decision-Logik)
+In v2.0.1 wurde die interne Hysterese aus `set_max_charge_current()` entfernt
+(Bug B) und die Entscheidungshoheit an `run_cycle()` übertragen. Dabei wurde
+`hysterese_abgelaufen` eingeführt:
+
+```python
+hysterese_abgelaufen = (now - self._last_decision_ts) < 1.0  # soeben neu entschieden
+if hysterese_abgelaufen or wert_geaendert:
+    victron.set_max_charge_current(ramped)
+```
+
+`hysterese_abgelaufen` ist `True` direkt nach jeder neuen `decide()`-Entscheidung.
+Da `decide()` alle `min_charge_duration_minutes` aufgerufen wird, löste das Flag
+regelmäßig einen Write aus — auch wenn der Wert unverändert `0 A → 0 A` war.
+`wert_geaendert` schützte nur *zwischen* Entscheidungen, aber nie *beim*
+Entscheidungszeitpunkt selbst.
+
+### Fix 1
+Beide Flags entfernt. Einziges Schreibkriterium in `run_cycle()`:
+
+```python
+if abs(ramped - self._last_written_ramped_a) >= 1.0:
+    victron.set_max_charge_current(ramped)
+```
+
+### Fix 2 (Shadow-Variable, unabhängig von Fix 1)
+`set_max_charge_current()` prüft jetzt selbst vor jedem Write:
+
+```python
+if self._last_written_a is not None and self._last_written_a == current_a:
+    self.state.charge_current_setpoint = current_a
+    return True   # Wert stimmt bereits, kein Write nötig
+```
+
+`_last_written_a` wird beim Programmstart via `read_current_max_charge()` mit dem
+aktuellen Cerbo-Wert vorbelegt. Damit ist es strukturell unmöglich, denselben Wert
+zweimal auf den Modbus-Bus zu schreiben — unabhängig davon was die Decision-Logik
+übergibt. Beide Schutzschichten sind voneinander unabhängig und sichern sich gegenseitig ab.

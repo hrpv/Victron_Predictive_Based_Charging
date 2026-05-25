@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 2.0.4  (Modbus TCP, kein MQTT)
+Version: 2.0.5  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -316,15 +316,25 @@ class VictronModbus:
     def set_max_charge_current(self, current_a: float) -> bool:
         """
         Schreibt DVCC MaxChargeCurrent (Register 2705).
-        Der Aufrufer (ChargeController) ist fuer Hysterese/Entprellung
-        verantwortlich. Diese Methode fuehrt den Modbus-Write immer
-        aus, wenn sie aufgerufen wird, und gibt True nur bei
-        tatsaechlichem Erfolg zurueck.
+
+        Schicht-1-Schutz (Shadow-Variable): Identischer Wert wird niemals
+        ein zweites Mal auf den Bus geschrieben – unabhaengig davon was der
+        Aufrufer uebergibt. _last_written_a wird beim Start via
+        read_current_max_charge() vorbelegt, damit auch der allererste
+        Zyklus keinen unnoetigen Write ausloest.
+
+        Schicht-2-Schutz liegt beim ChargeController (_last_written_ramped_a).
+        Beide Schichten sind unabhaengig voneinander und sichern sich gegenseitig ab.
         """
         bat = self.cfg["battery"]
         current_a = max(float(bat["min_charge_current"]),
                         min(float(bat["max_charge_current"]), current_a))
         current_a = round(current_a)
+
+        # Schicht-1: Shadow-Variable – identischer Wert → kein Write
+        if self._last_written_a is not None and self._last_written_a == current_a:
+            self.state.charge_current_setpoint = current_a
+            return True   # aus Sicht des Aufrufers erfolgreich (Wert stimmt bereits)
 
         client = self._new_client()
         try:
@@ -1464,15 +1474,14 @@ class ChargeController:
             if not reason.endswith("(Hysterese)"):
                 reason = reason + " (Hysterese)"
 
-        # Schreiben nur wenn Hysterese abgelaufen UND sich gerampter Wert geaendert hat
+        # Schreiben nur wenn sich der gerampte Sollwert tatsaechlich geaendert hat.
+        # Die frueheren Flags hysterese_abgelaufen/wert_geaendert wurden entfernt:
+        # hysterese_abgelaufen war True bei jeder neuen Entscheidung, also auch
+        # bei 0 A -> 0 A – das hat den Write-Schutz vollstaendig ausgehebelt.
         write_performed = False
         if target_a >= 0:
             ramped = self._ramp(target_a)
-            # Schreib-Hysterese: nur bei Ablauf der Entscheidungs-Hysterese
-            # oder wenn der gerampete Wert sich tatsaechlich geaendert hat
-            hysterese_abgelaufen = (now - self._last_decision_ts) < 1.0  # soeben neu entschieden
-            wert_geaendert = abs(ramped - self._last_written_ramped_a) >= 1.0
-            if hysterese_abgelaufen or wert_geaendert:
+            if abs(ramped - self._last_written_ramped_a) >= 1.0:
                 if self.victron.set_max_charge_current(ramped):
                     self._last_written_ramped_a = ramped
                     write_performed = True
@@ -1878,7 +1887,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v2.0.4  (Modbus TCP)")
+    logger.info("Solar Batterie Manager v2.0.5  (Modbus TCP)")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 
