@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 2.0.2  (Modbus TCP, kein MQTT)
+Version: 2.0.3  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -1179,6 +1179,13 @@ class ChargeController:
         # Ziel erreicht?
         if soc_sim >= dyn_target - hyst:
             action, soc_sim = _apply_deficit(soc_sim)
+            # SOC darf nicht unter die Hysterese-Schwelle fallen, solange PV-Ueberschuss
+            # vorhanden ist – sonst wuerde die naechste Stunde faelschlicherweise wieder
+            # laden (Ping-Pong-Effekt durch minimales Netto-Deficit).
+            # In der Realitaet wuerde DVCC bei einem solchen Minimal-Deficit sofort
+            # wieder einschalten; die Simulation klemmt den SOC deshalb auf dyn_target - hyst.
+            if fc.net_kwh >= 0:
+                soc_sim = max(soc_sim, dyn_target - hyst)
             return action, current_a, soc_sim
 
         # Morgen-Verzoegerung
@@ -1869,7 +1876,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v2.0.2  (Modbus TCP)")
+    logger.info("Solar Batterie Manager v2.0.3  (Modbus TCP)")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

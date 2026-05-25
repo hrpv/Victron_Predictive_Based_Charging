@@ -209,3 +209,37 @@ Die Unterscheidung war rein durch die Uhrzeit gesteuert, nicht durch den tatsäc
 - `net_kwh < 0` → `"discharging"` (Verbrauch übersteigt PV, Akku gibt Energie ab)
 - `net_kwh >= 0` → `"idle"` (kein Ladebefehl, aber kein Nettodefizit)
 - Gilt für alle Stunden gleichwertig – keine separate Nachtlogik mehr
+
+---
+
+### 25.05.2026
+battery_manager v2.0.3 – Änderungsübersicht
+
+## Zusammenfassung aller Änderungen gegenüber v2.0.2
+
+| # | Fix | Datei/Funktion | Beschreibung |
+|---|-----|----------------|--------------|
+| 1 | **Bugfix SOC-Ping-Pong nach Ziel-Erreichen** | `ChargeController._simulate_hour()` | SOC wird nach Erreichen des Ladeziels auf die Hysterese-Schwelle geklemmt, wenn kein echtes Netto-Deficit vorliegt (`net_kwh >= 0`) |
+
+### Hintergrund
+Nach Erreichen des Ziel-SOC (z.B. 78.3% bei Ziel 80%, Hysterese 2%) konnte ein minimales
+Netto-Deficit (z.B. −0.055 kWh um 18:00 Uhr) den simulierten SOC knapp unter die
+Hysterese-Schwelle (78%) drücken. Die Folgestunde wertete das als „Ziel nicht erreicht"
+und erzeugte einen erneuten LADEN-Eintrag (z.B. 19:00 Uhr mit 6 A), obwohl das Ziel
+faktisch gehalten wird. In der Realität würde das Gerät bei einem solch minimalen Abfall
+sofort wieder einschalten – der Ping-Pong-Effekt war ein reines Simulations-Artefakt.
+
+### Neues Verhalten
+Nach dem Block „Ziel erreicht" in `_simulate_hour()`:
+```python
+if fc.net_kwh >= 0:
+    soc_sim = max(soc_sim, dyn_target - hyst)
+```
+- `net_kwh < 0` (echtes Deficit) → SOC darf weiter sinken (Akku entlädt sich)
+- `net_kwh >= 0` (Überschuss oder ausgeglichen) → SOC wird auf Hysterese-Schwelle gehalten
+
+### Sichtbarer Effekt im Ladeplan
+Vorher: SOC sank zwischen 12:00 und 19:00 trotz PV-Überschuss schrittweise ab,
+und um 19:00 wurde fälschlicherweise wieder LADEN mit 6 A angezeigt.
+Nachher: SOC bleibt nach Ziel-Erreichen stabil; LADEN taucht erst dann wieder auf,
+wenn ein echtes Netto-Deficit den SOC dauerhaft unter die Hysterese-Schwelle drückt.
