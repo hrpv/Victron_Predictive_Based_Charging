@@ -243,3 +243,29 @@ Vorher: SOC sank zwischen 12:00 und 19:00 trotz PV-Überschuss schrittweise ab,
 und um 19:00 wurde fälschlicherweise wieder LADEN mit 6 A angezeigt.
 Nachher: SOC bleibt nach Ziel-Erreichen stabil; LADEN taucht erst dann wieder auf,
 wenn ein echtes Netto-Deficit den SOC dauerhaft unter die Hysterese-Schwelle drückt.
+
+---
+
+### 25.05.2026 (2)
+battery_manager v2.0.4 – Änderungsübersicht
+
+## Zusammenfassung aller Änderungen gegenüber v2.0.3
+
+| # | Fix | Datei/Funktion | Beschreibung |
+|---|-----|----------------|--------------|
+| 1 | **Verbesserter Ping-Pong-Schutz** | `ChargeController._simulate_hour()` | SOC-Klemmung nach Ziel-Erreichen toleriert jetzt Deficits bis zur Größe der Hysterese-Energie (`hyst_kwh = hyst / 100 * cap`) statt nur `net_kwh >= 0` |
+
+### Hintergrund
+v2.0.3 klemmt den SOC nur bei `net_kwh >= 0`. Ein minimales Deficit (z.B. −0.055 kWh)
+würde trotzdem nicht geklemmt und könnte den SOC unter die Hysterese-Schwelle drücken.
+Der Ping-Pong-Effekt war damit unter Grenzwertbedingungen noch möglich.
+
+### Neues Verhalten
+```python
+hyst_kwh = hyst / 100.0 * cap   # z.B. 2% von 14 kWh = 0.28 kWh
+if fc.net_kwh >= -hyst_kwh:
+    soc_sim = max(soc_sim, dyn_target - hyst)
+```
+- Deficits kleiner als `hyst_kwh` (z.B. −0.06 kWh < −0.28 kWh) → SOC bleibt geklemmt
+- Deficits größer als `hyst_kwh` (z.B. −0.47 kWh ab 20:00) → SOC darf sinken
+- Entspricht dem realen Hysterese-Verhalten von DVCC exakter als die `>= 0`-Prüfung
