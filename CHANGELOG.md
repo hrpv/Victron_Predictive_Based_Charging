@@ -320,3 +320,42 @@ if self._last_written_a is not None and self._last_written_a == current_a:
 aktuellen Cerbo-Wert vorbelegt. Damit ist es strukturell unmöglich, denselben Wert
 zweimal auf den Modbus-Bus zu schreiben — unabhängig davon was die Decision-Logik
 übergibt. Beide Schutzschichten sind voneinander unabhängig und sichern sich gegenseitig ab.
+
+---
+
+### 25.05.2026 (4)
+battery_manager v2.0.6 – Änderungsübersicht
+
+## Zusammenfassung aller Änderungen gegenüber v2.0.5
+
+| # | Fix | Datei/Funktion | Beschreibung |
+|---|-----|----------------|--------------|
+| 1 | **Bugfix: Ladestrom zeigt 0 A nach Neustart** | `main()` | `controller._ramp_current` und `controller._last_written_ramped_a` werden nach Controller-Initialisierung mit dem vom Cerbo gelesenen Ist-Wert vorbelegt |
+
+### Ursache
+Nach einem Neustart wird der aktuelle `MaxChargeCurrent` des Cerbo (z.B. 50 A) korrekt
+in `victron._last_written_a` und `state.charge_current_setpoint` gesetzt.
+Der `ChargeController` wird jedoch danach neu erzeugt und initialisiert
+`_ramp_current = 0.0` sowie `_last_written_ramped_a = 0.0` — ohne Kenntnis des
+echten Cerbo-Werts.
+
+Beim ersten `run_cycle()`:
+- `decide()` liefert z.B. `target_a = 50` (PV-Überschuss)
+- `_ramp(50)` → `_ramp_current = min(0 + 5, 50) = 5` (Rampe startet bei 0!)
+- `abs(5 - 0) >= 1` → Write `5 A` → Cerbo wird fälschlicherweise auf 5 A gedrosselt
+- Dashboard zeigt `5 A` statt `50 A`
+
+Bei PAUSE-Entscheidung (`target_a = 0`):
+- `_ramp(0) = 0`, Shadow `_last_written_a = 50 ≠ 0` → Write `0 A`
+- Dashboard zeigt `0 A` obwohl Cerbo noch mit 50 A lädt
+
+### Fix
+Nach der Controller-Initialisierung in `main()`:
+```python
+if cur is not None:
+    controller._ramp_current          = cur
+    controller._last_written_ramped_a = cur
+```
+Alle drei Startwert-Variablen (`victron._last_written_a`, `controller._ramp_current`,
+`controller._last_written_ramped_a`) zeigen jetzt auf den gleichen Cerbo-Ist-Wert.
+Die Rampe setzt nahtlos am echten Ausgangspunkt an, kein falscher Write beim ersten Zyklus.

@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 2.0.5  (Modbus TCP, kein MQTT)
+Version: 2.0.6  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -1887,7 +1887,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v2.0.5  (Modbus TCP)")
+    logger.info("Solar Batterie Manager v2.0.6  (Modbus TCP)")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 
@@ -1920,7 +1920,7 @@ def main():
     if cur is not None:
         logger.info(f"Aktueller MaxChargeCurrent laut Cerbo: {cur} A")
         state.charge_current_setpoint = cur
-        victron._last_written_a = cur   # verhindert unnötigen Write beim Start
+        victron._last_written_a = cur   # Shadow-Variable Modbus-Layer vorbelegen
 
     # evcc Monitor
     evcc = EvccMonitor(cfg, state, victron, logger)
@@ -1931,6 +1931,15 @@ def main():
 
     # Ladesteuerung
     controller = ChargeController(cfg, state, forecast, victron, evcc, logger)
+
+    # Rampe und Schreib-Hysterese des Controllers mit Cerbo-Ist-Wert vorbelegen.
+    # Ohne das wuerde _ramp_current bei 0 starten und sofort einen Write mit
+    # einem zu niedrigen Rampenwert ausloesen (z.B. 5 A statt 50 A), was im
+    # Dashboard als falscher Ladestrom erscheint und den Cerbo kurzzeitig
+    # auf den Rampenwert setzt.
+    if cur is not None:
+        controller._ramp_current         = cur
+        controller._last_written_ramped_a = cur
 
     # Dashboard
     if cfg.get("dashboard", {}).get("enabled", True):
