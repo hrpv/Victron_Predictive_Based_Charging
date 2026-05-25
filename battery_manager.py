@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 2.0.6  (Modbus TCP, kein MQTT)
+Version: 2.0.7  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -1211,12 +1211,15 @@ class ChargeController:
                 soc_sim = min(max_soc, soc_sim + (current_a * nom_v / 1000 / cap) * 100)
             return action, current_a, soc_sim
 
-        # PV-Ueberschuss, begrenzt durch Strombegrenzung
+        # PV-Ueberschuss, begrenzt durch Strombegrenzung und Ladeziel
         if fc.net_kwh > 0:
             action = "charging"
             current_a = min(fc.net_kwh * 1000 / nom_v, max_a)
             charge_kwh = min(fc.net_kwh, max_charge_kwh)
-            soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+            # Deckelung auf dyn_target (nicht max_soc): sobald das Ziel erreicht
+            # ist, wird in der naechsten Stunde PAUSE entschieden. Die Simulation
+            # muss das abbilden, sonst werden unrealistische SOC-Werte projiziert.
+            soc_sim = min(dyn_target, soc_sim + (charge_kwh / cap) * 100)
         else:
             action, soc_sim = _apply_deficit(soc_sim)
 
@@ -1887,7 +1890,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v2.0.6  (Modbus TCP)")
+    logger.info("Solar Batterie Manager v2.0.7  (Modbus TCP)")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

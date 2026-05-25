@@ -359,3 +359,38 @@ if cur is not None:
 Alle drei Startwert-Variablen (`victron._last_written_a`, `controller._ramp_current`,
 `controller._last_written_ramped_a`) zeigen jetzt auf den gleichen Cerbo-Ist-Wert.
 Die Rampe setzt nahtlos am echten Ausgangspunkt an, kein falscher Write beim ersten Zyklus.
+
+---
+
+### 25.05.2026 (5)
+battery_manager v2.0.7 – Änderungsübersicht
+
+## Zusammenfassung aller Änderungen gegenüber v2.0.6
+
+| # | Fix | Datei/Funktion | Beschreibung |
+|---|-----|----------------|--------------|
+| 1 | **Bugfix: SOC-Projektion überschreitet Ladeziel** | `ChargeController._simulate_hour()` | Im PV-Überschuss-Block wird `soc_sim` jetzt auf `dyn_target` gedeckelt statt auf `max_soc` |
+
+### Ursache
+Im PV-Überschuss-Block wurde der SOC nach dem Laden auf `max_soc` (98%) gedeckelt:
+
+```python
+soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+```
+
+Da `max_soc = 98%` und das normale Ladeziel `dyn_target = 80%` ist, wurde der
+simulierte SOC weit über das Ziel hinaus projiziert. Beispiel aus dem Screenshot:
+SOC 75% + 2.4 kWh Ladung (50 A × 48 V) = ~92% — obwohl die Ladeentscheidung
+bei 80% stoppt. Die Folgestunden zeigten deshalb korrekt PAUSE, aber mit einem
+unrealistischen Ausgangs-SOC von 91%.
+
+### Fix
+```python
+soc_sim = min(dyn_target, soc_sim + (charge_kwh / cap) * 100)
+```
+Der SOC wird beim normalen PV-Überschuss-Laden auf `dyn_target` gedeckelt.
+Das entspricht dem realen Verhalten: Die Ladesteuerung stoppt bei Ziel-Erreichen,
+überschüssige PV-Energie geht ins Netz.
+
+Hinweis: `full_charge`- und `trickle`-Blöcke bleiben auf `max_soc` gedeckelt,
+da dort das Laden explizit bis `max_soc` (Zellbalancing) vorgesehen ist.
