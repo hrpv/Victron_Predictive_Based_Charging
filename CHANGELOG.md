@@ -1,6 +1,6 @@
 # Changelog — battery_manager.py
-### Commits on May 22, 2026 
-•	Add energy tracking, history buffer, fix startup Modbus write, details see changelog.md 73aa2fef0ff7b33a4afb18923c88939ac213dacb
+### Commits on May 22, 2026
+• Add energy tracking, history buffer, fix startup Modbus write, details see changelog.md 73aa2fef0ff7b33a4afb18923c88939ac213dacb
 
 **GitHub (master) → lokale Version**
 Vergleich: 1.586 Zeilen (GitHub) vs. 1.894 Zeilen (lokal, inkl. heutiger Bugfix)
@@ -30,9 +30,9 @@ Zugriff ausschließlich per Punkt-Notation (kein Dictionary-Zugriff).
 
 **Lokal (neu):**
 ```python
-history_buffer: list = field(default_factory=list)  # [HourlyHistory, ...]
-pv_energy_today_kwh: float = 0.0       # intern aufsummiert via EnergyAccumulator
-load_energy_today_kwh: float = 0.0     # intern aufsummiert via EnergyAccumulator
+history_buffer: list = field(default_factory=list) # [HourlyHistory, ...]
+pv_energy_today_kwh: float = 0.0 # intern aufsummiert via EnergyAccumulator
+load_energy_today_kwh: float = 0.0 # intern aufsummiert via EnergyAccumulator
 ```
 
 ---
@@ -47,7 +47,7 @@ load_energy_today_kwh: float = 0.0     # intern aufsummiert via EnergyAccumulato
 - Wird in der Hauptschleife in Schritt 2 aufgerufen:
   ```python
   energy.update(state.pv_power_w, state.load_power_w)
-  state.pv_energy_today_kwh  = round(energy.pv_kwh,   3)
+  state.pv_energy_today_kwh = round(energy.pv_kwh, 3)
   state.load_energy_today_kwh = round(energy.load_kwh, 3)
   ```
 - Ergebnis sichtbar im Dashboard als „Heute: X kWh" bei PV und Verbrauch
@@ -61,8 +61,8 @@ load_energy_today_kwh: float = 0.0     # intern aufsummiert via EnergyAccumulato
 
 **Lokal:** drei neue Felder in `state.json`:
 ```json
-"energy_date":      "2026-05-22",
-"energy_base_pv":   1.234,
+"energy_date": "2026-05-22",
+"energy_base_pv": 1.234,
 "energy_base_load": 2.567
 ```
 Neue Methode `_load_energy_base()` stellt beim Start die Energiebasis
@@ -115,7 +115,7 @@ cur = victron.read_current_max_charge()
 if cur is not None:
     logger.info(f"Aktueller MaxChargeCurrent laut Cerbo: {cur} A")
     state.charge_current_setpoint = cur
-    victron._last_written_a = cur   # verhindert unnötigen Write beim Start
+    victron._last_written_a = cur # verhindert unnötigen Write beim Start
 ```
 
 ---
@@ -262,7 +262,7 @@ Der Ping-Pong-Effekt war damit unter Grenzwertbedingungen noch möglich.
 
 ### Neues Verhalten
 ```python
-hyst_kwh = hyst / 100.0 * cap   # z.B. 2% von 14 kWh = 0.28 kWh
+hyst_kwh = hyst / 100.0 * cap # z.B. 2% von 14 kWh = 0.28 kWh
 if fc.net_kwh >= -hyst_kwh:
     soc_sim = max(soc_sim, dyn_target - hyst)
 ```
@@ -288,7 +288,7 @@ In v2.0.1 wurde die interne Hysterese aus `set_max_charge_current()` entfernt
 `hysterese_abgelaufen` eingeführt:
 
 ```python
-hysterese_abgelaufen = (now - self._last_decision_ts) < 1.0  # soeben neu entschieden
+hysterese_abgelaufen = (now - self._last_decision_ts) < 1.0 # soeben neu entschieden
 if hysterese_abgelaufen or wert_geaendert:
     victron.set_max_charge_current(ramped)
 ```
@@ -313,7 +313,7 @@ if abs(ramped - self._last_written_ramped_a) >= 1.0:
 ```python
 if self._last_written_a is not None and self._last_written_a == current_a:
     self.state.charge_current_setpoint = current_a
-    return True   # Wert stimmt bereits, kein Write nötig
+    return True # Wert stimmt bereits, kein Write nötig
 ```
 
 `_last_written_a` wird beim Programmstart via `read_current_max_charge()` mit dem
@@ -353,7 +353,7 @@ Bei PAUSE-Entscheidung (`target_a = 0`):
 Nach der Controller-Initialisierung in `main()`:
 ```python
 if cur is not None:
-    controller._ramp_current          = cur
+    controller._ramp_current = cur
     controller._last_written_ramped_a = cur
 ```
 Alle drei Startwert-Variablen (`victron._last_written_a`, `controller._ramp_current`,
@@ -394,3 +394,142 @@ Das entspricht dem realen Verhalten: Die Ladesteuerung stoppt bei Ziel-Erreichen
 
 Hinweis: `full_charge`- und `trickle`-Blöcke bleiben auf `max_soc` gedeckelt,
 da dort das Laden explizit bis `max_soc` (Zellbalancing) vorgesehen ist.
+
+
+---
+
+### 25.05.2026 (6)
+battery_manager v3.0.0 – Änderungsübersicht
+
+## Zusammenfassung aller Änderungen gegenüber v2.0.7
+
+| # | Feature | Datei/Funktion | Beschreibung |
+|---|---------|----------------|--------------|
+| 1 | **Dynamisches target_soc** | `ChargeController._calculate_target_soc()` | `target_soc` ist nicht mehr fest `target_soc_normal` (80%), sondern wird für jeden Tag individuell berechnet: `max(min_soc, emergency_charge_soc) + (night_consumption_kWh / capacity_kWh) × 100%`, capped auf 98% |
+| 2 | **Volllade-Zwang alle 10 Tage** | `ChargeController._calculate_target_soc()` | Wenn `days_since_full_charge ≥ 10` → `target_soc = 98%` (Vollladung für Zellbalancing) |
+| 3 | **Morgen-Notladung** | `ChargeController.decide()` | Bei Sonnenaufgang im Morgenfenster: Wenn `SOC < min(emergency_charge_soc, min_soc)` → sofort laden mit `max_charge_current` (kein Warten auf `morning_delay_end_hour`). Ladeplan wird erst erstellt, wenn SOC ≥ Minimum erreicht ist |
+| 4 | **Adaptive Ladezeitfenster** | `ChargeController.decide()` / `_simulate_hour()` | Je niedriger der PV-Überschuss, desto früher muss mit Laden begonnen werden – auch schon vor `morning_delay_end_hour` bei geringem Überschuss. Bei genug PV im optimalen Fenster → Warten, sonst frühes Laden |
+| 5 | **Sonnenhöchststand-Optimierung** | `ChargeController._get_optimal_charge_window()` / `decide()` | Hauptladefenster um 13:00 ± `solar_noon_offset_hours` (Default: 2h = 11:00–15:00). Im optimalen Fenster bei genug PV → Ladestrom auf `reduced_charge_current_a` (Default: 20 A) reduziert, um das 4h-Fenster besser auszunutzen statt frühzeitig auf Ziel-SOC zu kommen |
+| 6 | **Auto-Reset Vollladung** | `ChargeController.run_cycle()` | Monitoring: Wenn `SOC ≥ 98%` für mindestens 1 Stunde erreicht wurde → `days_since_full_charge` in `state.json` sofort auf `0` gesetzt, auch wenn kein expliziter `full_charge_cycle` eingeplant war |
+| 7 | **Rückwärtskompatibilität Config** | `config.yaml` / `validate_config()` | Neue optionale Felder `solar_noon_offset_hours` (Default: 2) und `reduced_charge_current_a` (Default: 20) werden mit sinnvollen Defaults belegt. Alte `config.yaml` ohne diese Felder funktioniert ohne Anpassung |
+
+---
+
+## 1. Dynamisches target_soc (statt fester 80%)
+
+**v2.0.7:** `target_soc` war konstant `target_soc_normal` (80%).
+
+**v3.0.0:** Neue Methode `_calculate_target_soc()` berechnet täglich:
+
+```python
+def _calculate_target_soc(self) -> float:
+    min_required = max(self.bat["min_soc"], self.cc.get("emergency_charge_soc", 25))
+    night_cons = self.forecast.night_consumption_kwh()
+    capacity = self.bat["capacity_kwh"]
+
+    if self.state.days_since_full_charge >= self.bat.get("full_charge_interval_days", 10):
+        return 98.0  # Vollladung fällig
+
+    target = min_required + (night_cons / capacity) * 100.0
+    target = min(target, 98.0)
+    return max(target, min_required)
+```
+
+- `night_consumption_kWh`: Erwarteter Verbrauch von Sonnenuntergang bis Sonnenaufgang (aus VRM-Prognose oder historischen Werten)
+- Ergebnis liegt immer zwischen `min_soc`/`emergency_charge_soc` und `target_soc_full` (98%)
+
+---
+
+## 2. Morgen-Notladung (Emergency Charge)
+
+**v2.0.7:** Ladung startete frühestens ab `morning_delay_start_hour`, auch wenn der SOC kritisch niedrig war.
+
+**v3.0.0:** Bei Sonnenaufgang im Morgenfenster (6:00–10:00 Uhr):
+1. Prüfe aktuellen SOC
+2. Wenn `SOC < min(emergency_charge_soc, min_soc)`:
+   - Sofort laden mit `max_charge_current` (kein Warten auf `morning_delay_end_hour`)
+   - Ladeplan wird erst erstellt, wenn SOC ≥ Minimum erreicht ist
+3. Danach: Berechne dynamisches `target_soc` und erstelle normalen Tages-Ladeplan
+
+---
+
+## 3. Adaptive Ladezeitfenster & Sonnenhöchststand-Optimierung
+
+**v2.0.7:** Ladeplan war primär durch `morning_delay_start_hour`/`morning_delay_end_hour` und PV-Prognose gesteuert.
+
+**v3.0.0:** Intelligente Fenster-Logik mit `_get_optimal_charge_window()`:
+
+| PV-Überschuss | Verhalten |
+|---------------|-----------|
+| Gering | Laden beginnt so früh wie nötig – auch vor `morning_delay_end_hour` (z.B. 8:00 Uhr), um das Ziel zu erreichen |
+| Mittel | Ladefenster verschiebt sich Richtung Sonnenhöchststand (11:00–15:00) |
+| Hoch | Hauptladung konzentriert sich um Sonnenhöchststand ±2h mit reduziertem Strom (z.B. 20 A statt 50 A) |
+
+Um das 4h-Fenster (Sonnenhöchststand ±2h) besser auszunutzen, wird bei ausreichendem Überschuss der Ladestrom reduziert. Das verhindert, dass die Ladung zu früh beendet ist und PV-Energie später ins Netz geht.
+
+---
+
+## 4. Auto-Reset: days_since_full_charge
+
+**v2.0.7:** `days_since_full_charge` wurde nur bei einem explizit geplanten `full_charge_cycle` zurückgesetzt.
+
+**v3.0.0:** Monitoring-Regel in `run_cycle()`:
+- Wenn `SOC ≥ 98%` für mindestens eine Stunde erreicht wurde
+- → `days_since_full_charge` wird sofort in `state.json` auf `0` gesetzt
+- → Gilt auch, wenn kein `full_charge_cycle` explizit eingeplant war (z.B. durch unerwartet hohen PV-Überschuss)
+- → `_soc_98_reached_at` (Timestamp) wird zurückgesetzt wenn SOC wieder unter 98% fällt
+
+---
+
+## 5. Rückwärtskompatibilität
+
+**v3.0.0:** Neue optionale Konfigurationsfelder werden mit sinnvollen Defaults belegt:
+
+```yaml
+charging:
+  # NEU (optional, Default: 2)
+  solar_noon_offset_hours: 2        # ± Stunden um 13:00 (Sonnenhöchststand)
+  # NEU (optional, Default: 20)
+  reduced_charge_current_a: 20      # Reduzierter Strom im Optimal-Fenster
+```
+
+Alte `config.yaml` ohne diese Felder funktioniert ohne Anpassung – die Defaults greifen automatisch via `dict.get(key, default)`.
+
+**Validierung** in `validate_config()`:
+- `solar_noon_offset_hours ≥ 0`
+- `reduced_charge_current_a ≤ max_charge_current`
+- `reduced_charge_current_a ≥ 0`
+
+---
+
+## 6. Bugfix: Nachtverbrauch-Anzeige 0.0 kWh (v3.0.0 final)
+
+**Problem:** `state.forecast_consumption_night_kwh` wurde in v3.0.0 initial mit `0.0` gesetzt, aber nie aktualisiert. Das Dashboard zeigte daher immer `0.0 kWh` für den Nachtverbrauch, obwohl die interne Berechnung korrekt war (VRM lieferte z.B. `~4.7 kWh`).
+
+**Ursache:** In der ursprünglichen v2.0.7 wurde `forecast_consumption_night_kwh` in `decide()` gesetzt:
+```python
+self.state.forecast_consumption_night_kwh = round(night_cons, 2)
+```
+In v3.0.0 wurde `decide()` komplett neu geschrieben, aber diese Zeile wurde vergessen.
+
+**Fix:** `state.forecast_consumption_night_kwh` wird jetzt in `_calculate_target_soc()` gesetzt – das ist robuster, weil diese Methode sowohl von `decide()` als auch von `_simulate_hour()` (in `build_schedule()`) aufgerufen wird:
+```python
+def _calculate_target_soc(self) -> float:
+    night_cons = self.forecast.night_consumption_kwh()
+    self.state.forecast_consumption_night_kwh = round(night_cons, 2)  # <-- Fix
+    ...
+```
+
+**Ergebnis:** Dashboard zeigt jetzt den korrekten Nachtverbrauch (z.B. `4.7 kWh`) und das Ziel-SOC wird korrekt berechnet (`25% + (4.7/14)*100 = 58.6%` statt fälschlicher `48%`).
+
+---
+
+## Zusammenfassung der Dateigröße
+
+| Version | Zeilen |
+|---------|--------|
+| v2.0.7 (GitHub) | ~1.998 |
+| v3.0.0 final | ~2.090 |
+| Differenz | **~+92 Zeilen** |
+
+Hauptursachen: `_calculate_target_soc()`, `_get_optimal_charge_window()`, Morgen-Notladung, adaptive Fensterlogik, Auto-Reset-Vollladung, Nachtverbrauch-Display-Fix.

@@ -824,14 +824,29 @@ class ForecastManager:
         return sum(f.pv_kwh for f in self.get_forecast())
 
     def night_consumption_kwh(self) -> float:
-        """VRM-Verbrauchsprognose bevorzugt, sonst Durchschnitt."""
+        """Berechnet Nachtverbrauch. Bevorzugt VRM totals, sonst Forecast-Summe."""
+        ns = self.cfg["charging"].get("night_start_hour", 21)
+        ne = self.cfg["charging"].get("night_end_hour",   6)
+
+        # 1. VRM liefert direkten Nachtverbrauch aus totals (genaueste Quelle)
         vrm_val = self.vrm.night_consumption_kwh()
-        if vrm_val:
-            return vrm_val
-        ns  = self.cfg["charging"].get("night_start_hour", 21)
-        ne  = self.cfg["charging"].get("night_end_hour",   6)
+        if vrm_val and vrm_val > 0.0:
+            return round(vrm_val, 2)
+
+        # 2. Summiere aus stündlichen Forecast-Daten
+        fc_list = self.get_forecast()
+        night_cons = 0.0
+        for fc in fc_list:
+            h = fc.hour
+            if h >= ns or h < ne:
+                night_cons += fc.consumption_kwh
+
+        if night_cons > 0.0:
+            return round(night_cons, 2)
+
+        # 3. Fallback: Durchschnitt
         avg = self.cfg["charging"].get("avg_daily_consumption_kwh", 8.0) / 24
-        return avg * ((24 - ns) + ne)
+        return round(avg * ((24 - ns) + ne), 2)
 
 
 # ─────────────────────────────────────────────
@@ -923,6 +938,10 @@ class ChargeController:
         self._last_written_ramped_a: float = 0.0
         # Persistenter Zustand: nur alle 5 Minuten auf SD-Karte schreiben
         self._last_persistent_save: float = 0.0
+        # v3.0.0: Morgen-Notladung Tracking
+        self._morning_emergency_done: bool = False
+        # v3.0.0: Auto-Reset Vollladung Tracking
+        self._soc_98_reached_at: Optional[datetime] = None
 
     def _load_energy_base(self):
         """Laedt letzten bekannten Energie-Akkumulatorstand aus state.json."""
@@ -1016,6 +1035,33 @@ class ChargeController:
     def _soc_for_kwh(self, kwh: float) -> float:
         return (kwh / self.bat["capacity_kwh"]) * 100.0
 
+    def _calculate_target_soc(self) -> float:
+        """Berechnet dynamisches target_soc basierend auf Nachtverbrauch.
+
+        target_soc = max(min_soc, emergency_charge_soc) + (night_consumption_kWh / capacity_kWh) * 100%
+        Wenn > 98% -> 98%. Wenn days_since_full_charge > 10 -> 98% (Vollladung).
+        """
+        min_required = max(self.bat["min_soc"], self.cc.get("emergency_charge_soc", 25))
+        night_cons = self.forecast.night_consumption_kwh()
+        self.state.forecast_consumption_night_kwh = round(night_cons, 2)
+        capacity = self.bat["capacity_kwh"]
+
+        if self.state.days_since_full_charge >= self.bat.get("full_charge_interval_days", 10):
+            return 98.0
+
+        target = min_required + (night_cons / capacity) * 100.0
+        target = min(target, 98.0)
+        return max(target, min_required)
+
+    def _get_optimal_charge_window(self) -> tuple[int, int]:
+        """Gibt (start, end) des optimalen Lade-Fensters um Sonnenhoechststand zurueck.
+
+        Sonnenhoechststand ca. 13:00 Sommer, 12:00 Winter. Vereinfacht: 13:00.
+        """
+        offset = self.cc.get("solar_noon_offset_hours", 2)
+        noon = 13  # Koennte aus Location/Date genauer berechnet werden
+        return (noon - offset, noon + offset)
+
     # --- Hauptentscheidung ---
 
     def decide(self) -> tuple[float, str, str]:
@@ -1024,17 +1070,18 @@ class ChargeController:
 
         soc       = self.state.soc
         max_soc   = self.bat["max_soc"]
-        target_n  = self.bat["target_soc_normal"]
         hyst      = self.cc.get("soc_hysteresis", 2)
         emergency = self.cc.get("emergency_charge_soc", 25)
         nom_v     = self.bat.get("voltage_nominal", 48.0)
         max_a     = self.bat["max_charge_current"]
         trickle_a = self.bat.get("trickle_current", 5)
+        min_required = max(self.bat["min_soc"], emergency)
+
+        # ── Dynamisches target_soc (v3.0.0) ───────────────────
+        dyn_target = self._calculate_target_soc()
+        self.state.target_soc = round(dyn_target, 1)
 
         # ── Effektiver Min-SOC: evcc kann diesen angehoben haben ─
-        # evcc schreibt beim Schnellladen Reg 2901 (MinSoc) auf ~aktuellen SOC
-        # um Akkuentladung zu verhindern. Wir respektieren das als Untergrenze.
-        # Unser MaxChargeCurrent (Reg 2705) bleibt davon voellig unberuehrt.
         effective_min_soc = self.bat["min_soc"]
         if self.state.evcc_discharge_locked:
             effective_min_soc = max(effective_min_soc,
@@ -1043,18 +1090,25 @@ class ChargeController:
                 f"evcc MinSoc-Sperre aktiv: effektiver Min-SOC = "
                 f"{effective_min_soc:.0f}% (Reg 2901={self.evcc.evcc_min_soc:.0f}%)")
 
+        # ── Morgen-Notladung (v3.0.0) ─────────────────────────
+        # Wenn aktueller SOC < Minimum -> sofort laden, bis Minimum erreicht
+        if self._is_morning_window() and soc < min_required:
+            self._morning_emergency_done = False
+            return max_a, "charging", (
+                f"Morgen-Notladung: SOC {soc:.1f}% < {min_required}% -> sofort laden")
+
+        # Morgen-Notladung abgeschlossen markieren
+        if soc >= min_required:
+            self._morning_emergency_done = True
+
         # ── 2. Notfall ────────────────────────────────────────
         if soc <= emergency:
             return max_a, "charging", (
                 f"NOTFALL: SOC {soc:.1f}% <= {emergency}% -> sofort laden")
 
         # ── 3. Vollladung faellig (Zellbalancing) ─────────────
-        if self._needs_full_charge():
-            if soc >= max_soc - hyst:
-                self.state.last_full_charge_date = date.today().isoformat()
-                self.state.days_since_full_charge = 0
-                self._save_persistent()
-                return 0, "idle", f"Vollladung abgeschlossen ({soc:.1f}%)"
+        # Wird durch dyn_target >= 98.0 abgedeckt (v3.0.0)
+        if dyn_target >= 98.0 and soc < max_soc - hyst:
             return max_a, "full_charge", (
                 f"Vollladung faellig ({self.state.days_since_full_charge} Tage) "
                 f"-> lade auf {max_soc}% (aktuell {soc:.1f}%)")
@@ -1071,38 +1125,59 @@ class ChargeController:
         # Projizierter Abend-SOC (aktueller SOC + restliche PV-Erzeugung)
         proj_eve = min(max_soc, soc + self._soc_for_kwh(pv_rem))
 
-        # Dynamisches Ladeziel: erhoehen wenn PV nicht reicht
-        if proj_eve >= target_n:
-            dyn_target = target_n
-        else:
-            shortfall  = target_n - proj_eve
-            dyn_target = min(target_n + shortfall * 0.5, max_soc)
-
-        self.state.target_soc                    = round(dyn_target)
-        self.state.forecast_pv_remaining_kwh     = round(pv_rem, 2)
-        self.state.forecast_pv_today_kwh         = round(pv_total, 2)
-        self.state.forecast_consumption_night_kwh = round(night_cons, 2)
-
         # Ziel bereits erreicht?
         if soc >= dyn_target - hyst:
             return 0, "idle", (
                 f"Ziel {dyn_target:.0f}% erreicht (SOC {soc:.1f}%)")
 
-        # ── 5. Morgen-Verzoegerung ────────────────────────────
+        # ── 5. Morgen-Fenster mit adaptiver Logik (v3.0.0) ────
         if self._is_morning_window():
-            if proj_eve >= target_n:
-                return 0, "idle", (
-                    f"Morgen: PV-Prognose {pv_total:.1f} kWh reicht, "
-                    f"Abend-SOC ~{proj_eve:.0f}% erwartet -> warte auf PV")
-            if soc > target_n - 15:
-                return 0, "idle", (
-                    f"Morgen: SOC {soc:.1f}% noch ausreichend, "
-                    f"warte auf PV ({pv_rem:.1f} kWh erwartet)")
+            needed_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
+            fc_list = self.forecast.get_forecast()
+            opt_start, opt_end = self._get_optimal_charge_window()
+            pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
 
-        # ── 6. PV-Ueberschuss ─────────────────────────────────
+            # Wenn genug PV im optimalen Fenster und SOC nicht kritisch -> warte
+            if pv_in_optimal >= needed_kwh and soc > min_required + 5:
+                return 0, "idle", (
+                    f"Morgen: PV im Optimal-Fenster ({opt_start}:00-{opt_end}:00) "
+                    f"ausreichend ({pv_in_optimal:.1f} kWh >= {needed_kwh:.1f} kWh), warte")
+
+            # Nicht genug PV im optimalen Fenster -> fruehes Laden noetig
+            if soc < dyn_target - hyst:
+                h_now = datetime.now().hour
+                # Im optimalen Fenster mit genug PV -> reduzierter Strom
+                if opt_start <= h_now <= opt_end and pv_in_optimal >= needed_kwh * 1.2:
+                    reduced_a = self.cc.get("reduced_charge_current_a", 20)
+                    return reduced_a, "charging", (
+                        f"Morgen: Optimal-Fenster, reduzierter Ladestrom {reduced_a}A "
+                        f"um PV besser auszunutzen (SOC {soc:.1f}% -> {dyn_target:.0f}%)")
+                return max_a, "charging", (
+                    f"Morgen: PV nicht ausreichend im Optimal-Fenster "
+                    f"({pv_in_optimal:.1f} kWh < {needed_kwh:.1f} kWh), "
+                    f"fruehes Laden noetig")
+
+        # ── 6. PV-Ueberschuss mit adaptivem Strom (v3.0.0) ─────
         pv_w     = self.state.pv_power_w
         load_w   = self.state.load_power_w
         surplus_w = max(0.0, pv_w - load_w)
+
+        # Adaptive Ladestrom-Reduktion im optimalen Fenster bei hohem Ueberschuss
+        h_now = datetime.now().hour
+        opt_start, opt_end = self._get_optimal_charge_window()
+        if opt_start <= h_now <= opt_end and surplus_w > 200:
+            needed_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
+            fc_list = self.forecast.get_forecast()
+            pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
+            if pv_in_optimal >= needed_kwh * 1.5:
+                # Reduzierter Strom um 4h-Fenster besser auszunutzen
+                reduced_a = self.cc.get("reduced_charge_current_a", 20)
+                surplus_a = surplus_w / nom_v
+                charge_a = min(surplus_a, reduced_a)
+                return charge_a, "charging", (
+                    f"PV-Ueberschuss {surplus_w:.0f} W -> {charge_a:.0f} A "
+                    f"(reduziert im Optimal-Fenster {opt_start}:00-{opt_end}:00) "
+                    f"(SOC {soc:.1f}% -> Ziel {dyn_target:.0f}%)")
 
         if surplus_w > 200:
             surplus_a = surplus_w / nom_v
@@ -1112,7 +1187,7 @@ class ChargeController:
                 f"(SOC {soc:.1f}% -> Ziel {dyn_target:.0f}%)")
 
         # ── 7. Trickle ────────────────────────────────────────
-        if soc < target_n - 10:
+        if soc < dyn_target - 10:
             return trickle_a, "trickle", (
                 f"SOC {soc:.1f}% weit unter Ziel {dyn_target:.0f}%, "
                 f"sanft laden {trickle_a} A "
@@ -1122,7 +1197,6 @@ class ChargeController:
         return 0, "idle", (
             f"Warte auf PV-Ueberschuss "
             f"(SOC {soc:.1f}%, PV {pv_w:.0f} W, Last {load_w:.0f} W)")
-
     def _ramp(self, target_a: float) -> float:
         """Sanftes Rampen des Ladestroms (+/- ramp_step A pro Zyklus)."""
         step = self.cc.get("current_ramp_step", 5)
@@ -1132,11 +1206,11 @@ class ChargeController:
             self._ramp_current = max(self._ramp_current - step, target_a)
         return self._ramp_current
 
-    def _simulate_hour(self, h: int, fc: HourlyForecast, soc_sim: float, 
+    def _simulate_hour(self, h: int, fc: HourlyForecast, soc_sim: float,
                        needs_full: bool, pv_rem_total: float, night_cons: float,
                        is_forecast: bool = True) -> tuple[str, float, float]:
         """
-        Simuliert EINE Stunde mit der exakten decide()-Logik.
+        Simuliert EINE Stunde mit der exakten decide()-Logik (v3.0.0).
         Gibt (action, current_a, new_soc_sim) zurueck.
         """
         cap = self.bat["capacity_kwh"]
@@ -1144,10 +1218,13 @@ class ChargeController:
         max_soc = self.bat["max_soc"]
         nom_v = self.bat.get("voltage_nominal", 48.0)
         max_a = self.bat["max_charge_current"]
-        target_n = self.bat["target_soc_normal"]
         hyst = self.cc.get("soc_hysteresis", 2)
         morn_s = self.cc.get("morning_delay_start_hour", 6)
         morn_e = self.cc.get("morning_delay_end_hour", 10)
+
+        # Dynamisches target_soc fuer die Simulation (v3.0.0)
+        dyn_target = self._calculate_target_soc()
+        min_required = max(min_soc, self.cc.get("emergency_charge_soc", 25))
 
         action = "idle"
         current_a = 0.0
@@ -1169,16 +1246,6 @@ class ChargeController:
             soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             return action, current_a, soc_sim
 
-        # Dynamisches Ziel (exakt wie in decide())
-        # proj_eve mit Strombegrenzung: max. max_charge_kwh pro Stunde
-        pv_rem_capped = min(pv_rem_total, max_charge_kwh * 24)
-        proj_eve = min(max_soc, soc_sim + (pv_rem_capped / cap) * 100)
-        if proj_eve >= target_n:
-            dyn_target = target_n
-        else:
-            shortfall = target_n - proj_eve
-            dyn_target = min(target_n + shortfall * 0.5, max_soc)
-
         def _apply_deficit(soc: float) -> tuple[str, float]:
             """Berechnet Deficit und setzt action: discharging wenn Ueberschuss negativ, sonst idle."""
             deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
@@ -1186,45 +1253,66 @@ class ChargeController:
             act = "discharging" if fc.net_kwh < 0 else "idle"
             return act, new_soc
 
+        # Morgen-Notladung in der Simulation (v3.0.0)
+        if morn_s <= h < morn_e and soc_sim < min_required:
+            action = "charging"
+            current_a = max_a
+            charge_kwh = min(max_charge_kwh, max_a * nom_v / 1000.0)
+            soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+            return action, current_a, soc_sim
+
         # Ziel erreicht?
         if soc_sim >= dyn_target - hyst:
             action, soc_sim = _apply_deficit(soc_sim)
-            # Ping-Pong-Schutz: Deficits, die kleiner sind als die Hysterese-
-            # Energie (z.B. 2% von 14 kWh = 0.28 kWh), sollen den simulierten
-            # SOC nicht unter die Hysterese-Schwelle druecken. In der Realitaet
-            # wuerde DVCC bei einem solchen Minimal-Deficit sofort wieder 
-            # einschalten; die Simulation klemmt den SOC deshalb auf 
-            # dyn_target - hyst.
+            # Ping-Pong-Schutz: Deficits kleiner als Hysterese-Energie
             hyst_kwh = hyst / 100.0 * cap
             if fc.net_kwh >= -hyst_kwh:
                 soc_sim = max(soc_sim, dyn_target - hyst)
             return action, current_a, soc_sim
 
-        # Morgen-Verzoegerung
+        # Morgen-Verzoegerung / Adaptive Fenster (v3.0.0)
         if morn_s <= h < morn_e:
-            if proj_eve >= target_n or soc_sim > target_n - 15:
-                action, soc_sim = _apply_deficit(soc_sim)
+            needed_kwh = max(0.0, (dyn_target - soc_sim) / 100.0 * cap)
+            opt_start, opt_end = self._get_optimal_charge_window()
+
+            # Wenn Stunde noch vor dem optimalen Fenster und genug PV erwartet -> warte
+            if h < opt_start:
+                if proj_eve >= dyn_target or soc_sim > min_required + 5:
+                    action, soc_sim = _apply_deficit(soc_sim)
+                    return action, current_a, soc_sim
+
+            # Fruehes Laden noetig oder im optimalen Fenster
+            if fc.net_kwh > 0:
+                action = "charging"
+                # Adaptive Reduktion im optimalen Fenster
+                if opt_start <= h <= opt_end:
+                    reduced_a = self.cc.get("reduced_charge_current_a", 20)
+                    current_a = min(fc.net_kwh * 1000 / nom_v, reduced_a)
+                else:
+                    current_a = min(fc.net_kwh * 1000 / nom_v, max_a)
+                charge_kwh = min(fc.net_kwh, current_a * nom_v / 1000.0)
+                soc_sim = min(dyn_target, soc_sim + (charge_kwh / cap) * 100)
             else:
-                action = "trickle"
-                current_a = self.bat.get("trickle_current", 5)
-                # trickle: eigener Strom, kein PV-Ueberschuss-Limit noetig
-                soc_sim = min(max_soc, soc_sim + (current_a * nom_v / 1000 / cap) * 100)
+                action, soc_sim = _apply_deficit(soc_sim)
             return action, current_a, soc_sim
 
-        # PV-Ueberschuss, begrenzt durch Strombegrenzung und Ladeziel
+        # PV-Ueberschuss mit adaptivem Strom (v3.0.0)
         if fc.net_kwh > 0:
             action = "charging"
-            current_a = min(fc.net_kwh * 1000 / nom_v, max_a)
-            charge_kwh = min(fc.net_kwh, max_charge_kwh)
-            # Deckelung auf dyn_target (nicht max_soc): sobald das Ziel erreicht
-            # ist, wird in der naechsten Stunde PAUSE entschieden. Die Simulation
-            # muss das abbilden, sonst werden unrealistische SOC-Werte projiziert.
+            opt_start, opt_end = self._get_optimal_charge_window()
+            if opt_start <= h <= opt_end:
+                # Im optimalen Fenster: reduzierter Strom wenn moeglich
+                reduced_a = self.cc.get("reduced_charge_current_a", 20)
+                current_a = min(fc.net_kwh * 1000 / nom_v, reduced_a)
+            else:
+                current_a = min(fc.net_kwh * 1000 / nom_v, max_a)
+            charge_kwh = min(fc.net_kwh, current_a * nom_v / 1000.0)
+            # Deckelung auf dyn_target (nicht max_soc)
             soc_sim = min(dyn_target, soc_sim + (charge_kwh / cap) * 100)
         else:
             action, soc_sim = _apply_deficit(soc_sim)
 
         return action, current_a, soc_sim
-
     def build_schedule(self) -> list:
         """
         Stundlicher Ladeplan:
@@ -1442,24 +1530,39 @@ class ChargeController:
 
 
     def run_cycle(self):
-        """Fuehrt einen Regelzyklus aus."""
+        """Fuehrt einen Regelzyklus aus (v3.0.0)."""
         self._update_history()
 
         # ── days_since_full_charge immer aktuell aus Datum berechnen ──────────
-        # Verhindert, dass der Wert nach einem langen Programmlauf (mehrere Tage
-        # ohne Neustart) auf dem Stand des letzten Neustarts eingefroren bleibt.
         if self.state.last_full_charge_date:
             try:
                 d = date.fromisoformat(self.state.last_full_charge_date)
                 self.state.days_since_full_charge = (date.today() - d).days
             except ValueError:
                 pass
-        # ──────────────────────────────────────────────────────────────────────
+
+        # ── Auto-Reset Vollladung (v3.0.0) ────────────────────────────────────
+        # Wenn SOC >= 98% fuer mindestens eine Stunde -> days_since_full_charge zuruecksetzen
+        if self.state.soc >= 98.0:
+            if self._soc_98_reached_at is None:
+                self._soc_98_reached_at = datetime.now()
+            else:
+                elapsed = (datetime.now() - self._soc_98_reached_at).total_seconds()
+                if elapsed >= 3600 and self.state.days_since_full_charge > 0:
+                    self.logger.info(
+                        f"Auto-Reset Vollladung: SOC >= 98% fuer {elapsed/60:.0f} Minuten "
+                        f"-> days_since_full_charge auf 0 zurueckgesetzt")
+                    self.state.last_full_charge_date = date.today().isoformat()
+                    self.state.days_since_full_charge = 0
+                    self._save_persistent()
+                    self._soc_98_reached_at = None
+        else:
+            self._soc_98_reached_at = None
 
         now = time.monotonic()
         min_dur = self._min_charge_duration_s
 
-        # Sofort-Entscheidung bei kritischen Zuständen (Sicherheit)
+        # Sofort-Entscheidung bei kritischen Zustaenden (Sicherheit)
         force_new = False
         if self.state.soc <= self.cc.get("emergency_charge_soc", 25):
             force_new = True
@@ -1473,14 +1576,10 @@ class ChargeController:
             self._last_decision_result = (target_a, mode, reason)
         else:
             target_a, mode, reason = self._last_decision_result
-            # Reason ergänzen, dass Hysterese aktiv ist
             if not reason.endswith("(Hysterese)"):
                 reason = reason + " (Hysterese)"
 
-        # Schreiben nur wenn sich der gerampte Sollwert tatsaechlich geaendert hat.
-        # Die frueheren Flags hysterese_abgelaufen/wert_geaendert wurden entfernt:
-        # hysterese_abgelaufen war True bei jeder neuen Entscheidung, also auch
-        # bei 0 A -> 0 A – das hat den Write-Schutz vollstaendig ausgehebelt.
+        # Schreiben nur wenn sich der gerampte Sollwert tatsaechlich geaendert hat
         write_performed = False
         if target_a >= 0:
             ramped = self._ramp(target_a)
@@ -1489,16 +1588,13 @@ class ChargeController:
                     self._last_written_ramped_a = ramped
                     write_performed = True
             else:
-                # Kein Schreiben: state auf letzten geschriebenen Wert belassen
                 self.state.charge_current_setpoint = self._last_written_ramped_a
-        # target_a ist immer >= 0 (0 = kein Laden, >0 = Ladestrom)
 
         self.state.charge_mode              = mode
         self.state.charge_reason            = reason
         self.state.planned_charge_schedule  = self.build_schedule()
 
         # Persistenter Zustand alle 30 Minuten speichern
-        # (Kompromiss: SD-Karte schonen vs. max. Datenverlust nach Neustart)
         if time.monotonic() - self._last_persistent_save > 1800:
             self._save_persistent()
 
@@ -1506,8 +1602,6 @@ class ChargeController:
             a = self.state.charge_current_setpoint
             log_suffix = " [KEIN WRITE]" if (target_a >= 0 and not write_performed) else ""
             self.logger.info(f"[{mode.upper()}] {a:.0f}A | {reason[:120]}{log_suffix}")
-
-
 # ─────────────────────────────────────────────
 # Web Dashboard (Flask, eingebettet)
 # ─────────────────────────────────────────────
@@ -1867,6 +1961,20 @@ def validate_config(cfg: dict, logger: logging.Logger) -> bool:
     if "latitude" not in loc or "longitude" not in loc:
         issues.append("location.latitude / location.longitude fehlen")
 
+    # v3.0.0: Optionale neue Felder validieren (falls vorhanden)
+    cc = cfg.get("charging", {})
+    if "solar_noon_offset_hours" in cc and cc["solar_noon_offset_hours"] < 0:
+        issues.append("charging.solar_noon_offset_hours muss >= 0 sein")
+    if "reduced_charge_current_a" in cc:
+        red_a = cc["reduced_charge_current_a"]
+        max_a = bat.get("max_charge_current", 50)
+        if red_a > max_a:
+            issues.append(
+                f"charging.reduced_charge_current_a ({red_a}) darf nicht groesser "
+                f"als max_charge_current ({max_a}) sein")
+        if red_a < 0:
+            issues.append("charging.reduced_charge_current_a muss >= 0 sein")
+
     if issues:
         for issue in issues:
             logger.error(f"Config-Fehler: {issue}")
@@ -1890,7 +1998,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v2.0.7  (Modbus TCP)")
+    logger.info("Solar Batterie Manager v3.0.0  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

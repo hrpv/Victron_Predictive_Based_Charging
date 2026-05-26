@@ -1,121 +1,131 @@
 # ============================================================
-# Prognosebasiertes Laden - Konfiguration v2
+# Prognosebasiertes Laden - Konfiguration v3.0
 # Kommunikation: Modbus TCP (kein MQTT nötig)
 # ============================================================
 
 # --- Victron Cerbo GX / Modbus TCP ---
 modbus:
-  host: "192.168.178.61"      # IP-Adresse des Cerbo GX (im Router nachschauen)
-  port: 502                  # Modbus TCP Standardport, nicht ändern
-  unit_id: 100               # Unit-ID des Cerbo GX (fest 100)
-  timeout_seconds: 5
-  # Modbus TCP muss am Cerbo aktiviert sein:
-  # Einstellungen → Dienste → Modbus TCP → Ein
-  # (läuft meist schon wenn evcc funktioniert)
+ host: "192.168.178.61" # IP-Adresse des Cerbo GX (im Router nachschauen)
+ port: 502 # Modbus TCP Standardport, nicht ändern
+ unit_id: 100 # Unit-ID des Cerbo GX (fest 100)
+ timeout_seconds: 5
+ # Modbus TCP muss am Cerbo aktiviert sein:
+ # Einstellungen → Dienste → Modbus TCP → Ein
+ # (läuft meist schon wenn evcc funktioniert)
 
 # --- evcc Koordination, NUR INFO ---
-  # evcc schreibt beim Schnellladen Register 2901 (ESS MinSoc) auf ~aktuellen SOC
-  # um Akkuentladung zu verhindern. Register 2705 (MaxChargeCurrent) wird von
-  # evcc NICHT beschrieben → kein Schreibkonflikt, Laden läuft normal weiter.
+ # evcc schreibt beim Schnellladen Register 2901 (ESS MinSoc) auf ~aktuellen SOC
+ # um Akkuentladung zu verhindern. Register 2705 (MaxChargeCurrent) wird von
+ # evcc NICHT beschrieben → kein Schreibkonflikt, Laden läuft normal weiter.
 evcc:
-  enabled: tr
-  api_url: "http://192.168.178.58:7070/api/state"  # evcc IP anpassen
-  timeout_seconds: 5
-  poll_interval_seconds: 30
+ enabled: true
+ api_url: "http://192.168.178.58:7070/api/state" # evcc IP anpassen
+ timeout_seconds: 5
+ poll_interval_seconds: 30
 
 # --- Batterie ---
 battery:
-  capacity_kwh: 14.0             # Nutzbare Kapazität in kWh (100%)
-  min_soc: 20                    # Minimaler Ladestand [%]
-  max_soc: 98                    # Maximaler Ladestand [%] (LFP erreicht 100% praktisch nie)
-  target_soc_normal: 80          # Normales Ladeziel [%]
-  target_soc_full: 98            # Vollladen-Ziel [%]
-  full_charge_interval_days: 10  # Spätestens alle N Tage auf max_soc laden (Zellbalancing)
-  min_charge_current: 0          # Minimaler Ladestrom [A]
-  max_charge_current: 50         # Maximaler Ladestrom [A]
-  # Stromstärke für "sanftes" Laden (Erhaltungsladung)
-  trickle_current: 5             # [A]
-  # Voltage pro % SOC (für Schätzungen ohne exakten SOC-Wert)
-  voltage_nominal: 48.0          # [V]
+ capacity_kwh: 14.0 # Nutzbare Kapazität in kWh (100%)
+ min_soc: 23 # Minimaler Ladestand [%]
+ max_soc: 98 # Maximaler Ladestand [%] (LFP erreicht 100% praktisch nie)
+ # target_soc_normal wird in v3.0 nicht mehr verwendet – target_soc wird
+ # dynamisch berechnet: max(min_soc, emergency_charge_soc) + Nachtverbrauch
+ target_soc_normal: 80 # (veraltet, bleibt für Rückwärtskompatibilität)
+ target_soc_full: 98 # Vollladen-Ziel [%]
+ full_charge_interval_days: 10 # Spätestens alle N Tage auf max_soc laden (Zellbalancing)
+ min_charge_current: 0 # Minimaler Ladestrom [A]
+ max_charge_current: 50 # Maximaler Ladestrom [A]
+ # Stromstärke für "sanftes" Laden (Erhaltungsladung)
+ trickle_current: 5 # [A]
+ # Voltage pro % SOC (für Schätzungen ohne exakten SOC-Wert)
+ voltage_nominal: 48.0 # [V]
 
 # --- PV Anlage ---
 pv:
-  peak_power_kwp: 10.0           # Peak-Leistung [kWp]
-  # Wirkungsgrad Faktor (Verluste Wechselrichter, Kabel, Temperatur)
-  efficiency_factor: 0.82
-  # Orientierung der Module (für Prognose-Gewichtung)
-  # Wird von der Wetterprognose-API übernommen, hier als Fallback
-  azimuth_deg: 180               # 180 = Süd, 90 = Ost, 270 = West
-  tilt_deg: 30                   # Neigungswinkel [°]
+ peak_power_kwp: 10.0 # Peak-Leistung [kWp]
+ # Wirkungsgrad Faktor (Verluste Wechselrichter, Kabel, Temperatur)
+ efficiency_factor: 0.82
+ # Orientierung der Module (für Prognose-Gewichtung)
+ # Wird von der Wetterprognose-API übernommen, hier als Fallback
+ azimuth_deg: 180 # 180 = Süd, 90 = Ost, 270 = West
+ tilt_deg: 30 # Neigungswinkel [°]
 
 # --- Standort ---
 location:
-  latitude: 48.7758              # Stuttgart
-  longitude: 9.1829
-  altitude_m: 300
-  timezone: "Europe/Berlin"
-
+ latitude: 48.7758 # Stuttgart
+ longitude: 9.1829
+ altitude_m: 300
+ timezone: "Europe/Berlin"
 
 # --- Wetterprognose API ---
 # --- Victron VRM API Prognose ---
 vrm:
-  enabled: true
-  access_token: "xxx"
-  installation_id: "xxx"
-  timeout_seconds: 10
+ enabled: true
+ access_token: "xxx"
+ installation_id: "xxx"
+ timeout_seconds: 10
 
 # Kostenlose Option: Open-Meteo (kein API-Key nötig)
 forecast:
-  provider: "open_meteo"         # open_meteo | solcast (kostenpflichtig)
-  # Solcast API Key (nur wenn provider = solcast)
-  solcast_api_key: ""
-  solcast_resource_id: ""
-  # Aktualisierungsintervall Prognose [Minuten]
-  update_interval_minutes: 60
-  # Wie viele Stunden voraus planen?
-  horizon_hours: 24
+ provider: "open_meteo" # open_meteo | solcast (kostenpflichtig)
+ # Solcast API Key (nur wenn provider = solcast)
+ solcast_api_key: ""
+ solcast_resource_id: ""
+ # Aktualisierungsintervall Prognose [Minuten]
+ update_interval_minutes: 60
+ # Wie viele Stunden voraus planen?
+ horizon_hours: 24
 
 # --- Ladelogik ---
 charging:
-  # Hauptsteuer-Intervall [Sekunden]
-  control_interval_seconds: 60
-  # Hysterese: SOC-Puffer bevor Ladung gestoppt wird [%]
-  soc_hysteresis: 2
-  # Minimale Ladedauer bevor Entscheidung neu getroffen wird [Minuten]
-  min_charge_duration_minutes: 10
-  # Strom-Rampe: Änderung pro Schritt [A] (sanftes Hochfahren)
-  current_ramp_step: 5
-  # Erwarteter nächtlicher Verbrauch [kWh] wenn keine Daten verfügbar
-  default_night_consumption_kwh: 2.5
-  # Durchschnittlicher Tagesverbrauch [kWh] (für Prognose-Kalibrierung)
-  avg_daily_consumption_kwh: 8.0
-  # Nacht-Zeitfenster (kein PV zu erwarten)
-  night_start_hour: 21           # 21:00 Uhr
-  night_end_hour: 6              # 06:00 Uhr
-  # Früh-Morgen: Verzögertes Laden aktivieren ab Uhrzeit
-  morning_delay_start_hour: 6
-  morning_delay_end_hour: 10
-  # SOC-Schwelle: Unter diesem Wert wird trotzdem sofort geladen
-  emergency_charge_soc: 25
+ # Hauptsteuer-Intervall [Sekunden]
+ control_interval_seconds: 60
+ # Hysterese: SOC-Puffer bevor Ladung gestoppt wird [%]
+ soc_hysteresis: 2
+ # Minimale Ladedauer bevor Entscheidung neu getroffen wird [Minuten]
+ min_charge_duration_minutes: 10
+ # Strom-Rampe: Änderung pro Schritt [A] (sanftes Hochfahren)
+ current_ramp_step: 5
+ # Erwarteter nächtlicher Verbrauch [kWh] wenn keine Prognose verfügbar
+ default_night_consumption_kwh: 4.0
+ # Durchschnittlicher Tagesverbrauch [kWh] (für Prognose-Kalibrierung)
+ avg_daily_consumption_kwh: 8.0
+ # Nacht-Zeitfenster (kein PV zu erwarten)
+ night_start_hour: 21 # 21:00 Uhr
+ night_end_hour: 6 # 06:00 Uhr
+ # Früh-Morgen: Verzögertes Laden aktivieren ab Uhrzeit
+ morning_delay_start_hour: 6
+ morning_delay_end_hour: 10
+ # SOC-Schwelle: Unter diesem Wert wird trotzdem sofort geladen
+ emergency_charge_soc: 20
+ # --- v3.0.0: Adaptive Ladezeitfenster ---
+ # ± Stunden um den Sonnenhöchststand (ca. 13:00) für das Hauptladefenster.
+ # Bei genügend PV-Überschuss wird die Ladung in dieses Fenster konzentriert
+ # und der Ladestrom reduziert, um das Fenster besser auszunutzen.
+ solar_noon_offset_hours: 2 # 13:00 ± 2h = 11:00–15:00
+ # Reduzierter Ladestrom im optimalen Lade-Fenster [A].
+ # Wird verwendet wenn genug PV im Fenster erwartet wird, um das 4h-Fenster
+ # besser auszunutzen statt frühzeitig auf max_soc zu kommen.
+ reduced_charge_current_a: 20 # z.B. 20 A statt 50 A im Optimal-Fenster
 
 # --- Dashboard / Web GUI ---
 dashboard:
-  enabled: true
-  host: "0.0.0.0"
-  port: 5000
-  # Aktualisierungsintervall der Webseite [Sekunden]
-  refresh_interval_seconds: 30
-  # Datei für Statusspeicherung (JSON)
-  state_file: "/var/log/solar_battery/state.json"
+ enabled: true
+ host: "0.0.0.0"
+ port: 5000
+ # Aktualisierungsintervall der Webseite [Sekunden]
+ refresh_interval_seconds: 30
+ # Datei für Statusspeicherung (JSON)
+ state_file: "/var/log/solar_battery/state.json"
 
 # --- Logging ---
 logging:
-  level: "INFO"                  # DEBUG | INFO | WARNING | ERROR
+ level: "INFO" # DEBUG | INFO | WARNING | ERROR
 # option:addditional logfile
 # file: "/var/log/solar_battery/battery_manager.log"
 # no logfile
-  file:
-  max_size_mb: 10
-  backup_count: 3
-  # Detailliertes Logging der Ladeentscheidungen
-  log_decisions: true
+ file:
+ max_size_mb: 10
+ backup_count: 3
+ # Detailliertes Logging der Ladeentscheidungen
+ log_decisions: true
