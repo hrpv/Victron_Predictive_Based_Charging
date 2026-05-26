@@ -231,7 +231,8 @@ mbpoll -a 100 -r 2902 -c 1 192.168.178.61
 mbpoll -a 100 -r 2706 -t 4 192.168.178.61 10
 ```
 Register 2705 DVCC MaxChargeCurrent
-![DVCC Screenshot](docs/dvcc_maxchargecurrent.png)
+
+<img width="467" height="277" alt="image" src="https://github.com/user-attachments/assets/1a35310f-cd22-43b7-8007-3f091916b0e3" />
 
 ---
 
@@ -491,7 +492,7 @@ Balkendiagramm: PV-Ertrag vs. Verbrauch pro Stunde, aktuelle Stunde hervorgehobe
 
 ### Ladeplan-Tabelle
 Stündliche Vorschau mit projiziertem SOC-Verlauf, Aktion und geplantem Ladestrom.
-![Dashboard Screenshot](docs/dashboard_v3.png)
+<img width="1829" height="850" alt="image" src="https://github.com/user-attachments/assets/53a560b6-3089-48fc-a5fc-f5024e573913" />
 
 ---
 
