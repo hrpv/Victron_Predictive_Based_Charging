@@ -524,6 +524,34 @@ def _calculate_target_soc(self) -> float:
 
 ---
 
+## 7. Code-Review Fixes (v3.0.0 final)
+
+### Bug 1: `proj_eve` in `_simulate_hour()` nicht definiert
+
+**Problem:** In `_simulate_hour()` (Morgen-Fenster-Block, Stunde vor Optimal-Fenster) wurde die lokale Variable `proj_eve` aus `decide()` referenziert. Da `proj_eve` in `_simulate_hour()` nicht existiert, würde dies bei Erreichen dieses Code-Pfads einen `NameError` zur Laufzeit verursachen.
+
+**Fix:** Bedingung vereinfacht – statt `if proj_eve >= dyn_target or soc_sim > min_required + 5:` jetzt nur `if soc_sim > min_required + 5:`. Die `proj_eve`-Variable bleibt korrekt in `decide()` als lokale Berechnung erhalten.
+
+### Bug 2: State-Feld Überschreibung durch `_calculate_target_soc()`
+
+**Problem:** `_calculate_target_soc()` setzte `state.forecast_consumption_night_kwh` als Seiteneffekt. Da `_simulate_hour()` (in `build_schedule()`) für jede der 24 Stunden `_calculate_target_soc()` aufruft, wurde das State-Feld 24× pro Zyklus mit dem gleichen Wert überschrieben – funktional korrekt, aber Design-Smell.
+
+**Fix:** State-Update in neue Methode `_update_night_consumption_display()` extrahiert:
+```python
+def _update_night_consumption_display(self) -> None:
+    night_cons = self.forecast.night_consumption_kwh()
+    self.state.forecast_consumption_night_kwh = round(night_cons, 2)
+```
+Wird einmal pro Zyklus in `decide()` aufgerufen. `_calculate_target_soc()` hat jetzt keine Seiteneffekte mehr.
+
+### Bug 3: Versionsnummer im HTML-Header
+
+**Problem:** Der HTML-Header des Dashboards zeigte noch `v2.0.7`, während `main()` bereits `v3.0.0` loggte.
+
+**Fix:** HTML-Title auf `Solar Batterie Manager v3.0.0` aktualisiert.
+
+---
+
 ## Zusammenfassung der Dateigröße
 
 | Version | Zeilen |
@@ -532,4 +560,4 @@ def _calculate_target_soc(self) -> float:
 | v3.0.0 final | ~2.090 |
 | Differenz | **~+92 Zeilen** |
 
-Hauptursachen: `_calculate_target_soc()`, `_get_optimal_charge_window()`, Morgen-Notladung, adaptive Fensterlogik, Auto-Reset-Vollladung, Nachtverbrauch-Display-Fix.
+Hauptursachen: `_calculate_target_soc()`, `_get_optimal_charge_window()`, Morgen-Notladung, adaptive Fensterlogik, Auto-Reset-Vollladung, Nachtverbrauch-Display-Fix, Code-Review-Fixes.

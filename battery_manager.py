@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 2.0.7  (Modbus TCP, kein MQTT)
+Version: 3.0.0  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -1043,7 +1043,7 @@ class ChargeController:
         """
         min_required = max(self.bat["min_soc"], self.cc.get("emergency_charge_soc", 25))
         night_cons = self.forecast.night_consumption_kwh()
-        self.state.forecast_consumption_night_kwh = round(night_cons, 2)
+        self._update_night_consumption_display()
         capacity = self.bat["capacity_kwh"]
 
         if self.state.days_since_full_charge >= self.bat.get("full_charge_interval_days", 10):
@@ -1052,6 +1052,12 @@ class ChargeController:
         target = min_required + (night_cons / capacity) * 100.0
         target = min(target, 98.0)
         return max(target, min_required)
+
+    def _update_night_consumption_display(self) -> None:
+        """Aktualisiert state.forecast_consumption_night_kwh fuer Dashboard-Anzeige.
+        Wird einmal pro Zyklus in decide() aufgerufen."""
+        night_cons = self.forecast.night_consumption_kwh()
+        self.state.forecast_consumption_night_kwh = round(night_cons, 2)
 
     def _get_optimal_charge_window(self) -> tuple[int, int]:
         """Gibt (start, end) des optimalen Lade-Fensters um Sonnenhoechststand zurueck.
@@ -1277,7 +1283,7 @@ class ChargeController:
 
             # Wenn Stunde noch vor dem optimalen Fenster und genug PV erwartet -> warte
             if h < opt_start:
-                if proj_eve >= dyn_target or soc_sim > min_required + 5:
+                if soc_sim > min_required + 5:
                     action, soc_sim = _apply_deficit(soc_sim)
                     return action, current_a, soc_sim
 
