@@ -24,26 +24,26 @@
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    battery_manager.py                    │
+│  battery_manager.py                                     │
 │                                                         │
-│  ForecastManager   VictronModbus    EvccMonitor         │
-│  (Open-Meteo API)  (Modbus TCP)     (REST API)          │
-│        │                │                │              │
-│        └────────────────┼────────────────┘              │
-│                         │                               │
-│              ChargeController                           │
-│         (Ladeentscheidung 60s-Zyklus)                   │
-│                         │                               │
-│              Flask Dashboard :5000                      │
-└─────────────────────────┼───────────────────────────────┘
-                          │ Modbus TCP Port 502
+│  ForecastManager    VictronModbus    EvccMonitor        │
+│  (Open-Meteo API)   (Modbus TCP)     (REST API)         │
+│       │                  │                │             │
+│       └──────────────────┼────────────────┘             │
+│                          │                              │
+│                   ChargeController                      │
+│                   (Ladeentscheidung 60s-Zyklus)          │
+│                          │                              │
+│                   Flask Dashboard :5000                   │
+└──────────────────────────┼───────────────────────────────┘
+                           │ Modbus TCP Port 502
                     Cerbo GX (Venus OS)
-                          │
-               ┌──────────┴──────────┐
-          Multiplus II          MPPT / PV-WR
-          (ESS, DVCC)           (AC-gekoppelt)
-               │
-           LFP Akku 14 kWh
+                           │
+              ┌────────────┴────────────┐
+           Multiplus II              MPPT / PV-WR
+           (ESS, DVCC)               (AC-gekoppelt)
+                           │
+                    LFP Akku 14 kWh
 ```
 
 ### Datenfluß
@@ -90,64 +90,93 @@ Multiplus II / ESS:
 
 ---
 
-## 3. Ladelogik & Strategie
+## 3. Ladelogik & Strategie (v3.0)
 
 ### Ziele
 - **LFP-Schonung**: Bevorzugt SOC zwischen 20–80% halten
 - **Sommer-Optimierung**: Morgens nicht unnötig laden, auf PV-Überschuss warten
 - **Zellbalancing**: Spätestens alle 10 Tage Vollladung auf 98%
-- **Dynamisch**: Entscheidung basiert auf Echtzeit + Prognose
+- **Dynamisch**: Täglich neues Ziel-SOC basierend auf Nachtverbrauch
+- **Sonnenhöchststand-Optimierung**: Ladung konzentriert sich um 13:00 ± 2h
 
 ### Entscheidungsbaum (60-Sekunden-Zyklus)
 
 ```
-┌─ SOC ≤ 25% (Notfall)?
-│   └─ JA  → Sofort mit 50A laden
+┌─ Morgen-Notladung: SOC < max(min_soc, emergency_charge_soc) im Morgenfenster?
+│   └─ JA → Sofort mit max_charge_current laden (kein Warten)
+│
+├─ SOC ≤ emergency_charge_soc (Notfall)?
+│   └─ JA → Sofort mit max_charge_current laden
 │
 ├─ evcc-Schnellladen aktiv (Reg 2901 > 25%)?
-│   └─ JA  → Laden erlaubt, Min-SOC auf Reg-2901-Wert angehoben
+│   └─ JA → Laden erlaubt, Min-SOC auf Reg-2901-Wert angehoben
 │
 ├─ ≥ 10 Tage seit letzter Vollladung?
-│   └─ JA  → Laden bis 98% (Zellbalancing)
+│   └─ JA → target_soc = 98% (Zellbalancing)
 │
 ├─ Nacht (21:00–06:00 Uhr)?
-│   └─ JA  → Kein Laden
+│   └─ JA → Kein Laden
 │
 ├─ Morgen-Fenster (06:00–10:00 Uhr)?
-│   ├─ PV-Prognose heute reicht für Abend-Ziel? → Warten
-│   ├─ SOC noch ausreichend?                     → Warten
-│   └─ Sonst                                     → Sanft laden (5A)
+│   ├─ PV im Optimal-Fenster (11:00–15:00) ausreichend? → Warten
+│   ├─ SOC noch ausreichend? → Warten
+│   └─ Sonst → Frühes Laden (auch vor morning_delay_end_hour)
 │
 ├─ PV-Überschuss > 200W (PV > Verbrauch)?
-│   └─ JA  → Laden mit Überschuss-Strom (proportional, max 50A)
+│   ├─ Im Optimal-Fenster (11:00–15:00) mit genug PV?
+│   │   └─ JA → Reduzierter Ladestrom (z.B. 20A) um Fenster auszunutzen
+│   └─ Sonst → Laden mit Überschuss-Strom (proportional, max 50A)
 │
 ├─ SOC deutlich unter Ziel (> 10% Abstand)?
-│   └─ JA  → Sanft laden (5A Trickle)
+│   └─ JA → Sanft laden (5A Trickle)
 │
 └─ Ziel-SOC erreicht?
-    └─ JA  → Stop (Ladestrom = 0A)
+    └─ JA → Stop (Ladestrom = 0A)
 ```
 
-### Dynamisches Ladeziel
+### Dynamisches Ziel-SOC (v3.0)
+
+Das Ziel-SOC wird jeden Morgen neu berechnet – nicht mehr fest 80%:
 
 ```
-Projizierter Abend-SOC = aktueller SOC + PV-Restprognose heute
+target_soc = max(min_soc, emergency_charge_soc) + (night_consumption_kWh / capacity_kWh) × 100%
 
-Wenn projizierter Abend-SOC ≥ 80%:
-  → Ziel = 80% (normaler Betrieb)
-Wenn projizierter Abend-SOC < 80%:
-  → Ziel = 80% + (Fehlmenge × 0.5), max 98%
-  → Etwas früher nachladen um Nacht abzudecken
+Wenn target_soc > 98%: target_soc = 98%
+Wenn days_since_full_charge ≥ 10: target_soc = 98% (Vollladung)
 ```
+
+Beispiel:
+- min_soc = 25%, emergency_charge_soc = 20%
+- Nachtverbrauch (21:00–06:00) = 4.7 kWh (aus VRM-Prognose)
+- Kapazität = 14 kWh
+- target_soc = 25 + (4.7 / 14) × 100 = **58.6%**
+
+Das Ziel liegt also zwischen **25% und 98%** – je nach erwartetem Nachtverbrauch.
+
+### Adaptive Ladezeitfenster (v3.0)
+
+| PV-Überschuss | Verhalten |
+|---------------|-----------|
+| Gering | Laden beginnt so früh wie nötig – auch vor `morning_delay_end_hour` |
+| Mittel | Ladefenster verschiebt sich Richtung Sonnenhöchststand (11:00–15:00) |
+| Hoch | Hauptladung im Optimal-Fenster mit reduziertem Strom (z.B. 20A statt 50A) |
+
+**Sonnenhöchststand-Optimierung:**
+- Optimal-Fenster: 13:00 ± `solar_noon_offset_hours` (Default: 2h = 11:00–15:00)
+- Bei genug PV im Fenster wird der Ladestrom auf `reduced_charge_current_a` (Default: 20A) reduziert
+- Das verhindert, dass die Ladung zu früh beendet ist und PV-Energie später ins Netz geht
 
 ### Ladestrom-Regelung
 - Sanftes Rampen: ±5A pro Regelzyklus (kein abrupter Sprung)
 - Bei PV-Überschuss: `Strom = PV-Überschuss [W] / 48V`
 - Minimum: 0A (kein Laden), Maximum: 50A (konfigurierbar)
 - Trickle-Laden: 5A (konfigurierbar)
+- Reduzierter Strom im Optimal-Fenster: 20A (konfigurierbar)
 
 ### Vollladungs-Tracking
-Datum der letzten Vollladung wird in `state.json` gespeichert und überlebt Neustarts.
+- Datum der letzten Vollladung wird in `state.json` gespeichert und überlebt Neustarts
+- **Auto-Reset (v3.0):** Wenn SOC ≥ 98% für mindestens 1 Stunde erreicht wurde, wird `days_since_full_charge` sofort auf 0 gesetzt – auch ohne explizit geplanten `full_charge_cycle`
+- Morgen-Notladung: Wenn SOC < Minimum am Morgen, wird sofort mit vollem Strom geladen bis das Minimum erreicht ist
 
 ---
 
@@ -202,8 +231,7 @@ mbpoll -a 100 -r 2902 -c 1 192.168.178.61
 mbpoll -a 100 -r 2706 -t 4 192.168.178.61 10
 ```
 Register 2705 DVCC MaxChargeCurrent
-
-<img width="467" height="277" alt="image" src="https://github.com/user-attachments/assets/1a35310f-cd22-43b7-8007-3f091916b0e3" />
+![DVCC Screenshot](docs/dvcc_maxchargecurrent.png)
 
 ---
 
@@ -223,11 +251,11 @@ Kein Schreibkonflikt – beide arbeiten parallel.
 ### evcc-Verhalten beim Schnellladen
 
 ```
-Normalzustand:   Reg 2901 = 10–20%  → battery_manager: normaler Betrieb
-Schnellladen:    Reg 2901 ≈ SOC     → battery_manager: Min-SOC angehoben
-                 (z.B. SOC=70% → Reg 2901=70%)
-                 Laden weiterhin erlaubt, Entladen blockiert
-Fertig geladen:  Reg 2901 = 10–20%  → battery_manager: normaler Betrieb
+Normalzustand:     Reg 2901 = 10–20%  → battery_manager: normaler Betrieb
+Schnellladen:      Reg 2901 ≈ SOC     → battery_manager: Min-SOC angehoben
+                                      (z.B. SOC=70% → Reg 2901=70%)
+                                      Laden weiterhin erlaubt, Entladen blockiert
+Fertig geladen:    Reg 2901 = 10–20%  → battery_manager: normaler Betrieb
 ```
 
 ### Erkennung im Code
@@ -269,8 +297,8 @@ forecast:
 
 ### Verwendung der Prognose
 ```
-pv_remaining_today    → wieviel PV kommt heute noch?
-night_consumption     → wieviel Strom brauchen wir heute Nacht?
+pv_remaining_today → wieviel PV kommt heute noch?
+night_consumption → wieviel Strom brauchen wir heute Nacht?
 projected_evening_soc → SOC-Schätzung um 21:00 Uhr
 → Entscheidet ob Morgen-Verzögerung greift
 ```
@@ -281,7 +309,7 @@ projected_evening_soc → SOC-Schätzung um 21:00 Uhr
 
 ### Schritt 1: Voraussetzungen prüfen
 ```bash
-python3 --version     # mind. 3.9
+python3 --version  # mind. 3.9
 python3 -m venv --help || sudo apt install python3-venv
 ```
 
@@ -289,7 +317,7 @@ python3 -m venv --help || sudo apt install python3-venv
 ```bash
 mkdir -p /home/pi/solar_battery
 # Dateien kopieren: battery_manager.py, config.yaml,
-#                   requirements.txt, solar-battery.service, install.sh
+# requirements.txt, solar-battery.service, install.sh
 ```
 
 ### Schritt 3: Konfiguration anpassen
@@ -300,12 +328,12 @@ nano /home/pi/solar_battery/config.yaml
 Mindestens anpassen:
 ```yaml
 modbus:
-  host: "192.168.178.61"       # IP des Cerbo GX
+  host: "192.168.178.61"  # IP des Cerbo GX
 
 evcc:
   enabled: true
-  api_url: "http://localhost:7070/api/state"   # oder IP wenn remote
-  # enabled: false  wenn kein evcc vorhanden
+  api_url: "http://localhost:7070/api/state"  # oder IP wenn remote
+  # enabled: false wenn kein evcc vorhanden
 ```
 
 ### Schritt 4: Installation ausführen
@@ -327,7 +355,7 @@ tail -f /home/pi/solar_battery/battery_manager.log
 
 ### Schritt 6: Dashboard aufrufen
 ```
-http://<raspberry-pi-ip>:5000
+http://<raspi-ip>:5000
 ```
 
 ---
@@ -339,61 +367,75 @@ http://<raspberry-pi-ip>:5000
 ```yaml
 # ── Modbus TCP ──────────────────────────────────────────
 modbus:
-  host: "192.168.178.61"    # IP Cerbo GX – ANPASSEN
-  port: 502                 # Standardport, nicht ändern
-  unit_id: 100              # Cerbo GX Unit-ID, fest 100
+  host: "192.168.178.61"          # IP Cerbo GX – ANPASSEN
+  port: 502                       # Standardport, nicht ändern
+  unit_id: 100                    # Cerbo GX Unit-ID, fest 100
   timeout_seconds: 5
 
 # ── evcc ────────────────────────────────────────────────
 evcc:
   enabled: true
-  api_url: "http://localhost:7070/api/state"   # ANPASSEN
+  api_url: "http://localhost:7070/api/state"  # ANPASSEN
   timeout_seconds: 5
-  poll_interval_seconds: 30  # Wie oft Reg 2901 + REST lesen
+  poll_interval_seconds: 30       # Wie oft Reg 2901 + REST lesen
 
 # ── Batterie ────────────────────────────────────────────
 battery:
-  capacity_kwh: 14.0         # Kapazität bei 100% SOC
-  min_soc: 20                # Untere Grenze [%]
-  max_soc: 98                # Obere Grenze [%] (LFP)
-  target_soc_normal: 80      # Normales Ladeziel [%]
-  full_charge_interval_days: 10  # Tage bis Vollladung
-  min_charge_current: 0      # 0 = Laden gesperrt
-  max_charge_current: 50     # Max Ladestrom [A]
-  trickle_current: 5         # Sanft-Laden [A]
-  voltage_nominal: 48.0      # Nennspannung [V]
+  capacity_kwh: 14.0              # Kapazität bei 100% SOC
+  min_soc: 25                     # Untere Grenze [%] (LFP-Schonung)
+  max_soc: 98                     # Obere Grenze [%] (LFP)
+  # target_soc_normal wird in v3.0 nicht mehr verwendet – Ziel wird dynamisch berechnet
+  target_soc_normal: 80           # (veraltet, bleibt für Rückwärtskompatibilität)
+  target_soc_full: 98             # Vollladen-Ziel [%]
+  full_charge_interval_days: 10   # Spätestens alle N Tage Vollladung (Zellbalancing)
+  min_charge_current: 0           # 0 = Laden gesperrt
+  max_charge_current: 50          # Max Ladestrom [A]
+  trickle_current: 5              # Sanft-Laden [A]
+  voltage_nominal: 48.0           # Nennspannung [V]
 
 # ── PV-Anlage ───────────────────────────────────────────
 pv:
-  peak_power_kwp: 10.0       # Anlagenleistung [kWp]
-  efficiency_factor: 0.82    # Systemwirkungsgrad
-  azimuth_deg: 180           # 180=Süd, 90=Ost, 270=West
-  tilt_deg: 30               # Neigungswinkel [°]
+  peak_power_kwp: 10.0            # Anlagenleistung [kWp]
+  efficiency_factor: 0.82           # Systemwirkungsgrad
+  azimuth_deg: 180                # 180=Süd, 90=Ost, 270=West
+  tilt_deg: 30                    # Neigungswinkel [°]
 
 # ── Standort ────────────────────────────────────────────
 location:
-  latitude: 48.7758          # GPS Breitengrad
-  longitude: 9.1829          # GPS Längengrad
+  latitude: 48.7758               # GPS Breitengrad
+  longitude: 9.1829               # GPS Längengrad
   timezone: "Europe/Berlin"
+
+# ── Victron VRM API (empfohlen für beste Prognosequalität) ──
+vrm:
+  enabled: true
+  access_token: "dein-token"      # Von vrm.victronenergy.com/access-tokens
+  installation_id: "deine-id"     # VRM Portal → Einstellungen → Allgemein
+  timeout_seconds: 10
 
 # ── Prognose ────────────────────────────────────────────
 forecast:
-  provider: "open_meteo"     # open_meteo | solcast
+  provider: "open_meteo"          # open_meteo | solcast
   update_interval_minutes: 60
-  solcast_api_key: ""        # nur für provider=solcast
+  solcast_api_key: ""             # nur für provider=solcast
   solcast_resource_id: ""
 
-# ── Ladesteuerung ───────────────────────────────────────
+# ── Ladesteuerung (v3.0) ─────────────────────────────────
 charging:
   control_interval_seconds: 60    # Regelzyklus
   soc_hysteresis: 2               # Puffer am Ziel [%]
   current_ramp_step: 5            # Strom-Rampe [A/Zyklus]
-  avg_daily_consumption_kwh: 8.0  # Tagesverbrauch
-  emergency_charge_soc: 25        # Notfall-SOC [%]
+  # Wird nur als Fallback genutzt wenn VRM keine Verbrauchsprognose liefert
+  avg_daily_consumption_kwh: 8.0  # Durchschnittlicher Tagesverbrauch
+  default_night_consumption_kwh: 2.5  # Erwarteter Nachtverbrauch (Fallback)
+  emergency_charge_soc: 20        # Notfall-SOC [%] (unter min_soc möglich)
   night_start_hour: 21
   night_end_hour: 6
   morning_delay_start_hour: 6
   morning_delay_end_hour: 10
+  # ── v3.0.0: Adaptive Ladezeitfenster ─────────────────
+  solar_noon_offset_hours: 2      # ± Stunden um 13:00 (Sonnenhöchststand)
+  reduced_charge_current_a: 20    # Reduzierter Strom im Optimal-Fenster [A]
 
 # ── Dashboard ───────────────────────────────────────────
 dashboard:
@@ -405,18 +447,27 @@ dashboard:
 
 # ── Logging ─────────────────────────────────────────────
 logging:
-  level: "INFO"              # DEBUG|INFO|WARNING|ERROR
+  level: "INFO"                   # DEBUG|INFO|WARNING|ERROR
   file: "/home/pi/solar_battery/battery_manager.log"
   max_size_mb: 10
   backup_count: 3
-  log_decisions: true        # Jede Entscheidung loggen
+  log_decisions: true             # Jede Entscheidung loggen
 ```
+
+### Neue v3.0-Parameter
+
+| Parameter | Default | Beschreibung |
+|-----------|---------|--------------|
+| `solar_noon_offset_hours` | 2 | ± Stunden um 13:00 für das Hauptladefenster (11:00–15:00) |
+| `reduced_charge_current_a` | 20 | Reduzierter Ladestrom im Optimal-Fenster, um PV besser auszunutzen |
+
+Beide Parameter sind **optional** – alte `config.yaml` ohne diese Felder funktioniert ohne Anpassung (Defaults greifen automatisch).
 
 ---
 
 ## 9. Web-Dashboard
 
-Aufruf: `http://<pi-ip>:5000`
+Aufruf: `http://<raspi-ip>:5000`
 
 ### Anzeigeelemente
 
@@ -433,15 +484,14 @@ Aufruf: `http://<pi-ip>:5000`
 
 ### Entscheidungsbox
 Zeigt im Klartext warum gerade geladen/nicht geladen wird, z.B.:
-> „Morgen-Verzögerung: PV-Prognose heute 28.4 kWh, projizierter Abend-SOC 87% ≥ Ziel 80%. Kein Laden nötig."
+> "Morgen-Verzögerung: PV-Prognose heute 28.4 kWh, projizierter Abend-SOC 87% ≥ Ziel 80%. Kein Laden nötig."
 
 ### Tagesgrafik
 Balkendiagramm: PV-Ertrag vs. Verbrauch pro Stunde, aktuelle Stunde hervorgehoben.
 
 ### Ladeplan-Tabelle
 Stündliche Vorschau mit projiziertem SOC-Verlauf, Aktion und geplantem Ladestrom.
-
-<img width="1829" height="850" alt="image" src="https://github.com/user-attachments/assets/53a560b6-3089-48fc-a5fc-f5024e573913" />
+![Dashboard Screenshot](docs/dashboard_v3.png)
 
 ---
 
@@ -449,12 +499,12 @@ Stündliche Vorschau mit projiziertem SOC-Verlauf, Aktion und geplantem Ladestro
 
 ### Systemd-Befehle
 ```bash
-sudo systemctl start solar-battery      # Starten
-sudo systemctl stop solar-battery       # Stoppen
-sudo systemctl restart solar-battery    # Neu starten
-sudo systemctl status solar-battery     # Status
-sudo systemctl enable solar-battery     # Autostart an
-sudo systemctl disable solar-battery    # Autostart aus
+sudo systemctl start solar-battery     # Starten
+sudo systemctl stop solar-battery      # Stoppen
+sudo systemctl restart solar-battery   # Neu starten
+sudo systemctl status solar-battery    # Status
+sudo systemctl enable solar-battery    # Autostart an
+sudo systemctl disable solar-battery   # Autostart aus
 ```
 
 ### Log-Monitoring
@@ -469,18 +519,18 @@ journalctl -u solar-battery -f
 tail -100 /home/pi/solar_battery/battery_manager.log
 
 # Nur Entscheidungen
-grep "CHARGING\|TRICKLE\|IDLE\|FULL\|NOTFALL" battery_manager.log
+grep -E "CHARGING|TRICKLE|IDLE|FULL|NOTFALL" battery_manager.log
 ```
 
 ### Typische Log-Ausgaben
 ```
-[INFO]  Prognose (open_meteo): 28.4 kWh heute
-[INFO]  Modbus TCP: 192.168.178.61:502
-[INFO]  [IDLE] 0A | Morgen-Verzögerung: PV reicht...
-[INFO]  [CHARGING] 23A | PV-Überschuss: 1120W → 23A
-[INFO]  [TRICKLE] 5A | SOC 45% weit unter Ziel 80%
-[INFO]  [FULL_CHARGE] 50A | Vollladung: 8 Tage seit letzter
-[INFO]  Vollladung erreicht (98.1%), Balancing abgeschlossen
+[INFO] Prognose (open_meteo): 28.4 kWh heute
+[INFO] Modbus TCP: 192.168.178.61:502
+[INFO] [IDLE] 0A | Morgen-Verzögerung: PV reicht...
+[INFO] [CHARGING] 23A | PV-Überschuss: 1120W → 23A
+[INFO] [TRICKLE] 5A | SOC 45% weit unter Ziel 80%
+[INFO] [FULL_CHARGE] 50A | Vollladung: 8 Tage seit letzter
+[INFO] Vollladung erreicht (98.1%), Balancing abgeschlossen
 ```
 
 ### Persistenter Zustand
@@ -507,11 +557,11 @@ nc -zv 192.168.178.61 502
 ```bash
 # Rohwerte direkt lesen (mbpoll = pymodbus +1)
 sudo apt install mbpoll
-mbpoll -a 100 -r 844 -c 1 192.168.178.61   # SOC
-mbpoll -a 100 -r 841 -c 1 192.168.178.61   # Spannung (/10 → V)
-mbpoll -a 100 -r 812 -c 3 192.168.178.61   # PV L1/L2/L3
-mbpoll -a 100 -r 818 -c 3 192.168.178.61   # Last L1/L2/L3
-mbpoll -a 100 -r 821 -c 3 192.168.178.61   # Netz L1/L2/L3
+mbpoll -a 100 -r 844 -c 1 192.168.178.61  # SOC
+mbpoll -a 100 -r 841 -c 1 192.168.178.61  # Spannung (/10 → V)
+mbpoll -a 100 -r 812 -c 3 192.168.178.61  # PV L1/L2/L3
+mbpoll -a 100 -r 818 -c 3 192.168.178.61  # Last L1/L2/L3
+mbpoll -a 100 -r 821 -c 3 192.168.178.61  # Netz L1/L2/L3
 ```
 
 ### Ladestrom wird nicht gesetzt
@@ -564,7 +614,7 @@ sudo systemctl start solar-battery
 ### Option A: Eigener Raspberry Pi (aktuell, Entwicklungssetup)
 ```
 Raspi (battery_manager) ──WireGuard──► Fritzbox ──Internet──► Fritzbox ──► Cerbo GX
-192.168.168.54:5000                                            192.168.178.x   .61
+192.168.168.54:5000                    192.168.178.x                    .61
 ```
 - config.yaml bleibt wie ist
 - WireGuard-Tunnel für Modbus und evcc-API nötig
@@ -572,15 +622,15 @@ Raspi (battery_manager) ──WireGuard──► Fritzbox ──Internet──�
 ### Option B: Gleicher Raspi wie evcc (empfohlen für Produktion)
 ```
 Raspi (evcc + battery_manager) ──LAN──► Cerbo GX
-192.168.178.58                          192.168.178.61
+192.168.178.58                              192.168.178.61
 ```
 Änderungen in config.yaml:
 ```yaml
 modbus:
-  host: "192.168.178.61"    # unverändert
+  host: "192.168.178.61"        # unverändert
 
 evcc:
-  api_url: "http://localhost:7070/api/state"   # localhost statt IP
+  api_url: "http://localhost:7070/api/state"  # localhost statt IP
 ```
 - Kein WireGuard nötig
 - Beide Dienste laufen parallel, kein Ressourcenkonflikt (Go + Python)
@@ -592,7 +642,6 @@ evcc:
 free -h
 top -b -n1 | grep -E "evcc|python"
 ```
-
 
 ---
 
@@ -635,7 +684,7 @@ VRM Portal → Einstellungen → Allgemein
 ```yaml
 vrm:
   enabled: true
-  access_token: "dein-token"   # geheim halten, nicht in Git!
+  access_token: "dein-token"      # geheim halten, nicht in Git!
   installation_id: "deine-id"
   timeout_seconds: 10
 ```
@@ -644,10 +693,10 @@ vrm:
 
 ```
 GET https://vrmapi.victronenergy.com/v2/installations/{id}/stats
-    ?type=forecast
-    &start={unix_timestamp_jetzt - 60s}
-    &end={unix_timestamp_sonnenuntergang}
-    &interval=hours
+  ?type=forecast
+  &start={unix_timestamp_jetzt - 60s}
+  &end={unix_timestamp_sonnenuntergang}
+  &interval=hours
 
 Header: x-authorization: Token {access_token}
 ```
@@ -669,8 +718,8 @@ Header: x-authorization: Token {access_token}
     ]
   },
   "totals": {
-    "solar_yield_forecast": 26249.63,   // Wh gesamt
-    "vrm_consumption_fc":   14065.60
+    "solar_yield_forecast": 26249.63,  // Wh gesamt
+    "vrm_consumption_fc": 14065.60
   }
 }
 ```
@@ -689,7 +738,7 @@ Die Strategie aus der Community (bewährt, Genauigkeit ±1–2 kWh):
 ```python
 # Abfrage: (jetzt - 60s) bis Sonnenuntergang
 start = int(time.time()) - 60
-end   = heute_21_uhr_unix
+end = heute_21_uhr_unix
 
 # Ergebnis = verbleibende PV für heute
 # Gesamtprognose = bereits_erzeugt_heute + verbleibend
@@ -701,7 +750,7 @@ Im battery_manager ist das in `VrmForecastManager.fetch()` implementiert.
 
 ```
 VRM API verfügbar?
-  JA  → VRM-Prognose verwenden (beste Qualität)
+  JA → VRM-Prognose verwenden (beste Qualität)
   NEIN → Solcast (falls konfiguriert)
        → Open-Meteo (immer verfügbar, kein Key)
        → Dummy-Profil (Gauss-Kurve als Notfall)
@@ -764,4 +813,3 @@ https://www.victronenergy.com/upload/documents/CCGX-Modbus-TCP-register-list-3.7
 *Erstellt: Mai 2026 | Getestet mit: Victron Cerbo GX Venus OS, Raspberry Pi OS Bookworm, pymodbus 3.13*
 
 ---
-
