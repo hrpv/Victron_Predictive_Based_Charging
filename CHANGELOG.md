@@ -1,9 +1,5 @@
 # Changelog — battery_manager.py
 
-### 27.05.2026 — battery_manager v3.0.1
-
-## Cellbalancing-Haltezeit bei SOC ≥ max_soc
-
 ### 27.05.2026 (2) — battery_manager v3.0.1
 
 ## ESS-Modus Fix: SOC-Prognose bei negativem PV-Überschuss
@@ -13,8 +9,6 @@ der Akku bei negativem Überschuss (Last > PV) auch dann, wenn ein Ladestrom
 > 0 A gesetzt ist. Die SOC-Prognose in `_simulate_hour()` ignorierte diese
 physikalische Realität und zeigte einen stabilen SOC an, obwohl der Akku
 sich tatsächlich entlud.
-
-
 
 **Änderungen:**
 
@@ -45,6 +39,9 @@ Uhr    PV kWh    Last kWh    Ueberschuss    Aktion       Strom    SOC %
 
 ---
 
+### 27.05.2026 — battery_manager v3.0.1
+
+## Cellbalancing-Haltezeit bei SOC ≥ max_soc
 
 **Anforderung:** Wenn SOC ≥ 98% erreicht wird, darf der Ladestrom erst nach
 mindestens 5 Stunden auf 0 reduziert werden, damit der BMS ein vollständiges
