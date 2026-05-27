@@ -1617,9 +1617,12 @@ class ChargeController:
             self._last_decision_result = (target_a, mode, reason)
         else:
             target_a, mode, reason = self._last_decision_result
-            if not reason.endswith("(Hysterese)"):
+            # Sonderfall: Balancing-Haltezeit laeuft -> decide() neu aufrufen damit
+            # remaining_min jeden Zyklus aktuell berechnet wird (kein eingefrorener Countdown)
+            if mode == "trickle" and self._balancing_hold_until > 0:
+                target_a, mode, reason = self.decide()
+            elif not reason.endswith("(Hysterese)"):
                 reason = reason + " (Hysterese)"
-
         # Schreiben nur wenn sich der gerampte Sollwert tatsaechlich geaendert hat
         write_performed = False
         if target_a >= 0:
