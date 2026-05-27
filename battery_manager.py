@@ -1582,9 +1582,13 @@ class ChargeController:
         if self.state.soc >= 98.0:
             if self._soc_98_reached_at is None:
                 self._soc_98_reached_at = datetime.now()
-                # v3.0.1: Cellbalancing-Haltezeit starten (fruehestens N Stunden warten)
+                # v3.0.1: Cellbalancing-Haltezeit starten.
+                # Nur starten wenn kein laufender Timer existiert (Zukunft).
+                # "== 0.0" reicht nicht: nach Auto-Reset (_soc_98_reached_at -> None)
+                # landen wir erneut hier -- ein noch laufender Timer darf nicht
+                # ueberschrieben werden (das wuerde den Countdown zuruecksetzen).
                 hold_h = self.bat.get("balancing_hold_hours", 5)
-                if self._balancing_hold_until == 0.0:
+                if self._balancing_hold_until <= time.monotonic():
                     self._balancing_hold_until = time.monotonic() + hold_h * 3600
             else:
                 elapsed = (datetime.now() - self._soc_98_reached_at).total_seconds()
