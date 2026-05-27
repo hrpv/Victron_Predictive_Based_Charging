@@ -37,6 +37,8 @@ battery:
  max_charge_current: 50 # Maximaler Ladestrom [A]
  # Stromstärke für "sanftes" Laden (Erhaltungsladung)
  trickle_current: 5 # [A]
+ # v3.0.1: Mindest-Haltezeit bei max_soc für Cellbalancing [Stunden]
+ balancing_hold_hours: 5 # Ladestrom erst nach N Stunden auf 0 reduzieren
  # Voltage pro % SOC (für Schätzungen ohne exakten SOC-Wert)
  voltage_nominal: 48.0 # [V]
 

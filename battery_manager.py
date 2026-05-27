@@ -942,6 +942,8 @@ class ChargeController:
         self._morning_emergency_done: bool = False
         # v3.0.0: Auto-Reset Vollladung Tracking
         self._soc_98_reached_at: Optional[datetime] = None
+        # v3.0.1: Cellbalancing-Haltezeit: SOC >= max_soc fuer min. N Stunden halten
+        self._balancing_hold_until: float = 0.0
 
     def _load_energy_base(self):
         """Laedt letzten bekannten Energie-Akkumulatorstand aus state.json."""
@@ -1133,6 +1135,12 @@ class ChargeController:
 
         # Ziel bereits erreicht?
         if soc >= dyn_target - hyst:
+            # v3.0.1: Cellbalancing-Haltezeit: bei max_soc mindestens N Stunden trickle halten
+            if soc >= max_soc - hyst and time.monotonic() < self._balancing_hold_until:
+                remaining_min = int((self._balancing_hold_until - time.monotonic()) / 60)
+                return trickle_a, "trickle", (
+                    f"Cellbalancing: SOC {soc:.1f}% >= {max_soc}%, "
+                    f"halte {trickle_a} A noch {remaining_min} min")
             return 0, "idle", (
                 f"Ziel {dyn_target:.0f}% erreicht (SOC {soc:.1f}%)")
 
@@ -1552,6 +1560,10 @@ class ChargeController:
         if self.state.soc >= 98.0:
             if self._soc_98_reached_at is None:
                 self._soc_98_reached_at = datetime.now()
+                # v3.0.1: Cellbalancing-Haltezeit starten (fruehestens N Stunden warten)
+                hold_h = self.bat.get("balancing_hold_hours", 5)
+                if self._balancing_hold_until == 0.0:
+                    self._balancing_hold_until = time.monotonic() + hold_h * 3600
             else:
                 elapsed = (datetime.now() - self._soc_98_reached_at).total_seconds()
                 if elapsed >= 3600 and self.state.days_since_full_charge > 0:
@@ -1564,6 +1576,7 @@ class ChargeController:
                     self._soc_98_reached_at = None
         else:
             self._soc_98_reached_at = None
+            self._balancing_hold_until = 0.0  # v3.0.1: Reset wenn SOC unter max_soc faellt
 
         now = time.monotonic()
         min_dur = self._min_charge_duration_s

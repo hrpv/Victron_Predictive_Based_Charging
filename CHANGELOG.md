@@ -1,4 +1,36 @@
 # Changelog — battery_manager.py
+
+### 27.05.2026 — battery_manager v3.0.1
+
+## Cellbalancing-Haltezeit bei SOC ≥ max_soc
+
+**Anforderung:** Wenn SOC ≥ 98% erreicht wird, darf der Ladestrom erst nach
+mindestens 5 Stunden auf 0 reduziert werden, damit der BMS ein vollständiges
+Cellbalancing durchführen kann.
+
+**Änderungen:**
+
+| Datei | Stelle | Änderung |
+|-------|--------|----------|
+| `battery_manager.py` | `ChargeController.__init__()` | Neues Attribut `_balancing_hold_until: float = 0.0` (monotonic timestamp) |
+| `battery_manager.py` | `ChargeController.run_cycle()` | `_balancing_hold_until` wird gesetzt sobald SOC ≥ 98% erstmals erreicht; Reset wenn SOC wieder unter 98% fällt |
+| `battery_manager.py` | `ChargeController.decide()` | Im „Ziel erreicht"-Block: solange `_balancing_hold_until` noch nicht abgelaufen ist, wird `trickle_current` statt `0 A` zurückgegeben |
+| `config.yaml` | `battery:` | Neues optionales Feld `balancing_hold_hours: 5` (rückwärtskompatibel, Default 5) |
+
+**Verhalten:**
+- Beim ersten Erreichen von SOC ≥ 98% startet ein 5-Stunden-Timer
+- Während dieser Zeit gibt `decide()` `trickle_current` (5 A) zurück statt `0 A`
+- Im Log erscheint: `[TRICKLE] 5A | Cellbalancing: SOC 98.x% >= 98%, halte 5A noch NNN min`
+- Nach Ablauf der Haltezeit: normaler Übergang zu `idle / 0 A`
+- Fällt der SOC vor Ablauf unter 98%, wird der Timer zurückgesetzt (neuer Ladevorgang)
+- Der bestehende Auto-Reset von `days_since_full_charge` nach 1 Stunde läuft unverändert parallel
+
+**Rückwärtskompatibilität:** `balancing_hold_hours` ist optional – fehlt das Feld
+in einer alten `config.yaml`, greift automatisch der Default von 5 Stunden via
+`self.bat.get("balancing_hold_hours", 5)`.
+
+---
+
 ### Commits on May 22, 2026
 • Add energy tracking, history buffer, fix startup Modbus write, details see changelog.md 73aa2fef0ff7b33a4afb18923c88939ac213dacb
 
