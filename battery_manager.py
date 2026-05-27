@@ -1243,21 +1243,37 @@ class ChargeController:
         action = "idle"
         current_a = 0.0
 
+        # Maximale Ladeenergie pro Stunde durch Strombegrenzung
+        max_charge_kwh = max_a * nom_v / 1000.0  # z.B. 50A * 48V / 1000 = 2.4 kWh
+
         # Notfall-SOC
         if soc_sim <= self.cc.get("emergency_charge_soc", 25):
             action = "charging"
             current_a = max_a
-            soc_sim = min(max_soc, soc_sim + (current_a * nom_v / 1000 / cap) * 100)
+            if fc.net_kwh > 0:
+                # PV-Ueberschuss: Laden moeglich
+                charge_kwh = min(fc.net_kwh, max_charge_kwh)
+                soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+            else:
+                # ESS-Modus (DE): kein Netzbezug moeglich -> Akku entlaedt sich trotz Notfall
+                deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+                soc_sim = max(0.0, soc_sim - (deficit / cap) * 100)  # unter min_soc moeglich im echten Notfall
             return action, current_a, soc_sim
 
-        # Maximale Ladeenergie pro Stunde durch Strombegrenzung
-        max_charge_kwh = max_a * nom_v / 1000.0  # z.B. 50A * 48V / 1000 = 2.4 kWh
-
         if needs_full and soc_sim < max_soc - hyst:
-            action = "full_charge"
-            current_a = max_a
-            charge_kwh = min(fc.pv_kwh, max_charge_kwh)
-            soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+            if fc.net_kwh > 0:
+                # PV-Ueberschuss: Akku laden (Vollladung/Balancing)
+                action = "full_charge"
+                current_a = max_a
+                charge_kwh = min(fc.net_kwh, max_charge_kwh)
+                soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+            else:
+                # ESS-Modus (DE): kein Netzbezug moeglich! Akku entlaedt sich trotz
+                # gesetztem Ladestrom, da Last > PV. Vollladung wird naechsten Tag/PV versucht.
+                action = "full_charge"  # Soll-Aktion bleibt (Setpoint wird geschrieben)
+                current_a = max_a       # Setpoint bleibt, aber Netz laedt nicht
+                deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+                soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
             return action, current_a, soc_sim
 
         def _apply_deficit(soc: float) -> tuple[str, float]:
@@ -1271,8 +1287,14 @@ class ChargeController:
         if morn_s <= h < morn_e and soc_sim < min_required:
             action = "charging"
             current_a = max_a
-            charge_kwh = min(max_charge_kwh, max_a * nom_v / 1000.0)
-            soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+            if fc.net_kwh > 0:
+                # PV-Ueberschuss: Laden moeglich
+                charge_kwh = min(fc.net_kwh, max_charge_kwh)
+                soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+            else:
+                # ESS-Modus (DE): kein Netzbezug moeglich -> Akku entlaedt sich trotz Notladeversuch
+                deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+                soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
             return action, current_a, soc_sim
 
         # Ziel erreicht?

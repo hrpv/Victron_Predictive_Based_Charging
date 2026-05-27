@@ -4,6 +4,48 @@
 
 ## Cellbalancing-Haltezeit bei SOC ≥ max_soc
 
+### 27.05.2026 (2) — battery_manager v3.0.1
+
+## ESS-Modus Fix: SOC-Prognose bei negativem PV-Überschuss
+
+**Anforderung:** Im deutschen ESS-Modus (kein Netzbezug zum Laden) entlädt sich
+der Akku bei negativem Überschuss (Last > PV) auch dann, wenn ein Ladestrom
+> 0 A gesetzt ist. Die SOC-Prognose in `_simulate_hour()` ignorierte diese
+physikalische Realität und zeigte einen stabilen SOC an, obwohl der Akku
+sich tatsächlich entlud.
+
+
+
+**Änderungen:**
+
+| Datei | Stelle | Änderung |
+|-------|--------|----------|
+| `battery_manager.py` | `_simulate_hour()` — Notfall-SOC | `fc.net_kwh > 0` → laden mit `min(fc.net_kwh, max_charge_kwh)`; `fc.net_kwh <= 0` → Entladung mit `max(0.0, soc_sim - deficit)` |
+| `battery_manager.py` | `_simulate_hour()` — needs_full | `fc.net_kwh > 0` → laden; `fc.net_kwh <= 0` → Entladung mit `max(min_soc, soc_sim - deficit)`. `action` bleibt `"full_charge"`, `current_a` bleibt `max_a` (Setpoint wird geschrieben, aber Netz lädt nicht) |
+| `battery_manager.py` | `_simulate_hour()` — Morgen-Notladung | Gleiche Struktur: nur bei Überschuss laden, sonst Entladung mit `max(min_soc, ...)` |
+| `battery_manager.py` | `_simulate_hour()` — max_charge_kwh | Variable wurde vor den Notfall-SOC-Block verschoben (war nach dem Block definiert → `NameError`) |
+
+**Semantik:**
+- `action = "charging"` / `"full_charge"` beschreibt den **Sollwert** (DVCC Setpoint)
+- Die SOC-Prognose reflektiert die **physikalische Realität** (ESS-Modus = kein Netzbezug)
+- Bei negativem Überschuss sinkt der SOC trotz gesetztem Ladestrom
+
+**Neues Verhalten (nach dem Fix):**
+```
+Uhr    PV kWh    Last kWh    Ueberschuss    Aktion       Strom    SOC %
+20:00  0.213     0.775       -0.56          Entladen     -        94.0%
+21:00  0.000     0.627       -0.63          Vollladung   50A      93.2%  ← korrekt
+22:00  0.000     0.491       -0.49          Vollladung   50A      92.4%  ← korrekt
+23:00  0.000     0.326       -0.33          Vollladung   50A      91.8%  ← korrekt
+```
+
+**Unterschiedliche Untergrenzen:**
+- Notfall-SOC: `max(0.0, ...)` — Akku darf in der Prognose unter `min_soc` fallen (echter Notfall)
+- Alle anderen: `max(min_soc, ...)` — normale Betriebsgrenze
+
+---
+
+
 **Anforderung:** Wenn SOC ≥ 98% erreicht wird, darf der Ladestrom erst nach
 mindestens 5 Stunden auf 0 reduziert werden, damit der BMS ein vollständiges
 Cellbalancing durchführen kann.
