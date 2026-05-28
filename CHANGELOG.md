@@ -15,10 +15,13 @@
   `_simulate_hour()` (Ladeplan) hatte bereits den `effective_morn_e`-Fix, `decide()` (echte Steuerung) aber nicht. Das führte zu divergierenden Anzeigen: Dashboard-Text sagte "warte", Ladeplan zeigte "LADEN".  
   → Beide Methoden verwenden nun identische Logik.
 
-- **evcc MinSoc im Ladeplan **	
-   Simulation zeigte SOC bis 20%, obwohl Reg 2901 auf z.B. 60% sperrt	
+- **evcc MinSoc im Ladeplan**
+
+  Simulation zeigte SOC bis 20%, obwohl Reg 2901 auf z.B. 60% sperrt	
    floor_soc Parameter in _simulate_hour(), build_schedule() ermittelt effektiven MinSoc
+
 ---
+
 
 ## [3.0.2] – 2026-05-27
 
