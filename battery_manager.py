@@ -16,6 +16,7 @@ Steuerlogik:
 - SOC-Fenster bevorzugt 20-80 % (LFP-schonend)
 - Alle N Tage Vollladung auf 98 % (Zellbalancing)
 - evcc-Priorität: bei Schnellladen Auto → eigene Steuerung pausieren
+- evcc MinSoc-Sperre (Reg 2901) wird im Ladeplan berücksichtigt
 
 =============================================================
 Victron Modbus-TCP Register (Cerbo GX, Unit-ID 100):
@@ -463,7 +464,7 @@ class EvccMonitor:
         self._last_check = now
 
         # ── MinSoc aus Modbus Register 2901 lesen ─────────────
-        min_soc_reg = self.victron.read_register(self.REG_MIN_SOC)
+        min_soc_reg = self.victron.read_register(self.REG_MIN_SOC, scale=0.1)  # Reg 2901: Rohwert * 10 = %, also scale=0.1
         if min_soc_reg is not None:
             self.evcc_min_soc = float(min_soc_reg)
             # evcc sperrt Entladung wenn MinSoc deutlich ueber Normalwert liegt
@@ -1234,13 +1235,21 @@ class ChargeController:
 
     def _simulate_hour(self, h: int, fc: HourlyForecast, soc_sim: float,
                        needs_full: bool, pv_rem_total: float, night_cons: float,
-                       is_forecast: bool = True) -> tuple[str, float, float]:
+                       is_forecast: bool = True,
+                       floor_soc: Optional[float] = None) -> tuple[str, float, float]:
         """
-        Simuliert EINE Stunde mit der exakten decide()-Logik (v3.0.0).
+        Simuliert EINE Stunde mit der exakten decide()-Logik (v3.0.3).
         Gibt (action, current_a, new_soc_sim) zurueck.
+
+        v3.0.3: floor_soc beruecksichtigt evcc MinSoc-Sperre (Reg 2901).
+                Wenn evcc den MinSoc angehoben hat, kann der Akku physikalisch
+                nicht unter diesen Wert entladen — die Simulation muss das
+                abbilden, sonst sind die projizierten SOC-Werte zu niedrig.
         """
         cap = self.bat["capacity_kwh"]
         min_soc = self.bat["min_soc"]
+        # v3.0.3: effektiver SOC-Boden = konfigurierter min_soc oder evcc-MinSoc
+        floor_soc = floor_soc if floor_soc is not None else min_soc
         max_soc = self.bat["max_soc"]
         nom_v = self.bat.get("voltage_nominal", 48.0)
         max_a = self.bat["max_charge_current"]
@@ -1285,13 +1294,14 @@ class ChargeController:
                 action = "full_charge"  # Soll-Aktion bleibt (Setpoint wird geschrieben)
                 current_a = max_a       # Setpoint bleibt, aber Netz laedt nicht
                 deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-                soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+                soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)
             return action, current_a, soc_sim
 
         def _apply_deficit(soc: float) -> tuple[str, float]:
             """Berechnet Deficit und setzt action: discharging wenn Ueberschuss negativ, sonst idle."""
             deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-            new_soc = max(min_soc, soc - (deficit / cap) * 100)
+            # v3.0.3: floor_soc statt min_soc — beruecksichtigt evcc MinSoc-Sperre
+            new_soc = max(floor_soc, soc - (deficit / cap) * 100)
             act = "discharging" if fc.net_kwh < 0 else "idle"
             return act, new_soc
 
@@ -1306,7 +1316,7 @@ class ChargeController:
             else:
                 # ESS-Modus (DE): kein Netzbezug moeglich -> Akku entlaedt sich trotz Notladeversuch
                 deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-                soc_sim = max(min_soc, soc_sim - (deficit / cap) * 100)
+                soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)
             return action, current_a, soc_sim
 
         # Ziel erreicht?
@@ -1316,6 +1326,8 @@ class ChargeController:
             hyst_kwh = hyst / 100.0 * cap
             if fc.net_kwh >= -hyst_kwh:
                 soc_sim = max(soc_sim, dyn_target - hyst)
+            # v3.0.3: Nie unter floor_soc fallen
+            soc_sim = max(soc_sim, floor_soc)
             return action, current_a, soc_sim
 
         # Morgen-Verzoegerung / Adaptive Fenster (v3.0.0)
@@ -1436,6 +1448,13 @@ class ChargeController:
         night_cons = self.forecast.night_consumption_kwh()
         fc_by_hour = {f.hour: f for f in fc_list}
 
+        # v3.0.3: Effektiver SOC-Boden fuer Simulation = evcc MinSoc (Reg 2901)
+        # oder konfigurierter min_soc. Wenn evcc den MinSoc angehoben hat,
+        # kann der Akku physikalisch nicht unter diesen Wert entladen.
+        floor_soc = self.bat["min_soc"]
+        if self.state.evcc_discharge_locked:
+            floor_soc = max(floor_soc, self.evcc.evcc_min_soc)
+
         for h in range(now_h, 24):
             # Aktuelle Stunde nur als Zukunft wenn sie noch laeuft (< 55 Min)
             if h == now_h and now_m >= 55:
@@ -1447,7 +1466,8 @@ class ChargeController:
                 fc = HourlyForecast(hour=h, pv_kwh=0.0, consumption_kwh=avg_cons, net_kwh=-avg_cons)
 
             action, current_a, soc_sim = self._simulate_hour(
-                h, fc, soc_sim, needs_full, pv_rem_total, night_cons
+                h, fc, soc_sim, needs_full, pv_rem_total, night_cons,
+                floor_soc=floor_soc
             )
 
             result.append({
