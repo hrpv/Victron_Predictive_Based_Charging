@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.0  (Modbus TCP, kein MQTT)
+Version: 3.0.3  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -944,6 +944,8 @@ class ChargeController:
         self._soc_98_reached_at: Optional[datetime] = None
         # v3.0.1: Cellbalancing-Haltezeit: SOC >= max_soc fuer min. N Stunden halten
         self._balancing_hold_until: float = 0.0
+        # Tagesreset-Tracking: Mitternachts-Reset der Balancing-Timer
+        self._balancing_reset_date: str = date.today().isoformat()
 
     def _load_energy_base(self):
         """Laedt letzten bekannten Energie-Akkumulatorstand aus state.json."""
@@ -1144,22 +1146,32 @@ class ChargeController:
             return 0, "idle", (
                 f"Ziel {dyn_target:.0f}% erreicht (SOC {soc:.1f}%)")
 
-        # ── 5. Morgen-Fenster mit adaptiver Logik (v3.0.0) ────
-        if self._is_morning_window():
+        # ── 5. Morgen-Fenster mit adaptiver Logik (v3.0.2) ────
+        # WICHTIG: Das Morgen-Verzoegerungs-Fenster muss bis zum Optimal-Fenster
+        # reichen, sonst entsteht eine Luecke (z.B. morn_e=10, opt_start=11)
+        # in der sofort geladen wird — obwohl das Optimal-Fenster noch ausreichend
+        # PV verspricht.
+        h_now = datetime.now().hour
+        opt_start, opt_end = self._get_optimal_charge_window()
+        morn_s = self.cc.get("morning_delay_start_hour", 6)
+        morn_e = self.cc.get("morning_delay_end_hour", 10)
+        effective_morn_e = max(morn_e, opt_start)
+
+        if morn_s <= h_now < effective_morn_e:
             needed_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
             fc_list = self.forecast.get_forecast()
-            opt_start, opt_end = self._get_optimal_charge_window()
             pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
 
-            # Wenn genug PV im optimalen Fenster und SOC nicht kritisch -> warte
-            if pv_in_optimal >= needed_kwh and soc > min_required + 5:
+            # Warte auf Optimal-Fenster wenn:
+            # - genug PV dort erwartet wird  UND
+            # - SOC nicht im Notfall-Bereich (>= min_required)
+            if pv_in_optimal >= needed_kwh and soc >= min_required:
                 return 0, "idle", (
                     f"Morgen: PV im Optimal-Fenster ({opt_start}:00-{opt_end}:00) "
                     f"ausreichend ({pv_in_optimal:.1f} kWh >= {needed_kwh:.1f} kWh), warte")
 
             # Nicht genug PV im optimalen Fenster -> fruehes Laden noetig
             if soc < dyn_target - hyst:
-                h_now = datetime.now().hour
                 # Im optimalen Fenster mit genug PV -> reduzierter Strom
                 if opt_start <= h_now <= opt_end and pv_in_optimal >= needed_kwh * 1.2:
                     reduced_a = self.cc.get("reduced_charge_current_a", 20)
@@ -1307,13 +1319,15 @@ class ChargeController:
             return action, current_a, soc_sim
 
         # Morgen-Verzoegerung / Adaptive Fenster (v3.0.0)
-        if morn_s <= h < morn_e:
-            needed_kwh = max(0.0, (dyn_target - soc_sim) / 100.0 * cap)
-            opt_start, opt_end = self._get_optimal_charge_window()
+        # Erweiterter Bereich: morn_s bis max(morn_e, opt_start) damit keine Luecke
+        # zwischen Morgen-Fenster-Ende und opt_start entsteht.
+        opt_start, opt_end = self._get_optimal_charge_window()
+        effective_morn_e = max(morn_e, opt_start)
+        if morn_s <= h < effective_morn_e:
 
-            # Wenn Stunde noch vor dem optimalen Fenster und genug PV erwartet -> warte
+            # Wenn Stunde noch vor dem optimalen Fenster und SOC nicht kritisch -> warte
             if h < opt_start:
-                if soc_sim > min_required + 5:
+                if soc_sim >= min_required:
                     action, soc_sim = _apply_deficit(soc_sim)
                     return action, current_a, soc_sim
 
@@ -1335,7 +1349,6 @@ class ChargeController:
         # PV-Ueberschuss mit adaptivem Strom (v3.0.0)
         if fc.net_kwh > 0:
             action = "charging"
-            opt_start, opt_end = self._get_optimal_charge_window()
             if opt_start <= h <= opt_end:
                 # Im optimalen Fenster: reduzierter Strom wenn moeglich
                 reduced_a = self.cc.get("reduced_charge_current_a", 20)
@@ -1568,6 +1581,17 @@ class ChargeController:
     def run_cycle(self):
         """Fuehrt einen Regelzyklus aus (v3.0.0)."""
         self._update_history()
+
+        # ── Mitternachts-Reset Balancing-Timer (v3.0.2) ───────────────────────
+        # Unabhaengig von Vorgeschichte (SOC-Schwankungen, Mehrfach-Resets):
+        # Jeden Tag um Mitternacht werden Balancing-Timer zurueckgesetzt.
+        # So beginnt jeder Tag sauber ohne Altlasten vom Vortag.
+        _today_iso = date.today().isoformat()
+        if _today_iso != self._balancing_reset_date:
+            self._balancing_hold_until = 0.0
+            self._soc_98_reached_at    = None
+            self._balancing_reset_date = _today_iso
+            self.logger.info("Mitternachts-Reset: Balancing-Timer zurueckgesetzt")
 
         # ── days_since_full_charge immer aktuell aus Datum berechnen ──────────
         if self.state.last_full_charge_date:
@@ -2046,7 +2070,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v3.0.0  (Modbus TCP) - Predictive Charging")
+    logger.info("Solar Batterie Manager v3.0.3  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

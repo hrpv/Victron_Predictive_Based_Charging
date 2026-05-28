@@ -1,5 +1,47 @@
 # Changelog — battery_manager.py
 
+## [3.0.3] – 2026-05-28
+
+### Fixed
+- **Morgen-Verzögerung: Lücke zwischen `morning_delay_end_hour` und `opt_start`**  
+  Wenn `morning_delay_end_hour` (z.B. 10 Uhr) vor dem Optimal-Fenster-Start `opt_start` (z.B. 11 Uhr) lag, entstand eine Lücke von einer Stunde. In dieser Lücke fiel die Logik in den normalen PV-Überschuss-Block und lud sofort — obwohl das Optimal-Fenster noch ausreichend PV versprach.  
+  → Fix: `effective_morn_e = max(morn_e, opt_start)` schließt die Lücke. Der Morgen-Verzögerungs-Block reicht nun garantiert bis zum Optimal-Fenster.
+
+- **Morgen-Verzögerung: falsche Guard-Bedingung in `decide()`**  
+  Die Bedingung `soc > min_required + 5` war semantisch falsch: sie sollte verhindern, dass bei kritisch niedrigem SOC gewartet wird. Tatsächlich verhinderte sie aber zu oft das Warten, weil `min_required` (Notfall-SOC, z.B. 25%) nicht das Ziel-SOC (z.B. 66%) ist.  
+  → Fix: `soc >= min_required` — warte solange der SOC nicht im Notfallbereich liegt.
+
+- **Konsistenz zwischen `decide()` und `_simulate_hour()`**  
+  `_simulate_hour()` (Ladeplan) hatte bereits den `effective_morn_e`-Fix, `decide()` (echte Steuerung) aber nicht. Das führte zu divergierenden Anzeigen: Dashboard-Text sagte "warte", Ladeplan zeigte "LADEN".  
+  → Beide Methoden verwenden nun identische Logik.
+
+---
+
+## [3.0.2] – 2026-05-27
+
+### Fixed
+- **Balancing-Timer: Mitternachts-Reset**  
+  Der Cellbalancing-Timer (`_balancing_hold_until`) wurde bisher nur bei SOC-Abfall unter 98% zurückgesetzt. Bei stundenlangem Pendeln um 97,5–98,5% (Wolken, Lastspitzen) startete der Timer immer wieder von vorne — die geforderte Haltezeit wurde nie erreicht.  
+  → Fix: Hart-Reset um Mitternacht (`_balancing_reset_date`), unabhängig von Vorgeschichte.
+
+- **Balancing-Timer: kein sofortiger Kill bei kurzen SOC-Unterschreitungen**  
+  Ein kurzer SOC-Abfall unter 98% (z.B. 2 Minuten hohe Last) setzte den Timer sofort auf 0.  
+  → Fix: Timer wird nur verworfen wenn SOC deutlich unter `max_soc - hyst` fällt (z.B. < 96%).
+
+---
+
+## [3.0.1] – 2026-05-27
+
+### Fixed
+- **Balancing-Timer: Guard gegen Mehrfach-Start nach Auto-Reset**  
+  Nach dem Auto-Reset (`_soc_98_reached_at = None`) wurde `_balancing_hold_until` beim nächsten Zyklus neu gesetzt, obwohl der alte Timer noch lief.  
+  → Fix: Guard `if self._balancing_hold_until <= time.monotonic()` statt `== 0.0`.
+
+---
+### 27.05.2026 — battery_manager v3.0.1
+
+## Cellbalancing-Haltezeit bei SOC ≥ max_soc
+
 ### 27.05.2026 (2) — battery_manager v3.0.1
 
 ## ESS-Modus Fix: SOC-Prognose bei negativem PV-Überschuss
@@ -9,6 +51,7 @@ der Akku bei negativem Überschuss (Last > PV) auch dann, wenn ein Ladestrom
 > 0 A gesetzt ist. Die SOC-Prognose in `_simulate_hour()` ignorierte diese
 physikalische Realität und zeigte einen stabilen SOC an, obwohl der Akku
 sich tatsächlich entlud.
+
 
 **Änderungen:**
 
@@ -39,9 +82,6 @@ Uhr    PV kWh    Last kWh    Ueberschuss    Aktion       Strom    SOC %
 
 ---
 
-### 27.05.2026 — battery_manager v3.0.1
-
-## Cellbalancing-Haltezeit bei SOC ≥ max_soc
 
 **Anforderung:** Wenn SOC ≥ 98% erreicht wird, darf der Ladestrom erst nach
 mindestens 5 Stunden auf 0 reduziert werden, damit der BMS ein vollständiges
