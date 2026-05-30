@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.7  (Modbus TCP, kein MQTT)
+Version: 3.0.8.5  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -578,7 +578,6 @@ class VrmForecastManager:
         self.timeout      = vrm.get("timeout_seconds", 10)
         self._cache: Optional[list] = None
         self._cache_ts: float = 0.0
-        self._consumption_night_kwh: float = 0.0
 
     def _headers(self) -> dict:
         return {"x-authorization": f"Token {self.token}",
@@ -655,20 +654,13 @@ class VrmForecastManager:
                 self.logger.warning("VRM API: keine PV-Prognosedaten")
                 return None
 
-            # Verbrauchsprognose fuer die Nacht berechnen
-            cons_total_wh = data.get("totals", {}).get("vrm_consumption_fc", 0)
-            if cons_total_wh:
-                ns  = self.cfg["charging"].get("night_start_hour", 21)
-                ne  = self.cfg["charging"].get("night_end_hour",   6)
-                night_hours = (24 - ns) + ne
-                self._consumption_night_kwh = (
-                    cons_total_wh / 1000.0 / 24.0 * night_hours)
-            else:
-                self._consumption_night_kwh = 0.0
-
             # KORREKTUR: Aggregation pro Stunde (mehrere Eintraege werden summiert)
+            # Nur Eintraege des heutigen Tages verwenden — VRM liefert auch Eintraege
+            # vom Vortag (letzte Stunden des UTC-Tages), die auf lokale Stunden 22/23
+            # gemappt werden und die echten Tagesstunden ueberschreiben wuerden.
             pv_by_hour: dict = {}
             cons_by_hour: dict = {}
+            today = datetime.now().date()
 
             for entry in pv_raw:
                 if not isinstance(entry, (list, tuple)) or len(entry) < 2:
@@ -677,8 +669,10 @@ class VrmForecastManager:
                 if wh is None:
                     continue
                 ts_sec = ts_raw / 1000 if ts_raw > 1e10 else ts_raw
-                h = datetime.fromtimestamp(ts_sec).hour
-                pv_by_hour[h] = pv_by_hour.get(h, 0.0) + float(wh)
+                dt = datetime.fromtimestamp(ts_sec)
+                if dt.date() != today:
+                    continue
+                pv_by_hour[dt.hour] = pv_by_hour.get(dt.hour, 0.0) + float(wh)
 
             for entry in cons_raw:
                 if not isinstance(entry, (list, tuple)) or len(entry) < 2:
@@ -687,15 +681,18 @@ class VrmForecastManager:
                 if wh is None:
                     continue
                 ts_sec = ts_raw / 1000 if ts_raw > 1e10 else ts_raw
-                h = datetime.fromtimestamp(ts_sec).hour
-                cons_by_hour[h] = cons_by_hour.get(h, 0.0) + float(wh)
+                dt = datetime.fromtimestamp(ts_sec)
+                if dt.date() != today:
+                    continue
+                cons_by_hour[dt.hour] = cons_by_hour.get(dt.hour, 0.0) + float(wh)
 
-            # PV-Prognose in HourlyForecast umwandeln
+            # PV-Prognose in HourlyForecast umwandeln — alle 24h, nicht nur PV-Stunden.
+            # VRM liefert PV-Daten nur fuer Tagesstunden; Nachtstunden fehlen in pv_by_hour.
+            # Ohne range(24) wuerden Nachtstunden in night_consumption_kwh() fehlen → zu niedriger Wert.
             out = []
             total_pv_kwh = 0.0
-            for h in sorted(pv_by_hour.keys()):
-                wh = pv_by_hour[h]
-                pv_kwh = float(wh) / 1000.0
+            for h in range(24):
+                pv_kwh = pv_by_hour.get(h, 0.0) / 1000.0
                 c_kwh  = cons_by_hour.get(h, avg_h * 1000) / 1000.0 if h in cons_by_hour else avg_h
                 out.append(HourlyForecast(
                     hour=h,
@@ -718,10 +715,7 @@ class VrmForecastManager:
 
             self._cache    = out
             self._cache_ts = time.monotonic()
-            self.logger.info(
-                f"VRM-Prognose: {total_pv_kwh:.2f} kWh PV heute"
-                + (f", Nachtverbrauch ~{self._consumption_night_kwh:.1f} kWh"
-                   if self._consumption_night_kwh else ""))
+            self.logger.info(f"VRM-Prognose: {total_pv_kwh:.2f} kWh PV heute")
             return out
 
         except requests.exceptions.HTTPError as e:
@@ -732,9 +726,6 @@ class VrmForecastManager:
             self.logger.warning(f"VRM API Fehler: {e} – Fallback Open-Meteo")
         return None
 
-    def night_consumption_kwh(self) -> Optional[float]:
-        """Gibt VRM-Verbrauchsprognose fuer die Nacht zurueck, oder None."""
-        return self._consumption_night_kwh if self._consumption_night_kwh else None
 
 # ─────────────────────────────────────────────
 # PV-Prognose
@@ -756,6 +747,8 @@ class ForecastManager:
         self._cache_ts: float = 0.0
         # VRM als primäre Prognose-Quelle
         self.vrm = VrmForecastManager(cfg, logger)
+        # (-1, -1) erzwingt Log beim ersten Aufruf nach Programmstart
+        self._last_night_window: tuple = (-1, -1)
 
     def get_forecast(self, force: bool = False) -> list:
         interval_s = self.fc_cfg.get("update_interval_minutes", 60) * 60
@@ -864,17 +857,11 @@ class ForecastManager:
         return sum(f.pv_kwh for f in self.get_forecast())
 
     def night_consumption_kwh(self) -> float:
-        """Berechnet Nachtverbrauch. Bevorzugt VRM totals, sonst Forecast-Summe."""
-        ns = self.cfg["charging"].get("night_start_hour", 21)
-        ne = self.cfg["charging"].get("night_end_hour",   6)
-
-        # 1. VRM liefert direkten Nachtverbrauch aus totals (genaueste Quelle)
-        vrm_val = self.vrm.night_consumption_kwh()
-        if vrm_val and vrm_val > 0.0:
-            return round(vrm_val, 2)
-
-        # 2. Summiere aus stündlichen Forecast-Daten
+        """Berechnet Nachtverbrauch aus stündlichen Forecast-Daten mit dynamischem Fenster."""
         fc_list = self.get_forecast()
+        ns, ne = self._get_dynamic_night_window(fc_list)
+
+        # Summiere aus stündlichen Forecast-Daten
         night_cons = 0.0
         for fc in fc_list:
             h = fc.hour
@@ -884,9 +871,70 @@ class ForecastManager:
         if night_cons > 0.0:
             return round(night_cons, 2)
 
-        # 3. Fallback: Durchschnitt
+        # Fallback: Durchschnitt
         avg = self.cfg["charging"].get("avg_daily_consumption_kwh", 8.0) / 24
         return round(avg * ((24 - ns) + ne), 2)
+
+    def _get_dynamic_night_window(self, fc_list: list) -> tuple:
+        """
+        Bestimmt Nachtstart und -ende dynamisch aus dem PV/Verbrauchs-Forecast.
+
+        Start (Abend): erste Stunde ab 12 Uhr, wo PV < Verbrauch
+        Ende  (Morgen): erste Stunde ab 0 Uhr,  wo PV > Verbrauch
+
+        Clamps (nur im Code, nicht konfigurierbar):
+          Nachtstart: 16–21 Uhr
+          Nachtende:   6–10 Uhr
+
+        Fallback: night_start_hour / night_end_hour aus config.yaml (default 21/6)
+        Log: nur bei Änderung oder einmalig nach Programmstart.
+        """
+        # Clamps
+        NS_MIN, NS_MAX = 16, 21
+        NE_MIN, NE_MAX =  6, 10
+
+        ns_fallback = self.cfg["charging"].get("night_start_hour", 21)
+        ne_fallback = self.cfg["charging"].get("night_end_hour",    6)
+
+        has_consumption = fc_list and any(fc.consumption_kwh > 0 for fc in fc_list)
+
+        if not has_consumption:
+            # Kein brauchbarer Forecast → config-Fallback, trotzdem clampen
+            night_start = max(NS_MIN, min(NS_MAX, ns_fallback))
+            night_end   = max(NE_MIN, min(NE_MAX, ne_fallback))
+            dynamic     = False
+        else:
+            # Dynamischer Start (Abend): ab 12 Uhr, PV fällt unter Verbrauch
+            night_start = ns_fallback
+            for fc in fc_list:
+                if fc.hour >= 12 and fc.pv_kwh < fc.consumption_kwh:
+                    night_start = fc.hour
+                    break
+
+            # Dynamisches Ende (Morgen): ab 0 Uhr, PV übersteigt Verbrauch
+            night_end = ne_fallback
+            for fc in fc_list:
+                if fc.hour < 12 and fc.pv_kwh > fc.consumption_kwh:
+                    night_end = fc.hour
+                    break
+
+            # Clamps anwenden
+            night_start = max(NS_MIN, min(NS_MAX, night_start))
+            night_end   = max(NE_MIN, min(NE_MAX, night_end))
+            dynamic     = True
+
+        # Nur loggen bei Änderung oder erstem Aufruf nach Programmstart
+        window = (night_start, night_end)
+        if window != self._last_night_window:
+            self._last_night_window = window
+            hours = (24 - night_start) + night_end
+            source = "dynamisch" if dynamic else "Fallback config"
+            self.logger.info(
+                f"[NIGHT_WINDOW] {night_start}:00–{night_end}:00 "
+                f"({hours}h, {source})"
+            )
+
+        return night_start, night_end
 
 
 # ─────────────────────────────────────────────
@@ -1798,7 +1846,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Solar Batterie Manager</title>
+<title>Solar Batterie Manager v3.0.8.5</title>
 <style>
 :root{--bg:#0f1117;--bg2:#1a1d27;--bg3:#252836;
   --acc:#f59e0b;--grn:#22c55e;--red:#ef4444;--blu:#3b82f6;--vio:#a78bfa;
@@ -2185,7 +2233,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v3.0.7  (Modbus TCP) - Predictive Charging")
+    logger.info("Solar Batterie Manager v3.0.8.5  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

@@ -1,5 +1,89 @@
 # Changelog — battery_manager.py
 
+## [3.0.8.5] – 2026-05-30
+
+### Fixed
+- **`_get_dynamic_night_window()`: Debug-Logging entfernt**  
+  Temporäres `[NIGHT_DBG]`-Logging aus v3.0.8.4d entfernt. Produktionsversion ohne Debug-Ausgaben.
+
+---
+
+## [3.0.8.4] – 2026-05-30
+
+### Fixed
+- **`VrmForecastManager.fetch()`: Timestamp-Filter auf heutigen Tag**  
+  VRM liefert Einträge deren erste Timestamps (UTC-Mitternacht) auf lokale Stunden des **Vortags** fallen (z.B. UTC 22:00/23:00 = lokal gestern 22/23 Uhr). Diese überschrieben in `pv_by_hour`/`cons_by_hour` die echten heutigen Stunden 22/23. Folge: falsche Stunden-Zuordnung, `_get_dynamic_night_window()` berechnete ein verschobenes Fenster.  
+  → Fix: Beide Aggregations-Schleifen filtern jetzt mit `if dt.date() != today: continue` — nur Einträge des aktuellen Kalendertags fließen in die Stunden-Maps ein.
+
+### Added
+- **Temporäres `[NIGHT_DBG]`-Logging** zur Diagnose der Stunden-Zuordnung in `_get_dynamic_night_window()` (wird in v3.0.8.5 wieder entfernt).
+
+---
+
+## [3.0.8.3] – 2026-05-30
+
+### Fixed
+- **`VrmForecastManager.fetch()`: Alle 24 Stunden in `HourlyForecast` aufbauen**  
+  Die Schleife `for h in sorted(pv_by_hour.keys())` iterierte nur über Stunden mit PV-Daten (typisch 6–20 Uhr). Nachtstunden fehlten in `fc_list` → `night_consumption_kwh()` summierte nur einen Teil der Nacht → zu niedriger Wert (4.4 kWh statt korrekter ~4.1 kWh).  
+  → Fix: `for h in range(24)` mit `pv_by_hour.get(h, 0.0)` — alle 24 Stunden werden aufgebaut, Nachtstunden mit `pv_kwh=0.0` und echtem Verbrauch aus `cons_by_hour`.  
+  Nebeneffekt: `_get_dynamic_night_window()` findet Nachtgrenzen jetzt auch für Stunden ohne PV-Eintrag korrekt.
+
+---
+
+## [3.0.8.2] – 2026-05-30
+
+### Fixed
+- **`VrmForecastManager.fetch()`: Veraltete `_consumption_night_kwh`-Referenz im Log (`AttributeError`)**  
+  In v3.0.8.1 wurde `self._consumption_night_kwh` aus `__init__()` und `fetch()` entfernt, aber die Log-Zeile am Ende von `fetch()` referenzierte das Attribut noch:  
+  ```python
+  + (f", Nachtverbrauch ~{self._consumption_night_kwh:.1f} kWh" if self._consumption_night_kwh else "")
+  ```  
+  → `AttributeError` beim ersten VRM-Fetch nach Programmstart.  
+  → Fix: Log-Zeile auf `f"VRM-Prognose: {total_pv_kwh:.2f} kWh PV heute"` reduziert. Nachtverbrauch wird ohnehin separat über `[NIGHT_WINDOW]` geloggt.
+
+---
+
+## [3.0.8.1] – 2026-05-30
+
+### Changed
+- **`VrmForecastManager`: Nachtverbrauch aus Totals entfernt**  
+  Vorher: Wenn VRM aktiv, wurde `_consumption_night_kwh` aus `data["totals"]["vrm_consumption_fc"]` berechnet — mit einer groben Gleichverteilung (`total_wh / 24 * night_hours`). Das ignorierte das dynamische Nachtfenster aus v3.0.8 vollständig und überschätzte den Nachtverbrauch systematisch (Nacht hat deutlich niedrigeren Verbrauch als der Tagesschnitt).  
+  → Fix: `_consumption_night_kwh`-Attribut, dessen Berechnung in `fetch()` und die Methode `VrmForecastManager.night_consumption_kwh()` vollständig entfernt. `ForecastManager.night_consumption_kwh()` summiert jetzt immer aus den stündlichen Forecast-Daten mit dynamischem Fenster — konsistent und genauer.
+
+### Removed
+- `VrmForecastManager._consumption_night_kwh` (Attribut)
+- `VrmForecastManager.night_consumption_kwh()` (Methode)
+- Statische Nachtverbrauchsberechnung aus `VrmForecastManager.fetch()`
+- VRM-Totals-Bevorzugung in `ForecastManager.night_consumption_kwh()`
+
+---
+
+## [3.0.8] – 2026-05-30
+
+### Added
+- **Dynamisches Nachtfenster in `ForecastManager`**  
+  `night_start_hour` und `night_end_hour` waren bisher statische config-Werte (default 21/6). Der Nachtverbrauch wurde dadurch unabhängig von Jahreszeit und Wetterlage immer über ein fixes 9h-Fenster berechnet.  
+  → Neu: `_get_dynamic_night_window()` bestimmt Start und Ende aus dem PV/Verbrauchs-Forecast:  
+  - **Start (Abend):** erste Stunde ab 12 Uhr, in der PV-Ertrag < Hausverbrauch (Akku muss einspringen)  
+  - **Ende (Morgen):** erste Stunde vor 12 Uhr, in der PV-Ertrag > Hausverbrauch (System wieder autark)  
+  - **Clamps (nur im Code):** Start 16–21 Uhr, Ende 6–10 Uhr → Nacht zwischen 9h (Sommer) und 18h (Winter)  
+  - **Fallback:** kein brauchbarer Forecast → `night_start_hour` / `night_end_hour` aus `config.yaml`; config-Werte werden ebenfalls geclampt  
+
+- **`[NIGHT_WINDOW]`-Log in `ForecastManager`**  
+  Nachtfenster wird geloggt — einmalig nach Programmstart und bei jeder Änderung, nicht jede Minute.  
+  Beispiele:
+  ```
+  [NIGHT_WINDOW] 17:00–08:00 (15h, dynamisch)
+  [NIGHT_WINDOW] 21:00–06:00 (9h, Fallback config)
+  ```
+
+### Notes
+- `night_start_hour` / `night_end_hour` in `config.yaml` bleiben als Fallback erhalten — keine Migration nötig.  
+- Clamp-Grenzen sind bewusst nicht konfigurierbar, um die config übersichtlich zu halten.  
+- `_last_night_window = (-1, -1)` im `__init__` erzwingt den ersten Log-Eintrag nach Programmstart.
+
+---
+
 ## [3.0.7] – 2026-05-30
 
 ### Fixed
