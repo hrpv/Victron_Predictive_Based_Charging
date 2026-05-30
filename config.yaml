@@ -26,7 +26,7 @@ evcc:
 # --- Batterie ---
 battery:
  capacity_kwh: 14.0 # Nutzbare Kapazität in kWh (100%)
- min_soc: 23 # Minimaler Ladestand [%]
+ min_soc: 35 # Minimaler Ladestand [%]
  max_soc: 98 # Maximaler Ladestand [%] (LFP erreicht 100% praktisch nie)
  # target_soc_normal wird in v3.0 nicht mehr verwendet – target_soc wird
  # dynamisch berechnet: max(min_soc, emergency_charge_soc) + Nachtverbrauch
@@ -36,7 +36,7 @@ battery:
  min_charge_current: 0 # Minimaler Ladestrom [A]
  max_charge_current: 50 # Maximaler Ladestrom [A]
  # Stromstärke für "sanftes" Laden (Erhaltungsladung)
- trickle_current: 5 # [A]
+ trickle_current: 20 # [A]
  # v3.0.1: Mindest-Haltezeit bei max_soc für Cellbalancing [Stunden]
  balancing_hold_hours: 5 # Ladestrom erst nach N Stunden auf 0 reduzieren
  # Voltage pro % SOC (für Schätzungen ohne exakten SOC-Wert)
@@ -87,7 +87,7 @@ charging:
  # Minimale Ladedauer bevor Entscheidung neu getroffen wird [Minuten]
  min_charge_duration_minutes: 10
  # Strom-Rampe: Änderung pro Schritt [A] (sanftes Hochfahren)
- current_ramp_step: 5
+ current_ramp_step: 10
  # Erwarteter nächtlicher Verbrauch [kWh] wenn keine Prognose verfügbar
  default_night_consumption_kwh: 4.0
  # Durchschnittlicher Tagesverbrauch [kWh] (für Prognose-Kalibrierung)
@@ -124,9 +124,9 @@ dashboard:
 logging:
  level: "INFO" # DEBUG | INFO | WARNING | ERROR
 # option:addditional logfile
-# file: "/var/log/solar_battery/battery_manager.log"
+ file: "/var/log/solar_battery/battery_manager.log"
 # no logfile
- file:
+# file:
  max_size_mb: 10
  backup_count: 3
  # Detailliertes Logging der Ladeentscheidungen
