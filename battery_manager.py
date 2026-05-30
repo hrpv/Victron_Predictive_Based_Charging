@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.3  (Modbus TCP, kein MQTT)
+Version: 3.0.7  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -34,6 +34,25 @@ Victron Modbus-TCP Register (Cerbo GX, Unit-ID 100):
   Schreiben (DVCC):
   2705 MaxChargeCurrent    Maximaler Ladestrom     raw       → A
        Wert 0 = kein Laden, 50 = Maximalstrom
+
+  ESS-Status (read-only):
+  2900 BatteryLife State   ESS Zustand             raw       → Enum
+       Relevant fuer "Optimiert ohne BatteryLife" (Standard LFP):
+       10=Self-consumption (SOC >= MinSOC) → normaler Betrieb
+       11=Self-consumption (SOC <  MinSOC) → Entladen gesperrt!
+       12=Recharge (SOC >5% unter MinSOC) → Zwangsladung aus Netz
+       Weitere States (nur bei "Optimiert mit BatteryLife"):
+       2=Self-consumption  3=Self-consumption (SOC>85%)
+       4=Self-consumption (SOC=100%)
+       5=SOC below dynamic limit → Entladen gesperrt (BatteryLife)
+       6=SOC>24h unter Limit → Laden mit 5A
+       7=Multi/Quattro sustain
+  2901 ESS MinimumSocLimit  Konfigurierter SOC-Mindestwert  raw / 10 → %
+       Wird von evcc temporaer angehoben beim Schnellladen.
+       Unser battery_manager liest diesen Wert (EvccMonitor).
+  2903 ESS Active SoC Limit  Nur relevant bei "Optimiert mit BatteryLife"
+       Im Modus "Optimiert ohne BatteryLife" wird dieser Wert von
+       Victron ignoriert → nicht einlesen.
 
   Hinweis: Register koennen je nach Firmware-Version leicht abweichen.
   Pruefen mit:  mosquitto_sub oder Victron Modbus-TCP Register-Liste
@@ -102,6 +121,7 @@ class SystemState:
     evcc_mode: str = ""                     # "off"|"now"|"minpv"|"pv"
     evcc_charge_power_w: float = 0.0        # Wallbox-Ladeleistung [W]
     evcc_min_soc: float = 0.0              # Aktueller Wert in Reg 2901 [%]
+    ess_battery_life_state: int = -1        # Reg 2900: BatteryLife State (-1 = unbekannt)
 
 
 @dataclass
@@ -233,10 +253,13 @@ class VictronModbus:
         "grid_l1":  (820,  1.0,  True),    # W signed, + = Bezug, - = Einspeisung
         "grid_l2":  (821,  1.0,  True),
         "grid_l3":  (822,  1.0,  True),
-
+        # ESS-Status (read-only)
+        "ess_state":     (2900, 1.0,  False),  # BatteryLife State (Enum, siehe Doku)
     }
     REG_MAX_CHARGE = 2705   # DVCC MaxChargeCurrent [A]
     UNIT_ID = 100           # Cerbo GX Modbus Unit-ID
+    # ESS BatteryLife States bei denen Entladen gesperrt ist
+    ESS_DISCHARGE_BLOCKED_STATES = {11}
 
     def __init__(self, cfg: dict, state: SystemState, logger: logging.Logger):
         self.cfg = cfg
@@ -301,9 +324,25 @@ class VictronModbus:
             if current is not None: self.state.battery_current  = round(current, 1)
             if batt_pw is not None: self.state.battery_power_w  = round(batt_pw, 0)
             self.state.pv_power_w = round(pv_l1 + pv_l2 + pv_l3, 0)
-
             self.state.load_power_w = round(l1 + l2 + l3, 0)
             self.state.grid_power_w = round(g1 + g2 + g3, 0)
+
+            # ESS-Status lesen (Reg 2900)
+            ess_state = r("ess_state")
+            if ess_state is not None:
+                new_ess_state = int(ess_state)
+                if new_ess_state != self.state.ess_battery_life_state:
+                    ess_state_names = {
+                        10: "Self-consumption (SOC >= MinSOC)",
+                        11: "SOC below MinSOC → Entladen GESPERRT",
+                        12: "Recharge (SOC >5% unter MinSOC)",
+                    }
+                    desc = ess_state_names.get(new_ess_state, str(new_ess_state))
+                    self.logger.info(
+                        f"ESS BatteryLife State geaendert: "
+                        f"{self.state.ess_battery_life_state} → {new_ess_state} ({desc})")
+                self.state.ess_battery_life_state = new_ess_state
+
             self.state.timestamp    = datetime.now().isoformat()
             return True
 
@@ -1101,12 +1140,33 @@ class ChargeController:
                 f"evcc MinSoc-Sperre aktiv: effektiver Min-SOC = "
                 f"{effective_min_soc:.0f}% (Reg 2901={self.evcc.evcc_min_soc:.0f}%)")
 
-        # ── Morgen-Notladung (v3.0.0) ─────────────────────────
-        # Wenn aktueller SOC < Minimum -> sofort laden, bis Minimum erreicht
-        if self._is_morning_window() and soc < min_required:
-            self._morning_emergency_done = False
+
+        # ── 1. ESS State 11/12: Entladen gesperrt oder Netzladung erzwungen ──
+        # HOECHSTE PRIORITAET: Hardware-Eingriff durch Victron ESS.
+        # State 11: SOC < MinSOC → Entladen blockiert, Last aus Netz
+        # State 12: SOC >5% unter MinSOC → Zwangsladung aus Netz
+        # In beiden Faellen: sofort max. Ladestrom, unabhaengig von Tag/Nacht/Morgen-Logik.
+        # Muss VOR Morgen-Notladung geprueft werden, da sonst ab morning_delay_start_hour
+        # der Morgen-Block greift und ESS State 11 ignoriert wird (v3.0.7 Bugfix).
+        if self.state.ess_battery_life_state in {11, 12}:
             return max_a, "charging", (
-                f"Morgen-Notladung: SOC {soc:.1f}% < {min_required}% -> sofort laden")
+                f"ESS State {self.state.ess_battery_life_state}: "
+                f"Notladung/Entladesperre → max {max_a}A")
+
+        # ── Morgen-Notladung (v3.0.4) ─────────────────────────
+        # Wenn aktueller SOC < Minimum -> sofort laden bei PV-Ueberschuss, bis Minimum erreicht
+        if self._is_morning_window() and soc < min_required:
+            pv_w = self.state.pv_power_w
+            load_w = self.state.load_power_w
+            if pv_w > load_w + 200:
+                self._morning_emergency_done = False
+                return max_a, "charging", (
+                    f"Morgen-Notladung: SOC {soc:.1f}% < {min_required}% -> "
+                    f"sofort laden bei PV-Ueberschuss")
+            else:
+                return 0, "idle", (
+                    f"Morgen: Warte auf PV-Ueberschuss fuer Notladung "
+                    f"(SOC {soc:.1f}% < {min_required}%)")
 
         # Morgen-Notladung abgeschlossen markieren
         if soc >= min_required:
@@ -1267,18 +1327,39 @@ class ChargeController:
         # Maximale Ladeenergie pro Stunde durch Strombegrenzung
         max_charge_kwh = max_a * nom_v / 1000.0  # z.B. 50A * 48V / 1000 = 2.4 kWh
 
+        # State 11/12: Victron greift bei SOC < min_soc ein. Entladen wird
+        # blockiert oder aus Netz geladen. SOC sinkt nicht weiter.
+        if soc_sim < min_soc:
+            if fc.net_kwh > 0:
+                # PV-Ueberschuss vorhanden: Akku lädt (State 11 oder 12)
+                action = "charging"
+                current_a = max_a
+                charge_kwh = min(fc.net_kwh, max_charge_kwh)
+                soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+            else:
+                # Kein PV-Ueberschuss: Entladen blockiert (State 11) oder
+                # Zwangsladung aus Netz (State 12). SOC bleibt konstant.
+                # Im Ladeplan als "idle" anzeigen, da kein PV-basiertes Laden.
+                action = "idle"
+                current_a = 0.0
+                # SOC bleibt unverändert — Victron versorgt Last aus Netz
+            return action, current_a, soc_sim
+
         # Notfall-SOC
         if soc_sim <= self.cc.get("emergency_charge_soc", 25):
-            action = "charging"
-            current_a = max_a
             if fc.net_kwh > 0:
                 # PV-Ueberschuss: Laden moeglich
+                action = "charging"
+                current_a = max_a
                 charge_kwh = min(fc.net_kwh, max_charge_kwh)
                 soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             else:
                 # ESS-Modus (DE): kein Netzbezug moeglich -> Akku entlaedt sich trotz Notfall
+                # action = "discharging" zeigt im Dashboard den echten Zustand
+                action = "discharging"
+                current_a = 0.0
                 deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-                soc_sim = max(0.0, soc_sim - (deficit / cap) * 100)  # unter min_soc moeglich im echten Notfall
+                soc_sim = max(0.0, soc_sim - (deficit / cap) * 100)
             return action, current_a, soc_sim
 
         if needs_full and soc_sim < max_soc - hyst:
@@ -1300,24 +1381,32 @@ class ChargeController:
         def _apply_deficit(soc: float) -> tuple[str, float]:
             """Berechnet Deficit und setzt action: discharging wenn Ueberschuss negativ, sonst idle."""
             deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-            # v3.0.3: floor_soc statt min_soc — beruecksichtigt evcc MinSoc-Sperre
-            new_soc = max(floor_soc, soc - (deficit / cap) * 100)
+            new_soc = soc - (deficit / cap) * 100
+            # floor_soc nur als untere Schranke wenn SOC bereits >= floor_soc.
+            # Liegt SOC schon UNTER floor_soc (z.B. 21% < 35%), darf floor_soc
+            # den Wert nicht kuenstlich hochklemmen — das verfaelscht die Simulation.
+            if soc >= floor_soc:
+                new_soc = max(floor_soc, new_soc)
             act = "discharging" if fc.net_kwh < 0 else "idle"
             return act, new_soc
 
-        # Morgen-Notladung in der Simulation (v3.0.0)
+        # Morgen-Notladung in der Simulation (v3.0.4)
+        # Wenn SOC unter min_required: Sofort laden bei Ueberschuss, aber nur
+        # bis min_required. Danach greift die normale adaptive Planung.
         if morn_s <= h < morn_e and soc_sim < min_required:
-            action = "charging"
-            current_a = max_a
             if fc.net_kwh > 0:
-                # PV-Ueberschuss: Laden moeglich
-                charge_kwh = min(fc.net_kwh, max_charge_kwh)
-                soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
+                action = "charging"
+                current_a = max_a
+                # Nur bis min_required laden, nicht hoeher
+                needed_kwh = max(0.0, (min_required - soc_sim) / 100.0 * cap)
+                charge_kwh = min(fc.net_kwh, needed_kwh, max_charge_kwh)
+                soc_sim = min(min_required, soc_sim + (charge_kwh / cap) * 100)
+                return action, current_a, soc_sim
             else:
-                # ESS-Modus (DE): kein Netzbezug moeglich -> Akku entlaedt sich trotz Notladeversuch
+                # Kein Ueberschuss: Akku entlaedt sich trotz Bedarf (ESS-Modus)
                 deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
                 soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)
-            return action, current_a, soc_sim
+                return "discharging", 0.0, soc_sim
 
         # Ziel erreicht?
         if soc_sim >= dyn_target - hyst:
@@ -1448,12 +1537,13 @@ class ChargeController:
         night_cons = self.forecast.night_consumption_kwh()
         fc_by_hour = {f.hour: f for f in fc_list}
 
-        # v3.0.3: Effektiver SOC-Boden fuer Simulation = evcc MinSoc (Reg 2901)
-        # oder konfigurierter min_soc. Wenn evcc den MinSoc angehoben hat,
-        # kann der Akku physikalisch nicht unter diesen Wert entladen.
-        floor_soc = self.bat["min_soc"]
+        # Effektiver SOC-Boden fuer Simulation:
+        # Nur evcc kann den physikalischen Entladeboden anheben (Reg 2901).
+        # State 11/12 (ESS SOC < MinSOC) wird in _simulate_hour() abgefangen:
+        # dort greift Victron ein und der SOC sinkt nicht weiter.
+        floor_soc = 0.0
         if self.state.evcc_discharge_locked:
-            floor_soc = max(floor_soc, self.evcc.evcc_min_soc)
+            floor_soc = max(self.bat["min_soc"], self.evcc.evcc_min_soc)
 
         for h in range(now_h, 24):
             # Aktuelle Stunde nur als Zukunft wenn sie noch laeuft (< 55 Min)
@@ -1654,6 +1744,11 @@ class ChargeController:
         # Sofort-Entscheidung bei kritischen Zustaenden (Sicherheit)
         force_new = False
         if self.state.soc <= self.cc.get("emergency_charge_soc", 25):
+            force_new = True
+        # SOC unter min_soc: keine Hysterese, sofort neu entscheiden.
+        # Ohne das bleibt eine gecachte Nacht-Entscheidung bis zu 10 Minuten aktiv,
+        # obwohl es laengst hell ist und PV-Ueberschuss vorhanden waere.
+        if self.state.soc < self.bat["min_soc"]:
             force_new = True
         if self._needs_full_charge() and self.state.soc < self.bat["max_soc"] - self.cc.get("soc_hysteresis", 2):
             force_new = True
@@ -2090,7 +2185,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v3.0.3  (Modbus TCP) - Predictive Charging")
+    logger.info("Solar Batterie Manager v3.0.7  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

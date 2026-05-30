@@ -1,5 +1,50 @@
 # Changelog — battery_manager.py
 
+## [3.0.7] – 2026-05-30
+
+### Fixed
+- **ESS State 11/12: Priorität in `decide()` — Morgen-Fenster überschrieb State-11-Schutz**  
+  Ab `morning_delay_start_hour` (06:00 Uhr) griff der Morgen-Notladungs-Block in `decide()` zuerst. Da SOC < `min_required` und kein PV-Überschuss vorhanden war, gab er `0 A / "idle"` zurück — der ESS-State-11/12-Block danach wurde nie erreicht. Folge: Der Controller rampte den Ladestrom von 50 A über 10 Minuten auf 0 A herunter, obwohl State 11 aktiv war und `max_a` gehalten werden sollte.  
+  → Fix: ESS State 11/12 wird jetzt als **erster Block** in `decide()` geprüft, noch vor der Morgen-Notladung. State 11/12 ist ein Hardware-Eingriff durch Victron ESS mit höchster Priorität — kein anderer Block darf ihn überstimmen.  
+  Bisherige Reihenfolge: `Morgen-Notladung → Notfall → (2b) ESS State 11/12`  
+  Neue Reihenfolge: `(1) ESS State 11/12 → Morgen-Notladung → Notfall`
+
+### Test
+- State 11 aktiv um 05:59 (SOC 30%, MinSOC 35%): `50A | ESS State 11: Notladung/Entladesperre → max 50A` ✓  
+- Ab 06:00 (Morgen-Fenster aktiv): weiterhin `50A | ESS State 11` — kein Abrampen auf 0 A ✓
+
+---
+
+## [3.0.6] – 2026-05-30
+
+### Fixed
+- **ESS State 11/12: Simulation zeigte "LADEN 50A" bei Nacht ohne PV**  
+  In `_simulate_hour()` wurde bei `soc_sim < min_soc` (State 11/12 aktiv) immer `action = "charging"` und `current_a = max_a` gesetzt, auch wenn kein PV-Überschuss vorhanden war. Der Ladeplan zeigte dadurch in der Nacht "LADEN 50A" mit stagnierendem SOC — visuell irreführend, da State 11 nur die Entladung sperrt, aber nicht aus dem Netz lädt.  
+  → Fix: Guard unterscheidet jetzt: `fc.net_kwh > 0` → "charging" (PV da), sonst → "idle" (kein PV, SOC bleibt konstant). Die realen History-Einträge (Vergangenheit) zeigen weiterhin die tatsächliche `decide()`-Aktion.
+
+- **ESS State 11/12: Priorität in `decide()` korrigiert**  
+  State 11/12 wurde in v3.0.4 noch über `ESS_DISCHARGE_BLOCKED_STATES = {11,12}` und `floor_soc` in `build_schedule()` abgebildet — verteilt auf mehrere Code-Stellen und schwer nachvollziehbar.  
+  → Fix: Expliziter, dedizierter Block in `decide()` direkt nach der Morgen-Notladung. State 11/12 triggert sofort `max_a`, unabhängig von Tag/Nacht. `_simulate_hour()` fängt `soc_sim < min_soc` separat ab — keine indirekte Kopplung mehr über `floor_soc`.
+
+- **`ESS_DISCHARGE_BLOCKED_STATES` auf `{11}` reduziert**  
+  State 12 (Recharge / Zwangsladung aus Netz) wird jetzt direkt in `decide()` und `_simulate_hour()` behandelt, nicht über die Konstante. Semantisch korrekte Trennung: State 11 = Entladesperre, State 12 = aktive Netzladung.
+
+- **`floor_soc` vereinfacht**  
+  In v3.0.4: komplexe Kaskade (`if State 11/12 → min_soc`, `elif evcc → evcc_min_soc`, sonst `0.0`).  
+  → Fix: `floor_soc` macht jetzt nur noch das, wofür es gedacht ist — evcc MinSoc-Sperre (Reg 2901). State-11/12-Schutz ist in die Simulation selbst verlagert.
+
+- **Reg 2903 vollständig entfernt**  
+  In v3.0.4 noch im Docstring und teilweise im Code erwähnt.  
+  → Fix: Vollständig aus `SystemState`, `REGISTERS`, `read_all()`, `decide()`, `build_schedule()` und Doku entfernt. Im LFP-Modus "Optimiert ohne BatteryLife" wird Reg 2903 von Victron ignoriert.
+
+- **Docstring/Header aktualisiert**  
+  Alte State-Bezeichnungen ("BL Disabled") entfernt, aktuelle Victron-Terminologie für LFP-Modus eingeführt: State 10 = Self-consumption, State 11 = SOC below MinSOC, State 12 = Recharge.
+
+### Test
+- State 11 erreicht bei SOC 31% (VRM MinSoc 30%, config min_soc 35%).  
+  Verhalten bestätigt: Entladen gesperrt, SOC bleibt konstant, `MaxChargeCurrent = 50A` wird auf Bus geschrieben (wirkungslos ohne PV, aber harmlos). Kein ungewolltes Netzladen.
+
+---
 ## [3.0.3] – 2026-05-28
 
 ### Fixed
