@@ -1,5 +1,30 @@
 # Changelog — battery_manager.py
 
+## [3.0.8.6] – 2026-05-31
+
+### Fixed
+- **`build_schedule()`: `floor_soc` berücksichtigt immer ESS MinimumSocLimit (Reg 2901)**
+  `floor_soc` wurde bisher nur gesetzt wenn `evcc_discharge_locked == True`. Das Register 2901 (ESS MinimumSocLimit) ist jedoch die harte physikalische Untergrenze, die Victron in ESS State 11/12 durchsetzt — unabhängig davon, ob evcc aktiv ist oder nicht. Die Simulation zeigte daher Entladung unter den realen Hardware-Limit (z. B. 20 %), obwohl Victron den SOC dort physisch stoppt.
+  → Fix: `floor_soc` wird jetzt immer aus `state.evcc_min_soc` (Reg 2901) gebildet, Fallback auf `bat.min_soc`. Die Simulation sinkt damit korrekt nur bis zur tatsächlichen Victron-Untergrenze.
+
+- **`_simulate_hour()`: `_apply_deficit()` klemmt immer auf `floor_soc`**
+  In `_apply_deficit()` wurde die Untergrenze nur angewendet wenn `soc >= floor_soc`. Fiel der simulierte SOC bereits unter `floor_soc` (z. B. 33 % < 35 %), wurde das Defizit ungeklemmt weiter abgezogen — der SOC lief in der Prognose ins Negative.
+  → Fix: `max(floor_soc, new_soc)` wird jetzt in `_apply_deficit()` **immer** angewendet, unabhängig vom aktuellen SOC-Level. Das entspricht dem physikalischen Verhalten: Victron stoppt die Entladung am Hardware-Limit.
+
+- **`_simulate_hour()`: Kein pauschales SOC-Einfrieren bei `soc_sim < min_soc` ohne PV**
+  Der Block `if soc_sim < min_soc` mit `else`-Zweig (kein PV → SOC bleibt konstant, `action = "idle"`) frierte den simulierten SOC bei negativem Überschuss künstlich ein. Im Ladeplan blieb der SOC z. B. ab 03:00 bei 33.1 % stehen, obwohl weiterhin Last > PV vorhanden war und die reale Batterie weiter entlud (siehe Log: SOC 34.0 %).
+  → Fix: Der `else`-Zweig wurde entfernt. Wenn `soc_sim < min_soc` und **kein** PV-Überschuss vorhanden ist, läuft die normale Defizit-Logik (`_apply_deficit`) weiter. Der SOC sinkt im Ladeplan physikalisch korrekt bis zur harten `floor_soc`-Grenze (Reg 2901). Nur bei **positivem** Überschuss wird weiterhin sofort geladen (`action = "charging"`).
+
+- **`EvccMonitor.update()`: `state.evcc_min_soc` wird aus Reg 2901 geschrieben**
+  `EvccMonitor.update()` las Reg 2901 in die Instanzvariable `self.evcc_min_soc`, schrieb den Wert jedoch nie in `state.evcc_min_soc`. `build_schedule()` las `state.evcc_min_soc` (immer `0.0`) und fiel daher auf `bat.min_soc` (35 %) zurück — statt auf den echten ESS MinimumSocLimit (20 %). Folge: Alle Fixes 1–3 wirkten sich nicht aus, da `floor_soc` effektiv weiterhin 35 % betrug.
+  → Fix: Nach erfolgreichem Modbus-Lesen von Reg 2901 wird `self.state.evcc_min_soc = self.evcc_min_soc` gesetzt. Damit fließt der Victron-Hardware-Limit in den SystemState und wird von `build_schedule()` als `floor_soc` verwendet.
+
+### Notes
+- Der reale ESS State 11/12-Schutz in `decide()` (Echtzeit-Steuerung) bleibt unverändert. Die Änderungen betreffen ausschließlich die **Simulation** im Ladeplan (`build_schedule()` / `_simulate_hour()`), damit die Prognose mit der physikalischen Realität übereinstimmt.
+- Die Kombination aus Fix 1 + Fix 2 + Fix 3 + Fix 4 stellt sicher, dass der Ladeplan bei Nacht mit negativem Überschuss korrekt bis zum Victron-Limit (Reg 2901) entlädt und dort stoppt — nicht früher (Fix 3) und nicht tiefer (Fix 1+2+4).
+
+---
+
 ## [3.0.8.5] – 2026-05-30
 
 ### Fixed

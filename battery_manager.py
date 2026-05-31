@@ -503,9 +503,14 @@ class EvccMonitor:
         self._last_check = now
 
         # ── MinSoc aus Modbus Register 2901 lesen ─────────────
+        # Reg 2901 ist das ESS MinimumSocLimit — die harte physikalische
+        # Untergrenze, die Victron in State 11/12 durchsetzt. Unabhaengig
+        # von evcc-Status muss dieser Wert in den State geschrieben werden,
+        # damit build_schedule() die korrekte Simulations-Untergrenze verwendet.
         min_soc_reg = self.victron.read_register(self.REG_MIN_SOC, scale=0.1)  # Reg 2901: Rohwert * 10 = %, also scale=0.1
         if min_soc_reg is not None:
             self.evcc_min_soc = float(min_soc_reg)
+            self.state.evcc_min_soc = self.evcc_min_soc  # <-- FIX: in State schreiben
             # evcc sperrt Entladung wenn MinSoc deutlich ueber Normalwert liegt
             self.state.evcc_discharge_locked = (
                 self.evcc_min_soc > self.NORMAL_MIN_SOC_MAX)
@@ -1375,23 +1380,17 @@ class ChargeController:
         # Maximale Ladeenergie pro Stunde durch Strombegrenzung
         max_charge_kwh = max_a * nom_v / 1000.0  # z.B. 50A * 48V / 1000 = 2.4 kWh
 
-        # State 11/12: Victron greift bei SOC < min_soc ein. Entladen wird
-        # blockiert oder aus Netz geladen. SOC sinkt nicht weiter.
-        if soc_sim < min_soc:
-            if fc.net_kwh > 0:
-                # PV-Ueberschuss vorhanden: Akku lädt (State 11 oder 12)
-                action = "charging"
-                current_a = max_a
-                charge_kwh = min(fc.net_kwh, max_charge_kwh)
-                soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
-            else:
-                # Kein PV-Ueberschuss: Entladen blockiert (State 11) oder
-                # Zwangsladung aus Netz (State 12). SOC bleibt konstant.
-                # Im Ladeplan als "idle" anzeigen, da kein PV-basiertes Laden.
-                action = "idle"
-                current_a = 0.0
-                # SOC bleibt unverändert — Victron versorgt Last aus Netz
+        # Wenn SOC < min_soc und PV-Ueberschuss vorhanden: Sofort laden
+        # (Notladung / State-12-Simulation im Ladeplan)
+        if soc_sim < min_soc and fc.net_kwh > 0:
+            action = "charging"
+            current_a = max_a
+            charge_kwh = min(fc.net_kwh, max_charge_kwh)
+            soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             return action, current_a, soc_sim
+        # Wenn SOC < min_soc und KEIN PV-Ueberschuss: Nicht pauschal blockieren.
+        # Victron ESS State 11/12 wird in Echtzeit durch decide() gehandhabt.
+        # Für den Ladeplan zeigen wir den physikalischen Verlauf (Entladung).
 
         # Notfall-SOC
         if soc_sim <= self.cc.get("emergency_charge_soc", 25):
@@ -1430,11 +1429,10 @@ class ChargeController:
             """Berechnet Deficit und setzt action: discharging wenn Ueberschuss negativ, sonst idle."""
             deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
             new_soc = soc - (deficit / cap) * 100
-            # floor_soc nur als untere Schranke wenn SOC bereits >= floor_soc.
-            # Liegt SOC schon UNTER floor_soc (z.B. 21% < 35%), darf floor_soc
-            # den Wert nicht kuenstlich hochklemmen — das verfaelscht die Simulation.
-            if soc >= floor_soc:
-                new_soc = max(floor_soc, new_soc)
+            # Harte Untergrenze: Victron ESS MinimumSocLimit (Reg 2901) verhindert
+            # Entladung unter diesen Wert (State 11). Die Simulation darf nicht
+            # darunter sinken, da die Hardware diesen Boden durchsetzt.
+            new_soc = max(floor_soc, new_soc)
             act = "discharging" if fc.net_kwh < 0 else "idle"
             return act, new_soc
 
@@ -1463,7 +1461,7 @@ class ChargeController:
             hyst_kwh = hyst / 100.0 * cap
             if fc.net_kwh >= -hyst_kwh:
                 soc_sim = max(soc_sim, dyn_target - hyst)
-            # v3.0.3: Nie unter floor_soc fallen
+            # (Redundant mit _apply_deficit, aber schadet nicht)
             soc_sim = max(soc_sim, floor_soc)
             return action, current_a, soc_sim
 
@@ -1586,12 +1584,11 @@ class ChargeController:
         fc_by_hour = {f.hour: f for f in fc_list}
 
         # Effektiver SOC-Boden fuer Simulation:
-        # Nur evcc kann den physikalischen Entladeboden anheben (Reg 2901).
-        # State 11/12 (ESS SOC < MinSOC) wird in _simulate_hour() abgefangen:
-        # dort greift Victron ein und der SOC sinkt nicht weiter.
-        floor_soc = 0.0
-        if self.state.evcc_discharge_locked:
-            floor_soc = max(self.bat["min_soc"], self.evcc.evcc_min_soc)
+        # Reg 2901 (ESS MinimumSocLimit) ist die harte physikalische Untergrenze,
+        # die Victron in ESS State 11/12 durchsetzt. Unabhaengig von evcc oder
+        # dem konfigurierten bat.min_soc darf die Simulation nicht darunter sinken.
+        floor_soc = self.state.evcc_min_soc if self.state.evcc_min_soc > 0 else self.bat["min_soc"]
+        self.logger.debug(f"[SCHEDULE] floor_soc={floor_soc:.1f}% (evcc_min_soc={self.state.evcc_min_soc:.1f}%, bat.min_soc={self.bat['min_soc']:.1f}%)")
 
         for h in range(now_h, 24):
             # Aktuelle Stunde nur als Zukunft wenn sie noch laeuft (< 55 Min)
