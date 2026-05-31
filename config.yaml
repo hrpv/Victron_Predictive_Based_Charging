@@ -88,11 +88,16 @@ charging:
  min_charge_duration_minutes: 10
  # Strom-Rampe: Änderung pro Schritt [A] (sanftes Hochfahren)
  current_ramp_step: 10
- # Erwarteter nächtlicher Verbrauch [kWh] wenn keine Prognose verfügbar
- default_night_consumption_kwh: 4.0
+ 
+ # Durchschnittlicher Tagesverbrauch [kWh] – Basis für Nachtverbrauchsberechnung :
+ # default_night_consumption_kwh = avg_daily_consumption_kwh / 24 * ((24 - night_start_hour) + night_end_hour)
+ # Beispiel: 8.0 / 24 * (24-21+6) = 8.0 / 24 * 9 = 3.0 kWh
+ # VRM-API liefert ebenfalls nur Tagesgesamt und leitet den Nachtanteil linear ab.
  # Durchschnittlicher Tagesverbrauch [kWh] (für Prognose-Kalibrierung)
- avg_daily_consumption_kwh: 8.0
- # Nacht-Zeitfenster (kein PV zu erwarten)
+ avg_daily_consumption_kwh: 12.0
+ 
+ # Erwarteter nächtlicher Verbrauch [kWh] wenn keine Prognose verfügbar
+ # default_night_consumption_kwh: 4.0 #unbenutzt berechnung via avg_daily_consumption_kwh # Nacht-Zeitfenster (kein PV zu erwarten)
  night_start_hour: 21 # 21:00 Uhr
  night_end_hour: 6 # 06:00 Uhr
  # Früh-Morgen: Verzögertes Laden aktivieren ab Uhrzeit
