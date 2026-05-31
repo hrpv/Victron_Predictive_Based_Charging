@@ -1,5 +1,26 @@
 # Changelog — battery_manager.py
 
+## [3.0.9.4] – 2026-05-31
+
+### Fixed
+- **`forecast_pv_remaining_kwh` wurde nie berechnet**  
+  Das Feld `forecast_pv_remaining_kwh` in `SystemState` wurde nur deklariert, aber **nie** aktualisiert. Das Dashboard zeigte daher permanent "Verbleibend: 0.0 kWh", obwohl die VRM-Prognose deutlich höhere Restwerte lieferte.  
+  → Fix: `forecast_pv_remaining_kwh` wird jetzt bei jedem Prognose-Update berechnet als Summe der PV-Prognose ab aktueller Stunde (`sum(f.pv_kwh for f in fc if f.hour >= now_h)`). Auch beim Programmstart wird der Wert korrekt vorbelegt.
+
+- **VRM-Prognose wurde bei Wetteränderung nicht aktualisiert**  
+  Die PV-Prognose im Dashboard zeigte z.B. **53.2 kWh**, während die VRM-Realität (rechts im Screenshot) bereits auf **32–39 kWh** korrigiert hatte. Ursache: `ForecastManager.get_forecast()` lieferte seinen eigenen lokalen Cache, auch wenn VRM neue Daten hatte. Der `force=True`-Parameter wurde nur beim Tageswechsel oder manuellem Aufruf übergeben, nicht bei regulären Updates.  
+  → Fix: Wenn VRM aktiviert ist (`forecast.vrm.enabled == True`), wird bei jedem Prognose-Update-Intervall `force=True` an `get_forecast()` übergeben. VRM's Server cached selbst und gibt bei identischer Anfrage schnell eine 304-ähnliche Antwort zurück — kein Performance-Problem. Die lokale Cache-Invalidierung stellt sicher, dass der `ForecastManager`-Cache ebenfalls aktualisiert wird, wenn VRM neue Daten liefert.
+
+- **VRM-Cache ohne Debug-Transparenz**  
+  Es war nicht ersichtlich, ob VRM-Daten aus dem lokalen Cache oder vom Server kamen.  
+  → Fix: `VrmForecastManager.fetch()` loggt jetzt im DEBUG-Level "VRM: liefere gecachte Prognose" wenn der lokale Cache verwendet wird, und "VRM-Prognose aktualisiert: X.X kWh heute" wenn der Server neu abgefragt wurde.
+
+### Changed
+- **Prognose-Update-Intervall: VRM bevorzugt**  
+  Wenn VRM als Prognosequelle aktiv ist, wird bei jedem konfigurierten `update_interval_minutes`-Zyklus der VRM-Server direkt abgefragt (`force=True`). Der lokale Cache im `ForecastManager` wird entsprechend invalidiert. Open-Meteo/Solcast-Fallback bleibt unverändert (Cache nach Intervall).
+
+---
+
 ## [3.0.9.3] – 2026-05-31
 
 ### Fixed
@@ -46,7 +67,7 @@
 
 ---
 
-## [3.0.8.6] – 2026-05-31 Ubernahme von fix aus 3.0.8.6 in 3.0.9.1
+## [3.0.8.6] – 2026-05-31
 
 ### Fixed
 - **`build_schedule()`: `floor_soc` berücksichtigt immer ESS MinimumSocLimit (Reg 2901)**  

@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.9.3  (Modbus TCP, kein MQTT)
+Version: 3.0.9.4  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -601,6 +601,8 @@ class VrmForecastManager:
         if not self.enabled or not self.token or not self.install_id:
             return None
 
+        # v3.0.9.4: VRM-Prognosen ändern sich bei Wetterwechseln stündlich.
+        # force=True überspringt den lokalen Cache und fragt VRM-Server neu.
         interval_s = self.cfg.get("forecast", {}).get(
             "update_interval_minutes", 60) * 60
         # Cache bei Tageswechsel immer verwerfen (neue VRM-Prognose verfügbar)
@@ -611,6 +613,7 @@ class VrmForecastManager:
             self._cache_day = today
         if not force and self._cache and (
                 time.monotonic() - self._cache_ts) < interval_s:
+            self.logger.debug("VRM: liefere gecachte Prognose")
             return self._cache
 
         try:
@@ -765,8 +768,13 @@ class ForecastManager:
         # 1. VRM API (beste Qualitaet: Solcast + Anlagenhistorie)
         vrm_fc = self.vrm.fetch(force=force)
         if vrm_fc:
+            # v3.0.9.4: Wenn VRM neu abgerufen wurde (force=True), auch den
+            # eigenen ForecastManager-Cache aktualisieren. Sonst bleibt der
+            # alte Wert im Dashboard stehen, obwohl VRM neue Daten liefert.
             self._cache    = vrm_fc
             self._cache_ts = time.monotonic()
+            self.logger.info(
+                f"VRM-Prognose aktualisiert: {sum(f.pv_kwh for f in vrm_fc):.1f} kWh heute")
             return vrm_fc  # forecast_source wird in main() gesetzt
 
         # 2. Fallback: Solcast oder Open-Meteo
@@ -1961,7 +1969,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Solar Batterie Manager v3.0.9.3</title>
+<title>Solar Batterie Manager v3.0.9.4</title>
 <style>
 :root{--bg:#0f1117;--bg2:#1a1d27;--bg3:#252836;
   --acc:#f59e0b;--grn:#22c55e;--red:#ef4444;--blu:#3b82f6;--vio:#a78bfa;
@@ -2350,7 +2358,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v3.0.9.3  (Modbus TCP) - Predictive Charging")
+    logger.info("Solar Batterie Manager v3.0.9.4  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 
@@ -2368,6 +2376,9 @@ def main():
     try:
         fc = forecast.get_forecast(force=True)
         state.forecast_pv_today_kwh = round(sum(f.pv_kwh for f in fc), 2)
+        now_h = datetime.now().hour
+        state.forecast_pv_remaining_kwh = round(
+            sum(f.pv_kwh for f in fc if f.hour >= now_h), 2)
         state.forecast_updated      = datetime.now().isoformat()
         state.forecast_source       = _forecast_source(forecast)
     except Exception as e:
@@ -2434,8 +2445,15 @@ def main():
             # 4. Prognose aktualisieren wenn faellig
             if now_ts - last_fc_ts > fc_interval:
                 try:
-                    fc = forecast.get_forecast()
+                    # v3.0.9.4: Bei VRM immer force=True — VRM aktualisiert stündlich,
+                    # besonders bei Wetterwechseln. Der Server cached selbst.
+                    use_force = forecast.vrm.enabled
+                    fc = forecast.get_forecast(force=use_force)
                     state.forecast_pv_today_kwh = round(sum(f.pv_kwh for f in fc), 2)
+                    # NEU: Rest-Prognoes berechnen (nicht nur Tagesgesamt)
+                    now_h = datetime.now().hour
+                    state.forecast_pv_remaining_kwh = round(
+                        sum(f.pv_kwh for f in fc if f.hour >= now_h), 2)
                     state.forecast_updated      = datetime.now().isoformat()
                     last_fc_ts = now_ts
                 except Exception as e:
