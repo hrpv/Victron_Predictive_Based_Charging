@@ -88,25 +88,17 @@ charging:
  min_charge_duration_minutes: 10
  # Strom-Rampe: Änderung pro Schritt [A] (sanftes Hochfahren)
  current_ramp_step: 10
- 
- # Durchschnittlicher Tagesverbrauch [kWh] – Basis für Nachtverbrauchsberechnung :
- # default_night_consumption_kwh = avg_daily_consumption_kwh / 24 * ((24 - night_start_hour) + night_end_hour)
- # Beispiel: 8.0 / 24 * (24-21+6) = 8.0 / 24 * 9 = 3.0 kWh
- # VRM-API liefert ebenfalls nur Tagesgesamt und leitet den Nachtanteil linear ab.
- # Durchschnittlicher Tagesverbrauch [kWh] (für Prognose-Kalibrierung)
+ # Durchschnittlicher Tagesverbrauch [kWh]. Wird für stündlichen Verbrauchs-Fallback
+ # (Open-Meteo/Solcast/Dummy) und Nachtverbrauchsberechnung verwendet.
  avg_daily_consumption_kwh: 12.0
- 
- # Erwarteter nächtlicher Verbrauch [kWh] wenn keine Prognose verfügbar
- # default_night_consumption_kwh: 4.0 #unbenutzt berechnung via avg_daily_consumption_kwh # Nacht-Zeitfenster (kein PV zu erwarten)
- night_start_hour: 21 # 21:00 Uhr
- night_end_hour: 6 # 06:00 Uhr
- # Früh-Morgen: Verzögertes Laden aktivieren ab Uhrzeit
- morning_delay_start_hour: 6
- morning_delay_end_hour: 10
+ # Früh-Morgen: Verzögertes Laden ab Sonnenaufgang + N Stunden.
+ # Die Ladung wird nach Sonnenaufgang um morning_delay_h Stunden verzögert,
+ # damit das Optimal-Fenster (Sonnenhöchststand) bevorzugt wird.
+ morning_delay_h: 4
  # SOC-Schwelle: Unter diesem Wert wird trotzdem sofort geladen
  emergency_charge_soc: 20
  # --- v3.0.0: Adaptive Ladezeitfenster ---
- # ± Stunden um den Sonnenhöchststand (ca. 13:00) für das Hauptladefenster.
+ # ± Stunden um den dynamischen Sonnenhöchststand (GPS+Datum) für das Hauptladefenster.
  # Bei genügend PV-Überschuss wird die Ladung in dieses Fenster konzentriert
  # und der Ladestrom reduziert, um das Fenster besser auszunutzen.
  solar_noon_offset_hours: 2 # 13:00 ± 2h = 11:00–15:00
@@ -114,6 +106,13 @@ charging:
  # Wird verwendet wenn genug PV im Fenster erwartet wird, um das 4h-Fenster
  # besser auszunutzen statt frühzeitig auf max_soc zu kommen.
  reduced_charge_current_a: 20 # z.B. 20 A statt 50 A im Optimal-Fenster
+
+ # ----- optional ab V3.0.9.3 Glättung der Stromregelung, vor allem morgens ------
+ # power_smooth_window_cycles: 3   # 1 = keine Glättung, 3 = Default, 5 = sehr träge
+
+ # morning_trickle_on_no_pv: true   # true = trickle bei fehlendem Überschuss (v3.0.9.2)
+                                   # false = 0 A, warte auf PV (ursprünglich)
+                                   # Default: true (rückwärtskompatibel)
 
 # --- Dashboard / Web GUI ---
 dashboard:

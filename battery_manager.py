@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.8.5  (Modbus TCP, kein MQTT)
+Version: 3.0.9.3  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -503,10 +503,6 @@ class EvccMonitor:
         self._last_check = now
 
         # ── MinSoc aus Modbus Register 2901 lesen ─────────────
-        # Reg 2901 ist das ESS MinimumSocLimit — die harte physikalische
-        # Untergrenze, die Victron in State 11/12 durchsetzt. Unabhaengig
-        # von evcc-Status muss dieser Wert in den State geschrieben werden,
-        # damit build_schedule() die korrekte Simulations-Untergrenze verwendet.
         min_soc_reg = self.victron.read_register(self.REG_MIN_SOC, scale=0.1)  # Reg 2901: Rohwert * 10 = %, also scale=0.1
         if min_soc_reg is not None:
             self.evcc_min_soc = float(min_soc_reg)
@@ -880,63 +876,112 @@ class ForecastManager:
         avg = self.cfg["charging"].get("avg_daily_consumption_kwh", 8.0) / 24
         return round(avg * ((24 - ns) + ne), 2)
 
+
+    def _calculate_sun_times(self, dt: date) -> tuple[float, float, float]:
+        """
+        Berechnet Sonnenaufgang und Sonnenuntergang in lokaler Dezimalzeit
+        (z.B. 8.23 = 08:14). Vereinfachte NOAA-Formel, Fehler < 2 Minuten.
+        Sommer-/Winterzeit wird über zoneinfo (Python 3.9+) korrekt berücksichtigt.
+        """
+        lat = self.loc["latitude"]
+        lon = self.loc["longitude"]
+        tz_name = self.loc.get("timezone", "UTC")
+
+        # UTC-Offset für das konkrete Datum (Sommerzeit!)
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+            noon_local = datetime(dt.year, dt.month, dt.day, 12, 0, tzinfo=tz)
+            utc_offset_h = noon_local.utcoffset().total_seconds() / 3600.0
+        except Exception:
+            # Fallback CET
+            utc_offset_h = 1.0
+
+        # Tag des Jahres
+        n = dt.timetuple().tm_yday
+
+        # Sonnendeklination (Approximation)
+        decl = math.radians(-23.44 * math.cos(math.radians((360.0 / 365.0) * (n + 10))))
+
+        # Zeitgleichung (Equation of Time) in Stunden
+        B = math.radians((360.0 / 365.0) * (n - 81))
+        eot = (9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)) / 60.0
+
+        # Stundenwinkel für Sonnenaufgang/-untergang
+        # 90.833° = 90° + 50' (Sonnenradius 16' + atmosphärische Refraktion 34')
+        lat_rad = math.radians(lat)
+        cos_omega = (
+            math.cos(math.radians(90.833))
+            - math.sin(lat_rad) * math.sin(decl)
+        ) / (math.cos(lat_rad) * math.cos(decl))
+        cos_omega = max(-1.0, min(1.0, cos_omega))
+        omega = math.degrees(math.acos(cos_omega)) / 15.0  # in Stunden
+
+        # Solar noon in UTC
+        solar_noon_utc = 12.0 - (lon / 15.0) + eot
+
+        sunrise_utc = solar_noon_utc - omega
+        sunset_utc  = solar_noon_utc + omega
+
+        # In lokale Zeit umrechnen und normieren
+        sunrise_local = (sunrise_utc + utc_offset_h) % 24
+        sunset_local  = (sunset_utc  + utc_offset_h) % 24
+
+        # Solar noon in lokaler Zeit (für optimales Lade-Fenster)
+        solar_noon_local = (solar_noon_utc + utc_offset_h) % 24
+
+        return sunrise_local, sunset_local, solar_noon_local
+
     def _get_dynamic_night_window(self, fc_list: list) -> tuple:
         """
         Bestimmt Nachtstart und -ende dynamisch aus dem PV/Verbrauchs-Forecast.
-
-        Start (Abend): erste Stunde ab 12 Uhr, wo PV < Verbrauch
-        Ende  (Morgen): erste Stunde ab 0 Uhr,  wo PV > Verbrauch
-
-        Clamps (nur im Code, nicht konfigurierbar):
-          Nachtstart: 16–21 Uhr
-          Nachtende:   6–10 Uhr
-
-        Fallback: night_start_hour / night_end_hour aus config.yaml (default 21/6)
-        Log: nur bei Änderung oder einmalig nach Programmstart.
+        Fallback (kein Forecast oder unplausible Werte): astronomische
+        Dämmerungszeiten aus GPS + Datum. Keine statischen Config-Werte nötig.
         """
-        # Clamps
-        NS_MIN, NS_MAX = 16, 21
-        NE_MIN, NE_MAX =  6, 10
-
-        ns_fallback = self.cfg["charging"].get("night_start_hour", 21)
-        ne_fallback = self.cfg["charging"].get("night_end_hour",    6)
+        # --- Astronomische Fallback-Zeiten (GPS + Datum) ---
+        sunrise, sunset, solar_noon = self._calculate_sun_times(date.today())
+        ns_fallback = max(12, min(23, math.ceil(sunset)))
+        ne_fallback = max(0, min(11, math.floor(sunrise)))
 
         has_consumption = fc_list and any(fc.consumption_kwh > 0 for fc in fc_list)
 
         if not has_consumption:
-            # Kein brauchbarer Forecast → config-Fallback, trotzdem clampen
-            night_start = max(NS_MIN, min(NS_MAX, ns_fallback))
-            night_end   = max(NE_MIN, min(NE_MAX, ne_fallback))
+            night_start = ns_fallback
+            night_end   = ne_fallback
             dynamic     = False
         else:
-            # Dynamischer Start (Abend): ab 12 Uhr, PV fällt unter Verbrauch
+            # Dynamischer Start (Abend): erste Stunde ab 12 Uhr, wo PV < Verbrauch
             night_start = ns_fallback
             for fc in fc_list:
                 if fc.hour >= 12 and fc.pv_kwh < fc.consumption_kwh:
                     night_start = fc.hour
                     break
 
-            # Dynamisches Ende (Morgen): ab 0 Uhr, PV übersteigt Verbrauch
+            # Dynamisches Ende (Morgen): erste Stunde ab 0 Uhr, wo PV > Verbrauch
             night_end = ne_fallback
             for fc in fc_list:
                 if fc.hour < 12 and fc.pv_kwh > fc.consumption_kwh:
                     night_end = fc.hour
                     break
 
-            # Clamps anwenden
-            night_start = max(NS_MIN, min(NS_MAX, night_start))
-            night_end   = max(NE_MIN, min(NE_MAX, night_end))
+            # Weiche Clamps: dynamische Werte nicht sinnlos weit
+            # vom astronomischen Ereignis abweichen lassen (z.B. Datenfehler)
+            night_start = max(math.floor(sunset) - 1,
+                              min(math.ceil(sunset) + 3, night_start))
+            night_end   = max(math.floor(sunrise) - 3,
+                              min(math.ceil(sunrise) + 1, night_end))
             dynamic     = True
 
-        # Nur loggen bei Änderung oder erstem Aufruf nach Programmstart
+        # Nur loggen bei Änderung oder erstem Aufruf
         window = (night_start, night_end)
         if window != self._last_night_window:
             self._last_night_window = window
             hours = (24 - night_start) + night_end
-            source = "dynamisch" if dynamic else "Fallback config"
+            source = "dynamisch" if dynamic else "astronomisch"
             self.logger.info(
                 f"[NIGHT_WINDOW] {night_start}:00–{night_end}:00 "
-                f"({hours}h, {source})"
+                f"({hours}h, {source} | "
+                f"Sonnenaufgang {sunrise:.1f}h, Sonnenuntergang {sunset:.1f}h)"
             )
 
         return night_start, night_end
@@ -989,6 +1034,40 @@ class EnergyAccumulator:
 # Ladeentscheidungs-Engine
 # ─────────────────────────────────────────────
 
+class PowerSmoother:
+    """
+    Gleitender Durchschnitt fuer PV- und Last-Leistung.
+    Glaettet kurzzeitige Schwankungen (Wolken, Lastspitzen)
+    ueber N Zyklen, ohne die Reaktionsfaehigkeit zu verlieren.
+    """
+
+    def __init__(self, window_cycles: int = 3):
+        self._window = window_cycles
+        self._pv_samples: list[float] = []
+        self._load_samples: list[float] = []
+
+    def update(self, pv_w: float, load_w: float) -> tuple[float, float]:
+        """
+        Fuegt neue Werte hinzu und gibt geglaettete Werte zurueck.
+        """
+        self._pv_samples.append(pv_w)
+        self._load_samples.append(load_w)
+        # Nur die letzten N Werte behalten
+        if len(self._pv_samples) > self._window:
+            self._pv_samples = self._pv_samples[-self._window:]
+        if len(self._load_samples) > self._window:
+            self._load_samples = self._load_samples[-self._window:]
+
+        pv_smooth = sum(self._pv_samples) / len(self._pv_samples)
+        load_smooth = sum(self._load_samples) / len(self._load_samples)
+        return pv_smooth, load_smooth
+
+    def reset(self):
+        """Puffer leeren (z.B. nach langer Pause)."""
+        self._pv_samples.clear()
+        self._load_samples.clear()
+
+
 class ChargeController:
     """
     Kernlogik: entscheidet Modus und Ladestrom.
@@ -1037,6 +1116,9 @@ class ChargeController:
         self._soc_98_reached_at: Optional[datetime] = None
         # v3.0.1: Cellbalancing-Haltezeit: SOC >= max_soc fuer min. N Stunden halten
         self._balancing_hold_until: float = 0.0
+        # v3.0.9.3: Leistungsglättung (3 Zyklen gleitender Durchschnitt)
+        smooth_window = self.cc.get("power_smooth_window_cycles", 3)
+        self._power_smoother = PowerSmoother(window_cycles=smooth_window)
         # Tagesreset-Tracking: Mitternachts-Reset der Balancing-Timer
         self._balancing_reset_date: str = date.today().isoformat()
 
@@ -1121,13 +1203,19 @@ class ChargeController:
 
     def _is_morning_window(self) -> bool:
         h = datetime.now().hour
-        return (self.cc.get("morning_delay_start_hour", 6)
-                <= h < self.cc.get("morning_delay_end_hour", 10))
+        # v3.0.9: Dynamisch ab Sonnenaufgang (GPS+Datum)
+        sunrise, _, _ = self.forecast._calculate_sun_times(date.today())
+        morn_s = int(sunrise)
+        morn_e = morn_s + self.cc.get("morning_delay_h", 4)
+        return morn_s <= h < morn_e
 
     def _is_night(self) -> bool:
         h = datetime.now().hour
-        return (h >= self.cc.get("night_start_hour", 21)
-                or h < self.cc.get("night_end_hour", 6))
+        # Astronomische Zeiten aus GPS + Datum (v3.0.9)
+        sunrise, sunset, solar_noon = self.forecast._calculate_sun_times(date.today())
+        night_start = max(12, min(23, math.ceil(sunset)))
+        night_end   = max(0, min(11, math.floor(sunrise)))
+        return (h >= night_start or h < night_end)
 
     def _soc_for_kwh(self, kwh: float) -> float:
         return (kwh / self.bat["capacity_kwh"]) * 100.0
@@ -1159,10 +1247,13 @@ class ChargeController:
     def _get_optimal_charge_window(self) -> tuple[int, int]:
         """Gibt (start, end) des optimalen Lade-Fensters um Sonnenhoechststand zurueck.
 
-        Sonnenhoechststand ca. 13:00 Sommer, 12:00 Winter. Vereinfacht: 13:00.
+        Sonnenhoechststand wird dynamisch aus GPS + Datum berechnet
+        (v3.0.9: _calculate_sun_times). Offset bleibt konfigurierbar.
         """
         offset = self.cc.get("solar_noon_offset_hours", 2)
-        noon = 13  # Koennte aus Location/Date genauer berechnet werden
+        # Dynamischer Sonnenhoechststand (lokale Zeit, float)
+        _, _, solar_noon = self.forecast._calculate_sun_times(date.today())
+        noon = int(round(solar_noon))
         return (noon - offset, noon + offset)
 
     # --- Hauptentscheidung ---
@@ -1183,6 +1274,13 @@ class ChargeController:
         # ── Dynamisches target_soc (v3.0.0) ───────────────────
         dyn_target = self._calculate_target_soc()
         self.state.target_soc = round(dyn_target, 1)
+
+        # ── Zentrale Leistungsglättung (v3.0.9.3) ─────────────
+        # Einmal pro Zyklus geglättet, alle Verzweigungen nutzen dieselben Werte
+        pv_raw   = self.state.pv_power_w
+        load_raw = self.state.load_power_w
+        pv_w, load_w = self._power_smoother.update(pv_raw, load_raw)
+        surplus_w = max(0.0, pv_w - load_w)
 
         # ── Effektiver Min-SOC: evcc kann diesen angehoben haben ─
         effective_min_soc = self.bat["min_soc"]
@@ -1206,20 +1304,30 @@ class ChargeController:
                 f"ESS State {self.state.ess_battery_life_state}: "
                 f"Notladung/Entladesperre → max {max_a}A")
 
-        # ── Morgen-Notladung (v3.0.4) ─────────────────────────
-        # Wenn aktueller SOC < Minimum -> sofort laden bei PV-Ueberschuss, bis Minimum erreicht
+        # ── Morgen-Notladung (v3.0.9-fix) ─────────────────────
+        # Wenn aktueller SOC < Minimum -> proportional laden bei PV-Ueberschuss.
+        # Nie hart 0/50A schalten, sondern mindestens trickle halten.
         if self._is_morning_window() and soc < min_required:
-            pv_w = self.state.pv_power_w
-            load_w = self.state.load_power_w
-            if pv_w > load_w + 200:
+            # pv_w, load_w, surplus_w bereits zentral geglättet (siehe oben)
+
+            if surplus_w > 200:
+                surplus_a = surplus_w / nom_v
+                charge_a = min(surplus_a, max_a)
+                charge_a = max(charge_a, trickle_a)  # nie unter trickle
                 self._morning_emergency_done = False
-                return max_a, "charging", (
+                return charge_a, "charging", (
                     f"Morgen-Notladung: SOC {soc:.1f}% < {min_required}% -> "
-                    f"sofort laden bei PV-Ueberschuss")
+                    f"proportional laden {charge_a:.0f}A bei PV-Ueberschuss")
             else:
-                return 0, "idle", (
-                    f"Morgen: Warte auf PV-Ueberschuss fuer Notladung "
-                    f"(SOC {soc:.1f}% < {min_required}%)")
+                # Kein Überschuss: konfigurierbar trickle oder 0
+                if self.cc.get("morning_trickle_on_no_pv", True):
+                    return trickle_a, "trickle", (
+                        f"Morgen: Kein PV-Ueberschuss, sanftes Laden {trickle_a}A "
+                        f"(SOC {soc:.1f}% < {min_required}%)")
+                else:
+                    return 0, "idle", (
+                        f"Morgen: Warte auf PV-Ueberschuss fuer Notladung "
+                        f"(SOC {soc:.1f}% < {min_required}%)")
 
         # Morgen-Notladung abgeschlossen markieren
         if soc >= min_required:
@@ -1267,8 +1375,10 @@ class ChargeController:
         # PV verspricht.
         h_now = datetime.now().hour
         opt_start, opt_end = self._get_optimal_charge_window()
-        morn_s = self.cc.get("morning_delay_start_hour", 6)
-        morn_e = self.cc.get("morning_delay_end_hour", 10)
+        # v3.0.9: Morgenfenster dynamisch ab Sonnenaufgang + morning_delay_h
+        sunrise, _, _ = self.forecast._calculate_sun_times(date.today())
+        morn_s = int(sunrise)
+        morn_e = morn_s + self.cc.get("morning_delay_h", 4)
         effective_morn_e = max(morn_e, opt_start)
 
         if morn_s <= h_now < effective_morn_e:
@@ -1297,10 +1407,8 @@ class ChargeController:
                     f"({pv_in_optimal:.1f} kWh < {needed_kwh:.1f} kWh), "
                     f"fruehes Laden noetig")
 
-        # ── 6. PV-Ueberschuss mit adaptivem Strom (v3.0.0) ─────
-        pv_w     = self.state.pv_power_w
-        load_w   = self.state.load_power_w
-        surplus_w = max(0.0, pv_w - load_w)
+        # ── 6. PV-Ueberschuss mit adaptivem Strom (v3.0.9.3) ──
+        # pv_w, load_w, surplus_w bereits zentral geglättet (siehe oben)
 
         # Adaptive Ladestrom-Reduktion im optimalen Fenster bei hohem Ueberschuss
         h_now = datetime.now().hour
@@ -1331,12 +1439,12 @@ class ChargeController:
             return trickle_a, "trickle", (
                 f"SOC {soc:.1f}% weit unter Ziel {dyn_target:.0f}%, "
                 f"sanft laden {trickle_a} A "
-                f"(PV {pv_w:.0f} W, Last {load_w:.0f} W)")
+                f"(PV {pv_w:.0f} W [glatt], Last {load_w:.0f} W [glatt])")
 
         # ── 8. Warten ─────────────────────────────────────────
         return 0, "idle", (
             f"Warte auf PV-Ueberschuss "
-            f"(SOC {soc:.1f}%, PV {pv_w:.0f} W, Last {load_w:.0f} W)")
+            f"(SOC {soc:.1f}%, PV {pv_w:.0f} W [glatt], Last {load_w:.0f} W [glatt])")
     def _ramp(self, target_a: float) -> float:
         """Sanftes Rampen des Ladestroms (+/- ramp_step A pro Zyklus)."""
         step = self.cc.get("current_ramp_step", 5)
@@ -1367,8 +1475,10 @@ class ChargeController:
         nom_v = self.bat.get("voltage_nominal", 48.0)
         max_a = self.bat["max_charge_current"]
         hyst = self.cc.get("soc_hysteresis", 2)
-        morn_s = self.cc.get("morning_delay_start_hour", 6)
-        morn_e = self.cc.get("morning_delay_end_hour", 10)
+        # v3.0.9: Dynamisch ab Sonnenaufgang
+        sunrise, _, _ = self.forecast._calculate_sun_times(date.today())
+        morn_s = int(sunrise)
+        morn_e = morn_s + self.cc.get("morning_delay_h", 4)
 
         # Dynamisches target_soc fuer die Simulation (v3.0.0)
         dyn_target = self._calculate_target_soc()
@@ -1388,9 +1498,9 @@ class ChargeController:
             charge_kwh = min(fc.net_kwh, max_charge_kwh)
             soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             return action, current_a, soc_sim
-        # Wenn SOC < min_soc und KEIN PV-Ueberschuss: Nicht pauschal blockieren.
-        # Victron ESS State 11/12 wird in Echtzeit durch decide() gehandhabt.
-        # Für den Ladeplan zeigen wir den physikalischen Verlauf (Entladung).
+        # Wenn SOC < min_soc und KEIN PV-Ueberschuss: Normale Defizit-Logik
+        # läuft weiter. Der SOC sinkt physikalisch korrekt bis floor_soc
+        # (Reg 2901). Kein künstliches Einfrieren.
 
         # Notfall-SOC
         if soc_sim <= self.cc.get("emergency_charge_soc", 25):
@@ -1461,7 +1571,7 @@ class ChargeController:
             hyst_kwh = hyst / 100.0 * cap
             if fc.net_kwh >= -hyst_kwh:
                 soc_sim = max(soc_sim, dyn_target - hyst)
-            # (Redundant mit _apply_deficit, aber schadet nicht)
+            # v3.0.3: Nie unter floor_soc fallen
             soc_sim = max(soc_sim, floor_soc)
             return action, current_a, soc_sim
 
@@ -1746,7 +1856,8 @@ class ChargeController:
             self._balancing_hold_until = 0.0
             self._soc_98_reached_at    = None
             self._balancing_reset_date = _today_iso
-            self.logger.info("Mitternachts-Reset: Balancing-Timer zurueckgesetzt")
+            self._power_smoother.reset()  # Glättungspuffer bei Tageswechsel leeren
+            self.logger.info("Mitternachts-Reset: Balancing-Timer und Glättung zurueckgesetzt")
 
         # ── days_since_full_charge immer aktuell aus Datum berechnen ──────────
         if self.state.last_full_charge_date:
@@ -1793,8 +1904,15 @@ class ChargeController:
         # SOC unter min_soc: keine Hysterese, sofort neu entscheiden.
         # Ohne das bleibt eine gecachte Nacht-Entscheidung bis zu 10 Minuten aktiv,
         # obwohl es laengst hell ist und PV-Ueberschuss vorhanden waere.
-        if self.state.soc < self.bat["min_soc"]:
+        if self.state.soc < self.bat["min_soc"] - 2:
             force_new = True
+        elif self.state.soc < self.bat["min_soc"]:
+            # Knapp unter min_soc: max. alle 2 Minuten neu entscheiden,
+            # nicht bei jedem Zyklus (verhindert Oszillation durch Wolken/Lastspitzen)
+            if not hasattr(self, '_min_soc_force_ts') or \
+               (now - getattr(self, '_min_soc_force_ts', 0)) > 120:
+                force_new = True
+                self._min_soc_force_ts = now
         if self._needs_full_charge() and self.state.soc < self.bat["max_soc"] - self.cc.get("soc_hysteresis", 2):
             force_new = True
 
@@ -1843,7 +1961,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Solar Batterie Manager v3.0.8.5</title>
+<title>Solar Batterie Manager v3.0.9.3</title>
 <style>
 :root{--bg:#0f1117;--bg2:#1a1d27;--bg3:#252836;
   --acc:#f59e0b;--grn:#22c55e;--red:#ef4444;--blu:#3b82f6;--vio:#a78bfa;
@@ -1891,7 +2009,7 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
 </head>
 <body>
 <div class="hd">
-  <h1>&#9889; Solar Batterie Manager</h1>
+  <h1>&#9889; Solar Batterie Manager <span style="font-size:0.7rem;color:var(--mut);font-weight:400">v3.0.9</span></h1>
   <div class="hdr">
     <div class="sp"><div class="dot" id="mdot"></div><span id="mst">Verbinde...</span></div>
     <div class="sp"><div class="dot" id="edot"></div><span id="est">evcc -</span></div>
@@ -2107,7 +2225,7 @@ async function refresh(){
       </tr>`;
     }).join('');
     document.getElementById('ft').textContent=
-      `Aktualisiert: ${new Date().toLocaleTimeString('de')} - naechste in ${REFRESH/1000}s`;
+      `v3.0.9 | Aktualisiert: ${new Date().toLocaleTimeString('de')} - naechste in ${REFRESH/1000}s`;
   }catch(e){document.getElementById('rea').textContent='Fehler: '+e.message;}
 }
 refresh();setInterval(refresh,REFRESH);
@@ -2197,6 +2315,8 @@ def validate_config(cfg: dict, logger: logging.Logger) -> bool:
     cc = cfg.get("charging", {})
     if "solar_noon_offset_hours" in cc and cc["solar_noon_offset_hours"] < 0:
         issues.append("charging.solar_noon_offset_hours muss >= 0 sein")
+    if "morning_delay_h" in cc and cc["morning_delay_h"] < 0:
+        issues.append("charging.morning_delay_h muss >= 0 sein")
     if "reduced_charge_current_a" in cc:
         red_a = cc["reduced_charge_current_a"]
         max_a = bat.get("max_charge_current", 50)
@@ -2230,7 +2350,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v3.0.8.5  (Modbus TCP) - Predictive Charging")
+    logger.info("Solar Batterie Manager v3.0.9.3  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

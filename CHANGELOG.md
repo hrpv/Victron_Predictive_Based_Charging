@@ -1,22 +1,68 @@
 # Changelog — battery_manager.py
 
-## [3.0.8.6] – 2026-05-31
+## [3.0.9.3] – 2026-05-31
 
 ### Fixed
-- **`build_schedule()`: `floor_soc` berücksichtigt immer ESS MinimumSocLimit (Reg 2901)**
-  `floor_soc` wurde bisher nur gesetzt wenn `evcc_discharge_locked == True`. Das Register 2901 (ESS MinimumSocLimit) ist jedoch die harte physikalische Untergrenze, die Victron in ESS State 11/12 durchsetzt — unabhängig davon, ob evcc aktiv ist oder nicht. Die Simulation zeigte daher Entladung unter den realen Hardware-Limit (z. B. 20 %), obwohl Victron den SOC dort physisch stoppt.
+- **`decide()`: `PowerSmoother.update()` dezentral aufgerufen — Refactoring**  
+  In v3.0.9.2 wurde `_power_smoother.update()` an zwei Stellen in `decide()` aufgerufen: Morgen-Notladung und PV-Überschuss (Schritt 6). Beide Pfade teilten sich denselben Smoother-State, ohne dass das strukturell erzwungen wurde. Bei zukünftigen Erweiterungen bestand die Gefahr eines echten Doppelaufrufs.  
+  → Fix: `update()` wird jetzt **einmal zentral** am Anfang von `decide()` aufgerufen, vor allen Verzweigungen. Alle nachfolgenden Blöcke (Morgen-Notladung, PV-Überschuss, Trickle, Warten) nutzen dieselben geglätteten Werte (`pv_w`, `load_w`, `surplus_w`). Keine Fragilität mehr.
+
+- **`ChargeController.__init__()`: `_power_smoother` außerhalb des Hauptblocks**  
+  In v3.0.9.2 wurde `_power_smoother` nach dem Haupt-Init-Block (nach `_balancing_reset_date`) instanziiert. Stilistisch unordentlich, Wartbarkeit leidet.  
+  → Fix: `_power_smoother` ist jetzt im Haupt-Init-Block, vor `_balancing_reset_date`.
+
+### Changed
+- **`decide()`: Morgen-Notladung ohne Überschuss — konfigurierbar**  
+  In v3.0.9.2 wurde bei fehlendem PV-Überschuss im Morgenfenster immer `trickle_a` zurückgegeben (statt 0 A). Das verhindert zwar Oszillation, lädt aber auch um 6:30 Uhr ohne jede PV-Erzeugung mit 5 A (~240 W) aus dem Netz — eine Verhaltensänderung gegenüber dem ursprünglichen Design (0 A = warte auf PV).  
+  → Fix: Neuer optionaler Config-Parameter `charging.morning_trickle_on_no_pv` (Default: `true`). Bei `true` = trickle bei fehlendem Überschuss (v3.0.9.2-Verhalten). Bei `false` = 0 A, warte auf PV (ursprüngliches Verhalten). Rückwärtskompatibel: fehlender Eintrag = `true`.
+
+### Added
+- **Config-Option `charging.morning_trickle_on_no_pv`** (optional, Default `true`): Steuert ob bei Morgen-Notladung ohne PV-Überschuss trickle geladen oder gewartet wird.
+
+---
+
+## [3.0.9.2] – 2026-05-31
+
+### Fixed
+- **`run_cycle()`: `force_new` deaktiviert Hysterese bei knapp unter `min_soc`**  
+  Wenn der SOC knapp unter `min_soc` lag (z.B. 19 % bei `min_soc = 20 %`), wurde bei **jedem Zyklus** (jede Minute) eine komplett neue Entscheidung erzwungen (`force_new = True`). Die konfigurierte Hysterese (`min_charge_duration_minutes`, default 10 Minuten) war damit wirkungslos. `decide()` lieferte bei jedem Zyklus einen neuen Zielstrom basierend auf ungeglätteten Momentanwerten (PV-Leistung, Last, ESS-State). Die `_ramp()` konnte diesem Ziel nicht folgen und erzeugte das wellenartige Hoch-/Runterfahren (z.B. 10→20→30→20→30→40→30→20→10→0 A).  
+  → Fix: `force_new` wird erst bei deutlicher Unterschreitung (`min_soc - 2 %`) sofort ausgelöst. Knapp darunter nur noch alle **2 Minuten** neu entschieden (nicht jede Minute). Die 10-Minuten-Hysterese kann endlich wirken.
+
+- **`decide()`: Morgen-Notladung als harter 0/50-A-Schalter**  
+  Die Bedingung `if pv_w > load_w + 200: return max_a else: return 0` war ein harter Ein/Aus-Schalter. Wenn eine Wolke vorbeizog oder der Kühlschrank ansprang (`load_w` stieg kurz), fiel die Entscheidung innerhalb einer Minute von 50 A auf 0 A. Dann rampte `_ramp()` 5 A pro Zyklus runter. Wolke weg → wieder hoch. Das erklärte exakt das Log-Muster (10→20→30→20→30→40→30→20→10→0…).  
+  → Fix: Statt `max_a` wird der **proportionale Überschussstrom** geladen (`surplus_a = surplus_w / nom_v`), nie unter `trickle_a` (z.B. 5 A). Kurze Wolken oder Lastspitzen führen nicht mehr zum sofortigen Abschalten. Der Sollwert bleibt in einem stabilen Band statt zwischen 0 und 50 A zu springen.
+
+- **`decide()`: PV-Überschuss basiert auf ungeglätteten Momentanwerten**  
+  Der Ladestrom wurde direkt aus dem **aktuellen** PV-Überschuss berechnet (`pv_power_w - load_power_w`). Bei wechselhaftem Wetter oszillierte der Sollwert ständig. Kombiniert mit `force_new` (weil SOC < min_soc) entstand das Ping-Pong.  
+  → Fix: Neue Klasse `PowerSmoother` mit gleitendem Durchschnitt über **3 Zyklen** (konfigurierbar via `power_smooth_window_cycles` in `config.yaml`, Default 3). PV- und Last-Leistung werden geglättet, bevor der Überschuss berechnet wird. Ein kurzer Wolkenbruch (1 Zyklus = 1 Minute) wird auf 1/3 des Wertes gedämpft. Der Ladestrom sinkt sanft statt abrupt. Bei dauerhaftem Wetterwechsel reagiert er trotzdem innerhalb von 3 Zyklen voll. Der Glättungspuffer wird bei **Tageswechsel automatisch geleert**.
+
+### Added
+- **`PowerSmoother`**: Gleitender Durchschnitt für PV- und Last-Leistung. Geglättete Werte für stabileren Ladestrom ohne Reaktionsverlust.
+- **Config-Option `charging.power_smooth_window_cycles`** (optional, Default 3): Anzahl der Zyklen für die Glättung. 1 = keine Glättung, 3 = empfohlen, 5 = sehr träge.
+
+### Notes
+- Fix C (ESS-State-Hysterese) wurde bewusst **nicht** umgesetzt. Victron hat interne Hysterese für State 10↔11 (mindestens +3 % SOC), ein zusätzlicher Software-Timer ist überflüssig.
+- Die drei Fixes (A, B, D) greifen zusammen: **A** gibt der Hysterese Zeit zu wirken, **B** verhindert das harte Ein/Aus-Schalten, **D** dämpft kurzzeitige Messwertschwankungen.
+
+---
+
+## [3.0.8.6] – 2026-05-31 Ubernahme von fix aus 3.0.8.6 in 3.0.9.1
+
+### Fixed
+- **`build_schedule()`: `floor_soc` berücksichtigt immer ESS MinimumSocLimit (Reg 2901)**  
+  `floor_soc` wurde bisher nur gesetzt wenn `evcc_discharge_locked == True`. Das Register 2901 (ESS MinimumSocLimit) ist jedoch die harte physikalische Untergrenze, die Victron in ESS State 11/12 durchsetzt — unabhängig davon, ob evcc aktiv ist oder nicht. Die Simulation zeigte daher Entladung unter den realen Hardware-Limit (z. B. 20 %), obwohl Victron den SOC dort physisch stoppt.  
   → Fix: `floor_soc` wird jetzt immer aus `state.evcc_min_soc` (Reg 2901) gebildet, Fallback auf `bat.min_soc`. Die Simulation sinkt damit korrekt nur bis zur tatsächlichen Victron-Untergrenze.
 
-- **`_simulate_hour()`: `_apply_deficit()` klemmt immer auf `floor_soc`**
-  In `_apply_deficit()` wurde die Untergrenze nur angewendet wenn `soc >= floor_soc`. Fiel der simulierte SOC bereits unter `floor_soc` (z. B. 33 % < 35 %), wurde das Defizit ungeklemmt weiter abgezogen — der SOC lief in der Prognose ins Negative.
+- **`_simulate_hour()`: `_apply_deficit()` klemmt immer auf `floor_soc`**  
+  In `_apply_deficit()` wurde die Untergrenze nur angewendet wenn `soc >= floor_soc`. Fiel der simulierte SOC bereits unter `floor_soc` (z. B. 33 % < 35 %), wurde das Defizit ungeklemmt weiter abgezogen — der SOC lief in der Prognose ins Negative.  
   → Fix: `max(floor_soc, new_soc)` wird jetzt in `_apply_deficit()` **immer** angewendet, unabhängig vom aktuellen SOC-Level. Das entspricht dem physikalischen Verhalten: Victron stoppt die Entladung am Hardware-Limit.
 
-- **`_simulate_hour()`: Kein pauschales SOC-Einfrieren bei `soc_sim < min_soc` ohne PV**
-  Der Block `if soc_sim < min_soc` mit `else`-Zweig (kein PV → SOC bleibt konstant, `action = "idle"`) frierte den simulierten SOC bei negativem Überschuss künstlich ein. Im Ladeplan blieb der SOC z. B. ab 03:00 bei 33.1 % stehen, obwohl weiterhin Last > PV vorhanden war und die reale Batterie weiter entlud (siehe Log: SOC 34.0 %).
+- **`_simulate_hour()`: Kein pauschales SOC-Einfrieren bei `soc_sim < min_soc` ohne PV**  
+  Der Block `if soc_sim < min_soc` mit `else`-Zweig (kein PV → SOC bleibt konstant, `action = "idle"`) frierte den simulierten SOC bei negativem Überschuss künstlich ein. Im Ladeplan blieb der SOC z. B. ab 03:00 bei 33.1 % stehen, obwohl weiterhin Last > PV vorhanden war und die reale Batterie weiter entlud (siehe Log: SOC 34.0 %).  
   → Fix: Der `else`-Zweig wurde entfernt. Wenn `soc_sim < min_soc` und **kein** PV-Überschuss vorhanden ist, läuft die normale Defizit-Logik (`_apply_deficit`) weiter. Der SOC sinkt im Ladeplan physikalisch korrekt bis zur harten `floor_soc`-Grenze (Reg 2901). Nur bei **positivem** Überschuss wird weiterhin sofort geladen (`action = "charging"`).
 
-- **`EvccMonitor.update()`: `state.evcc_min_soc` wird aus Reg 2901 geschrieben**
-  `EvccMonitor.update()` las Reg 2901 in die Instanzvariable `self.evcc_min_soc`, schrieb den Wert jedoch nie in `state.evcc_min_soc`. `build_schedule()` las `state.evcc_min_soc` (immer `0.0`) und fiel daher auf `bat.min_soc` (35 %) zurück — statt auf den echten ESS MinimumSocLimit (20 %). Folge: Alle Fixes 1–3 wirkten sich nicht aus, da `floor_soc` effektiv weiterhin 35 % betrug.
+- **`EvccMonitor.update()`: `state.evcc_min_soc` wird aus Reg 2901 geschrieben**  
+  `EvccMonitor.update()` las Reg 2901 in die Instanzvariable `self.evcc_min_soc`, schrieb den Wert jedoch nie in `state.evcc_min_soc`. `build_schedule()` las `state.evcc_min_soc` (immer `0.0`) und fiel daher auf `bat.min_soc` (35 %) zurück — statt auf den echten ESS MinimumSocLimit (20 %). Folge: Alle Fixes 1–3 wirkten sich nicht aus, da `floor_soc` effektiv weiterhin 35 % betrug.  
   → Fix: Nach erfolgreichem Modbus-Lesen von Reg 2901 wird `self.state.evcc_min_soc = self.evcc_min_soc` gesetzt. Damit fließt der Victron-Hardware-Limit in den SystemState und wird von `build_schedule()` als `floor_soc` verwendet.
 
 ### Notes
@@ -24,6 +70,30 @@
 - Die Kombination aus Fix 1 + Fix 2 + Fix 3 + Fix 4 stellt sicher, dass der Ladeplan bei Nacht mit negativem Überschuss korrekt bis zum Victron-Limit (Reg 2901) entlädt und dort stoppt — nicht früher (Fix 3) und nicht tiefer (Fix 1+2+4).
 
 ---
+
+## [3.0.9] – 2026-05-30
+
+### Added
+- **Morgen-Verzögerung dynamisch (Sonnenaufgang)**  
+  `morning_delay_start_hour` / `morning_delay_end_hour` entfallen. Stattdessen neuer Parameter `morning_delay_h` (Default: 4h). Das Morgenfenster beginnt jetzt automatisch beim Sonnenaufgang (GPS+Datum) und dauert `morning_delay_h` Stunden. `effective_morn_e = max(morn_e, opt_start)` bleibt erhalten, damit keine Lücke zum Optimal-Fenster entsteht.
+
+- **`_get_optimal_charge_window()`: Dynamischer Sonnenhöchststand**  
+  Bisher hardcoded `noon = 13`. Jetzt wird der Sonnenhöchststand aus `_calculate_sun_times()` übernommen (lokale Zeit, gerundet). Sommer-/Winterzeit und Längengrad werden korrekt berücksichtigt. `solar_noon_offset_hours` bleibt konfigurierbar.
+
+- **`ForecastManager._calculate_sun_times()`**: Astronomische Berechnung von Sonnenaufgang/-untergang aus GPS-Koordinaten und Datum (vereinfachte NOAA-Formel, Fehler < 2 Min). Sommer-/Winterzeit wird via `zoneinfo` korrekt berücksichtigt.
+- **Dashboard-Header**: Versionsnummer `v3.0.9` wird jetzt im Titel und Footer angezeigt.
+
+### Changed
+- **`_get_dynamic_night_window()`**: Fallback komplett auf astronomische Zeiten umgestellt. Entfernt die statischen Config-Werte `night_start_hour` / `night_end_hour`. Clamps sind nun weich (±3h um Sonnenauf-/untergang) statt harter 16–21 / 6–10 Uhr.
+- **`ChargeController._is_night()`**: Nutzt jetzt ebenfalls `_calculate_sun_times()` statt der statischen Config-Werte. Nacht-Erkennung passt sich somit automatisch jahreszeitlich an (z.B. 17–08h im Dezember, 21–05h im Juni).
+- **Config (`config.yaml`)**: Felder `night_start_hour`, `night_end_hour` und `default_night_consumption_kwh` entfernt. Werden nicht mehr benötigt.
+
+### Notes
+- Jahreszeitliche Nachtfenster-Beispiele (Stuttgart): Dez 17–08h (15h), Jun 21–05h (8h), Mär 19–07h (12h).
+- Die dynamische PV/Verbrauchs-Logik (PV < Verbrauch ab 12 Uhr / PV > Verbrauch vor 12 Uhr) bleibt erhalten und modifiziert das astronomische Fenster fein.
+
+---
+
 
 ## [3.0.8.5] – 2026-05-30
 
