@@ -35,8 +35,8 @@ battery:
  full_charge_interval_days: 10 # Spätestens alle N Tage auf max_soc laden (Zellbalancing)
  min_charge_current: 0 # Minimaler Ladestrom [A]
  max_charge_current: 50 # Maximaler Ladestrom [A]
- # Stromstärke für "sanftes" Laden (Erhaltungsladung)
- trickle_current: 20 # [A]
+ # Stromstärke für Laden nach Fullcharge-Cycle SOC >= 98% 
+ trickle_current: 20 # [A] empfohlen: min. 10 A, Cell Balancing bei SOC >= 98%, ab V3.0.9.8 korrekt verwendet
  # v3.0.1: Mindest-Haltezeit bei max_soc für Cellbalancing [Stunden]
  balancing_hold_hours: 5 # Ladestrom erst nach N Stunden auf 0 reduzieren
  # Voltage pro % SOC (für Schätzungen ohne exakten SOC-Wert)
@@ -109,10 +109,8 @@ charging:
 
  # ----- optional ab V3.0.9.3 Glättung der Stromregelung, vor allem morgens ------
  # power_smooth_window_cycles: 3   # 1 = keine Glättung, 3 = Default, 5 = sehr träge
-
- # morning_trickle_on_no_pv: true   # true = trickle bei fehlendem Überschuss (v3.0.9.2)
-                                   # false = 0 A, warte auf PV (ursprünglich)
-                                   # Default: true (rückwärtskompatibel)
+ # optional, Default: 10 A ab v3.0.9.7
+ # optimal_window_min_current_a: 10  # Mindeststrom im Optimal-Fenster
 
 # --- Dashboard / Web GUI ---
 dashboard:
