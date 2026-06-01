@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.9.4  (Modbus TCP, kein MQTT)
+Version: 3.0.9.9  (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -1086,7 +1086,7 @@ class ChargeController:
       3. Vollladung faellig       -> auf max_soc laden (Balancing)
       4. Nacht                    -> kein Laden
       5. Morgen-Verzoegerung      -> warte auf PV wenn Prognose ausreicht
-      6. PV-Ueberschuss           -> laden proportional zum Ueberschuss
+      6. PV-Ueberschuss           -> laden mit max_a (oder reduced_a im Optimal-Fenster)
       7. Trickle                  -> sanft laden wenn SOC weit unter Ziel
       8. Ziel erreicht            -> Stop
     """
@@ -1274,7 +1274,6 @@ class ChargeController:
         max_soc   = self.bat["max_soc"]
         hyst      = self.cc.get("soc_hysteresis", 2)
         emergency = self.cc.get("emergency_charge_soc", 25)
-        nom_v     = self.bat.get("voltage_nominal", 48.0)
         max_a     = self.bat["max_charge_current"]
         trickle_a = self.bat.get("trickle_current", 5)
         min_required = max(self.bat["min_soc"], emergency)
@@ -1312,30 +1311,14 @@ class ChargeController:
                 f"ESS State {self.state.ess_battery_life_state}: "
                 f"Notladung/Entladesperre → max {max_a}A")
 
-        # ── Morgen-Notladung (v3.0.9-fix) ─────────────────────
-        # Wenn aktueller SOC < Minimum -> proportional laden bei PV-Ueberschuss.
-        # Nie hart 0/50A schalten, sondern mindestens trickle halten.
+        # ── Morgen-Notladung (v3.0.9.7) ────────────────────────
+        # SOC unter Minimum: sofort mit max_a laden bis min_soc erreicht.
+        # Keine Proportionallogik, kein PV-Ueberschuss-Check.
         if self._is_morning_window() and soc < min_required:
-            # pv_w, load_w, surplus_w bereits zentral geglättet (siehe oben)
-
-            if surplus_w > 200:
-                surplus_a = surplus_w / nom_v
-                charge_a = min(surplus_a, max_a)
-                charge_a = max(charge_a, trickle_a)  # nie unter trickle
-                self._morning_emergency_done = False
-                return charge_a, "charging", (
-                    f"Morgen-Notladung: SOC {soc:.1f}% < {min_required}% -> "
-                    f"proportional laden {charge_a:.0f}A bei PV-Ueberschuss")
-            else:
-                # Kein Überschuss: konfigurierbar trickle oder 0
-                if self.cc.get("morning_trickle_on_no_pv", True):
-                    return trickle_a, "trickle", (
-                        f"Morgen: Kein PV-Ueberschuss, sanftes Laden {trickle_a}A "
-                        f"(SOC {soc:.1f}% < {min_required}%)")
-                else:
-                    return 0, "idle", (
-                        f"Morgen: Warte auf PV-Ueberschuss fuer Notladung "
-                        f"(SOC {soc:.1f}% < {min_required}%)")
+            self._morning_emergency_done = False
+            return max_a, "charging", (
+                f"Morgen-Notladung: SOC {soc:.1f}% < {min_required}% "
+                f"-> {max_a:.0f}A bis min_soc")
 
         # Morgen-Notladung abgeschlossen markieren
         if soc >= min_required:
@@ -1415,10 +1398,7 @@ class ChargeController:
                     f"({pv_in_optimal:.1f} kWh < {needed_kwh:.1f} kWh), "
                     f"fruehes Laden noetig")
 
-        # ── 6. PV-Ueberschuss mit adaptivem Strom (v3.0.9.3) ──
-        # pv_w, load_w, surplus_w bereits zentral geglättet (siehe oben)
-
-        # Adaptive Ladestrom-Reduktion im optimalen Fenster bei hohem Ueberschuss
+        # ── 6. PV-Ueberschuss mit dynamischem Strom im Optimal-Fenster (v3.0.9.7) ──
         h_now = datetime.now().hour
         opt_start, opt_end = self._get_optimal_charge_window()
         if opt_start <= h_now <= opt_end and surplus_w > 200:
@@ -1426,27 +1406,47 @@ class ChargeController:
             fc_list = self.forecast.get_forecast()
             pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
             if pv_in_optimal >= needed_kwh * 1.5:
-                # Reduzierter Strom um 4h-Fenster besser auszunutzen
+                # Dynamischer Strom basierend auf verbleibendem Energiebedarf
+                missing_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
+
+                if missing_kwh <= 0.1:
+                    # Ziel praktisch erreicht (0.1 kWh ≈ 0.7% bei 14 kWh)
+                    gentle_a = self.bat.get("min_charge_current", 5)
+                    return gentle_a, "trickle", (
+                        f"Optimal-Fenster: Ziel fast erreicht, sanft {gentle_a}A "
+                        f"(SOC {soc:.1f}% ≈ {dyn_target:.0f}%)")
+
+                # Restzeit im Fenster (in Stunden, mindestens 0.5h)
+                hours_left = max(float((opt_end - h_now) + 1), 0.5)
+
+                # Benoetigte Ladeleistung mit 15% Sicherheitsreserve
+                required_kw = (missing_kwh * 1.15) / hours_left
+
+                # Echte Batteriespannung verwenden, Fallback auf nom_v
+                actual_v = max(self.state.battery_voltage,
+                               self.bat.get("voltage_nominal", 48.0) * 0.9)
+                required_a = (required_kw * 1000.0) / actual_v
+
+                # Begrenzen: min_charge_current <= charge_a <= reduced_a
+                optimal_min_a = self.cc.get("optimal_window_min_current_a", 10)
                 reduced_a = self.cc.get("reduced_charge_current_a", 20)
-                surplus_a = surplus_w / nom_v
-                charge_a = min(surplus_a, reduced_a)
+                charge_a = max(optimal_min_a, min(required_a, reduced_a))
+
                 return charge_a, "charging", (
-                    f"PV-Ueberschuss {surplus_w:.0f} W -> {charge_a:.0f} A "
-                    f"(reduziert im Optimal-Fenster {opt_start}:00-{opt_end}:00) "
-                    f"(SOC {soc:.1f}% -> Ziel {dyn_target:.0f}%)")
+                    f"Optimal-Fenster dynamisch: {charge_a:.0f}A "
+                    f"({missing_kwh:.1f} kWh in {hours_left:.1f}h, "
+                    f"reserve +15%)")
 
         if surplus_w > 200:
-            surplus_a = surplus_w / nom_v
-            charge_a  = min(surplus_a, max_a)
-            return charge_a, "charging", (
-                f"PV-Ueberschuss {surplus_w:.0f} W -> {charge_a:.0f} A "
+            return max_a, "charging", (
+                f"PV-Ueberschuss {surplus_w:.0f} W -> {max_a:.0f} A "
                 f"(SOC {soc:.1f}% -> Ziel {dyn_target:.0f}%)")
-
         # ── 7. Trickle ────────────────────────────────────────
         if soc < dyn_target - 10:
-            return trickle_a, "trickle", (
+            gentle_a = self.bat.get("min_charge_current", 5)
+            return gentle_a, "trickle", (
                 f"SOC {soc:.1f}% weit unter Ziel {dyn_target:.0f}%, "
-                f"sanft laden {trickle_a} A "
+                f"sanft laden {gentle_a} A "
                 f"(PV {pv_w:.0f} W [glatt], Last {load_w:.0f} W [glatt])")
 
         # ── 8. Warten ─────────────────────────────────────────
@@ -1943,7 +1943,11 @@ class ChargeController:
             ramped = self._ramp(target_a)
             if abs(ramped - self._last_written_ramped_a) >= 1.0:
                 if self.victron.set_max_charge_current(ramped):
-                    self._last_written_ramped_a = ramped
+                    # WICHTIG: _last_written_ramped_a muss den tatsaechlich geschriebenen
+                    # Wert enthalten (nach Clamping in set_max_charge_current), nicht den
+                    # ungeclamppten Rampenwert. Sonst driftet die Hysterese bei niedrigen
+                    # Stroemen (z.B. 5 A -> clamped auf 3 A) und erzeugt falsche Anzeigen.
+                    self._last_written_ramped_a = self.state.charge_current_setpoint
                     write_performed = True
             else:
                 self.state.charge_current_setpoint = self._last_written_ramped_a
@@ -1969,7 +1973,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Solar Batterie Manager v3.0.9.4</title>
+<title>Solar Batterie Manager v3.0.9.9</title>
 <style>
 :root{--bg:#0f1117;--bg2:#1a1d27;--bg3:#252836;
   --acc:#f59e0b;--grn:#22c55e;--red:#ef4444;--blu:#3b82f6;--vio:#a78bfa;
@@ -2017,7 +2021,7 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
 </head>
 <body>
 <div class="hd">
-  <h1>&#9889; Solar Batterie Manager <span style="font-size:0.7rem;color:var(--mut);font-weight:400">v3.0.9</span></h1>
+  <h1>&#9889; Solar Batterie Manager <span style="font-size:0.7rem;color:var(--mut);font-weight:400">v3.0.9.9</span></h1>
   <div class="hdr">
     <div class="sp"><div class="dot" id="mdot"></div><span id="mst">Verbinde...</span></div>
     <div class="sp"><div class="dot" id="edot"></div><span id="est">evcc -</span></div>
@@ -2233,7 +2237,7 @@ async function refresh(){
       </tr>`;
     }).join('');
     document.getElementById('ft').textContent=
-      `v3.0.9 | Aktualisiert: ${new Date().toLocaleTimeString('de')} - naechste in ${REFRESH/1000}s`;
+      `v3.0.9.9 | Aktualisiert: ${new Date().toLocaleTimeString('de')} - naechste in ${REFRESH/1000}s`;
   }catch(e){document.getElementById('rea').textContent='Fehler: '+e.message;}
 }
 refresh();setInterval(refresh,REFRESH);
@@ -2334,6 +2338,17 @@ def validate_config(cfg: dict, logger: logging.Logger) -> bool:
                 f"als max_charge_current ({max_a}) sein")
         if red_a < 0:
             issues.append("charging.reduced_charge_current_a muss >= 0 sein")
+    # v3.0.9.7: Dynamischer Strom im Optimal-Fenster
+    if "optimal_window_min_current_a" in cc:
+        opt_min = cc["optimal_window_min_current_a"]
+        if opt_min < 0:
+            issues.append("charging.optimal_window_min_current_a muss >= 0 sein")
+        if "reduced_charge_current_a" in cc:
+            red_a = cc["reduced_charge_current_a"]
+            if opt_min > red_a:
+                issues.append(
+                    f"charging.optimal_window_min_current_a ({opt_min}) darf nicht groesser "
+                    f"als reduced_charge_current_a ({red_a}) sein")
 
     if issues:
         for issue in issues:
@@ -2358,7 +2373,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v3.0.9.4  (Modbus TCP) - Predictive Charging")
+    logger.info("Solar Batterie Manager v3.0.9.9  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

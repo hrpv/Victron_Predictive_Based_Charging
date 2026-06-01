@@ -1,5 +1,135 @@
 # Changelog — battery_manager.py
 
+## [3.0.9.9] – 2026-06-01
+
+### Fixed
+- **GUI zeigt 0 A obwohl Cerbo auf 3 A steht — Anzeige-Bug bei Clamping**
+  Wenn `decide()` 0 A zurückgibt (idle), aber der tatsächlich geschriebene Wert
+  durch `set_max_charge_current()` auf `min_charge_current` (z.B. 3 A) geclamped
+  wird, zeigte das Dashboard fälschlicherweise 0 A statt 3 A.
+
+  Ursache: `_last_written_ramped_a` speicherte den ungeclamppten Rampenwert
+  (z.B. 5 A), nicht den tatsächlich geschriebenen Wert (3 A). Bei der nächsten
+  Hysterese-Prüfung (`abs(ramped - last_written) >= 1.0`) driftete der Vergleich,
+  weil `last_written` 5 enthielt, aber die Hardware 3 stand.
+
+  → Fix: Nach erfolgreichem Write wird `_last_written_ramped_a` jetzt auf
+  `state.charge_current_setpoint` gesetzt (der Wert, den `set_max_charge_current()`
+  tatsächlich geschrieben hat, nach Clamping). Die Hysterese vergleicht jetzt
+  gegen den echten Hardware-Wert, nicht gegen den theoretischen Rampenwert.
+
+  ```python
+  # Vorher (falsch):
+  self._last_written_ramped_a = ramped  # z.B. 5 A (ungeclamppt)
+
+  # Nachher (korrekt):
+  self._last_written_ramped_a = self.state.charge_current_setpoint  # z.B. 3 A (tatsächlich geschrieben)
+  ```
+
+---
+
+## [3.0.9.8] – 2026-06-01
+
+### Fixed
+- **Trickle-Block (Step 7) verwendete fälschlich `trickle_current` (20 A) statt sanftem Strom**
+  In v3.0.9.7 wurde `trickle_current` von 5 A auf 20 A erhöht, damit das Cellbalancing bei
+  SOC ≥ 98% funktioniert (BMS braucht Strom für Balancing). Der Trickle-Block (Step 7)
+  verwendete jedoch denselben Wert — bei SOC weit unter Ziel (z.B. 55% bei Ziel 80%)
+  wurde mit 20 A aus dem Netz geladen, obwohl kein PV-Überschuss vorhanden war.
+
+  → Fix: Trickle-Block verwendet jetzt `min_charge_current` (z.B. 3 A) statt `trickle_a`:
+  ```python
+  gentle_a = self.bat.get("min_charge_current", 5)
+  return gentle_a, "trickle", ...
+  ```
+
+  - Cellbalancing-Block (SOC ≥ 98%): Weiterhin `trickle_a` = 20 A (BMS-Anforderung)
+  - Trickle-Block (SOC weit unter Ziel, kein PV): Jetzt `gentle_a` = `min_charge_current` (Default 3 A)
+  - Keine neue Config-Option nötig — verwendet bestehendes `battery.min_charge_current`
+
+---
+
+# Changelog — battery_manager.py
+
+## [3.0.9.7] – 2026-06-01
+
+### Changed
+- **Schritt 6, Optimal-Fenster: Dynamischer Strom statt fester `reduced_a`**
+  Bisher wurde im Optimal-Fenster immer pauschal `reduced_charge_current_a` (Default 20 A) geladen.
+  Jetzt wird der Strom aus dem verbleibenden Energiebedarf berechnet:
+
+  ```
+  missing_kwh = (dyn_target - soc) / 100 * capacity_kwh
+  hours_left  = max((opt_end - h_now) + 1, 0.5)
+  required_kw = (missing_kwh * 1.15) / hours_left   # +15% Reserve
+  required_a  = (required_kw * 1000) / actual_v
+  charge_a    = max(optimal_min_a, min(required_a, reduced_a))
+  ```
+
+  - `actual_v`: Echte Batteriespannung aus Modbus (mit Fallback auf `nom_v * 0.9`)
+  - `optimal_min_a`: Neue Config-Option `charging.optimal_window_min_current_a` (Default 10 A)
+  - `reduced_a`: Bleibt als harte Obergrenze erhalten (Default 20 A)
+  - Guard: Wenn `missing_kwh <= 0.1` → sanftes Laden mit `min_charge_current` (z.B. 3 A)
+
+### Added
+- **Config-Option `charging.optimal_window_min_current_a`** (optional, Default 10 A)
+  Mindeststrom im Optimal-Fenster. Verhindert, dass der dynamische Algorithmus bei
+  geringem Energiebedarf unrealistisch niedrige Ströme (z.B. 2–3 A) vorschlägt,
+  die DVCC ignorieren würde.
+
+### Removed
+- **Unbenutzte Variable `nom_v` aus `decide()`** entfernt.
+  Die Nennspannung wird jetzt nur noch in `_simulate_hour()` verwendet.
+
+### Notes
+- Die 15% Sicherheitsreserve (`* 1.15`) puffert typische Forecast-Abweichungen
+  und Verluste (Wirkungsgrad, Temperatur) ab.
+- Der Guard `missing_kwh <= 0.1` verhindert Überladung bei fast erreichtem Ziel.
+  Er verwendet `min_charge_current` (z.B. 3 A), nicht `trickle_a` (20 A),
+  um Verwechslung mit dem Cellbalancing-Block zu vermeiden.
+- `trickle_a` (20 A) bleibt exklusiv für den Cellbalancing-Block bei SOC >= 98%.
+
+
+============================================================
+
+# Changelog — battery_manager.py
+
+## [3.0.9.6] – 2026-06-01
+
+### Changed
+- **Proportionalladung vollständig entfernt — feste Stromwerte in allen Pfaden**  
+  Die Berechnung `surplus_a = surplus_w / nom_v` (Ladestrom proportional zum PV-Überschuss) wurde ersatzlos aus allen drei Stellen in `decide()` entfernt:
+
+  1. **Morgen-Notladung** (`soc < min_required`): Bisher wurde bei `surplus_w > 200 W` proportional geladen (`min(surplus_a, max_a)`), bei fehlendem Überschuss optional `trickle_a` oder 0 A. Das erzeugte unnötige Modbus-Schreibvorgänge und verlangsamte die SOC-Erholung in einer Notlage.  
+     → Jetzt: Immer `max_a`, kein PV-Überschuss-Check, kein `morning_trickle_on_no_pv`-Flag mehr.
+
+  2. **Schritt 6, Optimal-Fenster** (`opt_start <= h_now <= opt_end`, `pv_in_optimal >= needed_kwh * 1.5`): Bisher `min(surplus_a, reduced_a)`.  
+     → Jetzt: Direkt `reduced_a` (aus `charging.reduced_charge_current_a`, Default 20 A).
+
+  3. **Schritt 6, Normalbetrieb** (`surplus_w > 200 W`): Bisher `min(surplus_a, max_a)`.  
+     → Jetzt: Direkt `max_a`.
+
+### Removed
+- **Config-Option `charging.morning_trickle_on_no_pv`** entfällt — der zugehörige Pfad existiert nicht mehr. Bestehende Einträge in `config.yaml` werden ignoriert und können entfernt werden.
+
+---
+
+## [3.0.9.5] – 2026-06-01
+
+### Fixed
+- **`_simulate_hour()`: Notfall-SOC block ignorierte `floor_soc` (Reg 2901)**  
+  Der Ladeplan zeigte Entladung bis 15.3% (04:00), 16.9% (03:00), 18.4% (02:00) — obwohl das `ESS MinimumSocLimit` (Reg 2901) auf z.B. 20% steht. Die reale Hardware würde bei 20% stoppen (State 11), die Simulation sank aber tiefer.  
+  Ursache: Im Notfall-SOC-Block (`soc_sim <= emergency_charge_soc`) wurde `max(0.0, ...)` verwendet statt `max(floor_soc, ...)`. Der `floor_soc`-Parameter (der Reg 2901 enthält) wurde ignoriert.  
+  → Fix: `soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)` — die Simulation sinkt jetzt korrekt nur bis zur harten Victron-Untergrenze (Reg 2901), nie darunter.
+
+### Verified
+- `_apply_deficit()`: ✅ verwendet `max(floor_soc, new_soc)`  
+- `needs_full`-Block: ✅ verwendet `max(floor_soc, soc_sim - ...)`  
+- Morgen-Notladung (discharging): ✅ verwendet `max(floor_soc, soc_sim - ...)`  
+- Notfall-SOC: ✅ jetzt auch `max(floor_soc, soc_sim - ...)` (v3.0.9.5 Fix)
+
+---
+
 ## [3.0.9.4] – 2026-05-31
 
 ### Fixed
