@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.9.9  (Modbus TCP, kein MQTT)
+Version: 3.0.9.10 (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -1349,7 +1349,10 @@ class ChargeController:
         proj_eve = min(max_soc, soc + self._soc_for_kwh(pv_rem))
 
         # Ziel bereits erreicht?
-        if soc >= dyn_target - hyst:
+        # v3.0.9.10: Asymmetrische Hysterese – Abschalten erst bei soc >= dyn_target
+        # (nicht bei dyn_target - hyst). Nachladen weiter unten bei soc < dyn_target - hyst.
+        # Verhindert systematischen 2%-Unterschuss durch symmetrische Hysterese.
+        if soc >= dyn_target:
             # v3.0.1: Cellbalancing-Haltezeit: bei max_soc mindestens N Stunden trickle halten
             if soc >= max_soc - hyst and time.monotonic() < self._balancing_hold_until:
                 remaining_min = int((self._balancing_hold_until - time.monotonic()) / 60)
@@ -1393,10 +1396,18 @@ class ChargeController:
                     return reduced_a, "charging", (
                         f"Morgen: Optimal-Fenster, reduzierter Ladestrom {reduced_a}A "
                         f"um PV besser auszunutzen (SOC {soc:.1f}% -> {dyn_target:.0f}%)")
-                return max_a, "charging", (
-                    f"Morgen: PV nicht ausreichend im Optimal-Fenster "
-                    f"({pv_in_optimal:.1f} kWh < {needed_kwh:.1f} kWh), "
-                    f"fruehes Laden noetig")
+                # v3.0.9.10: Logtext unterscheidet zwischen zwei Ablehnungsgründen:
+                # a) PV im Fenster ausreichend, aber SOC zu niedrig zum Warten (< min_required)
+                # b) PV im Fenster wirklich nicht ausreichend
+                if pv_in_optimal >= needed_kwh:
+                    reason = (
+                        f"SOC {soc:.1f}% < min {min_required}%, kann nicht warten; "
+                        f"PV im Fenster ausreichend ({pv_in_optimal:.1f} kWh >= {needed_kwh:.1f} kWh)")
+                else:
+                    reason = (
+                        f"PV nicht ausreichend im Optimal-Fenster "
+                        f"({pv_in_optimal:.1f} kWh < {needed_kwh:.1f} kWh)")
+                return max_a, "charging", f"Morgen: {reason}, fruehes Laden noetig"
 
         # ── 6. PV-Ueberschuss mit dynamischem Strom im Optimal-Fenster (v3.0.9.7) ──
         h_now = datetime.now().hour
@@ -1416,15 +1427,20 @@ class ChargeController:
                         f"Optimal-Fenster: Ziel fast erreicht, sanft {gentle_a}A "
                         f"(SOC {soc:.1f}% ≈ {dyn_target:.0f}%)")
 
-                # Restzeit im Fenster (in Stunden, mindestens 0.5h)
-                hours_left = max(float((opt_end - h_now) + 1), 0.5)
+                # Restzeit im Fenster (minutengenau, mindestens 0.5h)
+                # v3.0.9.10: Float-Berechnung statt Integer-Stunden, damit z.B.
+                # 11:59 im Fenster 11–15 korrekt ~3.0h statt 1.0h liefert.
+                minute_now = datetime.now().minute
+                hours_left = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
 
                 # Benoetigte Ladeleistung mit 15% Sicherheitsreserve
                 required_kw = (missing_kwh * 1.15) / hours_left
 
-                # Echte Batteriespannung verwenden, Fallback auf nom_v
-                actual_v = max(self.state.battery_voltage,
-                               self.bat.get("voltage_nominal", 48.0) * 0.9)
+                # Echte Batteriespannung verwenden; harter Boden bei 42V (LFP min)
+                # verhindert unrealistisch hohe Ströme bei Modbus-Ausfall.
+                # v3.0.9.10: Fallback-Minimum von nom_v * 0.9 auf max(42V, nom_v * 0.875) angehoben.
+                nom_v = self.bat.get("voltage_nominal", 48.0)
+                actual_v = max(self.state.battery_voltage, nom_v * 0.875, 42.0)
                 required_a = (required_kw * 1000.0) / actual_v
 
                 # Begrenzen: min_charge_current <= charge_a <= reduced_a
@@ -1573,9 +1589,12 @@ class ChargeController:
                 return "discharging", 0.0, soc_sim
 
         # Ziel erreicht?
-        if soc_sim >= dyn_target - hyst:
+        # v3.0.9.10: Asymmetrische Hysterese analog zu decide() — Simulation stoppt
+        # erst bei soc_sim >= dyn_target (nicht bei dyn_target - hyst), damit
+        # Ladeplan und Realsteuerung konsistent bleiben.
+        if soc_sim >= dyn_target:
             action, soc_sim = _apply_deficit(soc_sim)
-            # Ping-Pong-Schutz: Deficits kleiner als Hysterese-Energie
+            # Ping-Pong-Schutz: Deficits kleiner als Hysterese-Energie klemmen SOC
             hyst_kwh = hyst / 100.0 * cap
             if fc.net_kwh >= -hyst_kwh:
                 soc_sim = max(soc_sim, dyn_target - hyst)
@@ -1973,7 +1992,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Solar Batterie Manager v3.0.9.9</title>
+<title>Solar Batterie Manager v3.0.9.10</title>
 <style>
 :root{--bg:#0f1117;--bg2:#1a1d27;--bg3:#252836;
   --acc:#f59e0b;--grn:#22c55e;--red:#ef4444;--blu:#3b82f6;--vio:#a78bfa;
@@ -2021,7 +2040,7 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
 </head>
 <body>
 <div class="hd">
-  <h1>&#9889; Solar Batterie Manager <span style="font-size:0.7rem;color:var(--mut);font-weight:400">v3.0.9.9</span></h1>
+  <h1>&#9889; Solar Batterie Manager <span style="font-size:0.7rem;color:var(--mut);font-weight:400">v3.0.9.10</span></h1>
   <div class="hdr">
     <div class="sp"><div class="dot" id="mdot"></div><span id="mst">Verbinde...</span></div>
     <div class="sp"><div class="dot" id="edot"></div><span id="est">evcc -</span></div>
@@ -2237,7 +2256,7 @@ async function refresh(){
       </tr>`;
     }).join('');
     document.getElementById('ft').textContent=
-      `v3.0.9.9 | Aktualisiert: ${new Date().toLocaleTimeString('de')} - naechste in ${REFRESH/1000}s`;
+      `v3.0.9.10 | Aktualisiert: ${new Date().toLocaleTimeString('de')} - naechste in ${REFRESH/1000}s`;
   }catch(e){document.getElementById('rea').textContent='Fehler: '+e.message;}
 }
 refresh();setInterval(refresh,REFRESH);
@@ -2373,7 +2392,7 @@ def main():
     logger = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v3.0.9.9  (Modbus TCP) - Predictive Charging")
+    logger.info("Solar Batterie Manager v3.0.9.10  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 

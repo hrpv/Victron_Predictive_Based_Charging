@@ -1,6 +1,86 @@
 # Changelog — battery_manager.py
 
-## [3.0.9.9] – 2026-06-01
+## [3.0.9.10] – 2026-06-03
+
+### Fixed
+- **Asymmetrische Hysterese beim Ziel-SOC — systematischer 2%-Unterschuss**
+  Der "Ziel erreicht"-Block verwendete `soc >= dyn_target - hyst` als Abschalt-
+  bedingung. Bei `dyn_target = 66%` und `hyst = 2%` wurde bereits bei `SOC = 64%`
+  als "Ziel erreicht" gewertet und der Ladestrom auf 0 gesetzt. Da der SOC danach
+  weiter in die Nacht entlud, startete die nächste Nacht systematisch 2% unter dem
+  berechneten Ziel.
+
+  Ursache: Die Hysterese wirkte symmetrisch — sowohl als Einschaltschwelle
+  (`soc < dyn_target - hyst` → wieder laden) als auch als Abschaltschwelle
+  (`soc >= dyn_target - hyst` → Ziel "erreicht"). Das führte dazu, dass der
+  Sollwert nie wirklich erreicht wurde, nur die untere Hysterese-Grenze.
+
+  → Fix: Abschaltschwelle auf `soc >= dyn_target` angehoben (kein Unterschuss
+  mehr). Einschaltschwelle bleibt bei `soc < dyn_target - hyst` — die Hysterese
+  wirkt jetzt asymmetrisch, nur als Schutz gegen erneutes Einschalten, nicht
+  als Abschaltschwelle.
+
+  ```python
+  # Vorher (falsch — stoppt bei dyn_target - hyst, z.B. 64% statt 66%):
+  if soc >= dyn_target - hyst:
+      return 0, "idle", ...
+
+  # Nachher (korrekt — stoppt erst wenn Ziel wirklich erreicht):
+  if soc >= dyn_target:
+      return 0, "idle", ...
+  ```
+
+  Effekt: Laden bis exakt `dyn_target`, Nachladen erst unter `dyn_target - hyst`.
+  2% mehr Energie in der Nacht, kein Oszillationsrisiko.
+
+- **Irreführender Logtext bei Morgen-Verzögerung mit ausreichender PV-Prognose**
+  Wenn `pv_in_optimal >= needed_kwh` aber `soc < min_required` (SOC zu niedrig
+  zum Warten), lautete die Log-Meldung:
+
+  ```
+  Morgen: PV nicht ausreichend im Optimal-Fenster (20.0 kWh < 5.2 kWh), fruehes Laden noetig
+  ```
+
+  Der Vergleich im Text war faktisch falsch (20.0 > 5.2) — der eigentliche
+  Ablehnungsgrund war der niedrige SOC, nicht die PV-Prognose.
+
+  → Fix: Logtext unterscheidet jetzt zwischen zwei Fällen:
+
+  ```
+  # Fall a: PV ausreichend, aber SOC zu niedrig zum Warten:
+  Morgen: SOC 33.0% < min 35%, kann nicht warten; PV im Fenster ausreichend (20.0 kWh >= 5.2 kWh), fruehes Laden noetig
+
+  # Fall b: PV wirklich nicht ausreichend:
+  Morgen: PV nicht ausreichend im Optimal-Fenster (3.1 kWh < 5.2 kWh), fruehes Laden noetig
+  ```
+
+- **`_simulate_hour()`: Ziel-SOC-Abbruch inkonsistent mit `decide()` (Nachreview)**
+  Nach dem Fix in `decide()` stand in `_simulate_hour()` noch die alte Bedingung
+  `if soc_sim >= dyn_target - hyst`. Die Simulation stoppte das Laden 2% früher
+  als die Realsteuerung — der Ladeplan zeigte "idle" obwohl der echte Regler noch
+  lud. `_simulate_hour()` verwendet jetzt ebenfalls `soc_sim >= dyn_target`.
+
+- **`_simulate_hour()` / `decide()`: `hours_left` mit Minutengenauigkeit**
+  `hours_left = max((opt_end - h_now) + 1, 0.5)` arbeitete mit ganzen Stunden.
+  Um 11:59 im Fenster 11–15 lieferte das 1.0h statt ~3.0h — der berechnete
+  Ladestrom war dreifach überhöht. Korrigiert auf:
+  ```python
+  hours_left = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
+  ```
+
+- **`decide()`: Spannungs-Fallback mit hartem Minimum bei Modbus-Ausfall**
+  `actual_v = max(battery_voltage, nom_v * 0.9)` konnte bei Modbus-Ausfall
+  `battery_voltage = 0.0` liefern, Fallback dann `48 * 0.9 = 43.2V`. Für eine
+  14-kWh-LFP-Anlage unrealistisch niedrig, führte zu überhöhten `required_a`.
+  Neuer Boden: `max(battery_voltage, nom_v * 0.875, 42.0)` — 42V ist die absolute
+  LFP-Untergrenze (0% SOC), darunter ist kein realistischer Betrieb möglich.
+
+- **Dashboard-Versionsnummer nicht vollständig aktualisiert (Nachreview)**
+  `<h1>`-Tag und Footer-String zeigten noch `v3.0.9.9`. Alle vier Stellen
+  (HTML-Title, h1-Span, JS-Footer-String, `logger.info` in `main()`) auf
+  `v3.0.9.10` aktualisiert.
+
+---
 
 ### Fixed
 - **GUI zeigt 0 A obwohl Cerbo auf 3 A steht — Anzeige-Bug bei Clamping**
