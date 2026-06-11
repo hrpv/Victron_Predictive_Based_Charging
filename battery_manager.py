@@ -4,7 +4,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.9.10 (Modbus TCP, kein MQTT)
+Version: 3.0.9.24 (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
@@ -59,15 +59,126 @@ Victron Modbus-TCP Register (Cerbo GX, Unit-ID 100):
   (https://github.com/victronenergy/venus-modbus-tcp-specification)
 =============================================================
 """
+"""
+=============================================================
+CHANGELOG v3.0.9.24 (2026-06-10)
+=============================================================
+Changed:
+- _simulate_hour(): bei action=idle und SOC > floor_soc wird jetzt
+  current_a = min_charge_current (z.B. 3 A) statt 0.0 A verwendet.
+  Physikalisch korrekt: Reg. 2705 steht auch im idle-Zustand auf
+  mindestens min_charge_current — dieser Strom fliesst tatsaechlich.
+  SOC-Simulation steigt entsprechend leicht (~1 %/h bei 3 A / 48 V
+  / 100 Ah), statt konstant zu bleiben.
+  Entladesperre-Ausnahme unveraendert: SOC <= floor_soc → current_a=0,
+  SOC eingefroren (Victron ESS State 11/12).
+- _apply_deficit() gibt jetzt 3-Tupel (action, current_a, new_soc)
+  zurueck (vorher 2-Tupel ohne current_a).
+  Alle internen Aufrufe angepasst.
+- build_schedule(): Kommentar aktualisiert; Logik unveraendert korrekt
+  (effective_setpoint_a = max(current_a, min_charge_a) ist bei
+  current_a=min_charge_a idempotent).
+- Versionsstring in GUI-Titel, h1, logger.info und Datei-Header
+  auf 3.0.9.24 aktualisiert.
+
+=============================================================
+CHANGELOG v3.0.9.23 (2026-06-10)
+=============================================================
+Fixed:
+- build_schedule(): planned_current_a universell korrekt berechnet.
+  Formel gilt fuer ALLE Stunden:
+    planned_current_a = min(surplus_current_a, effective_setpoint_a)
+  wobei effective_setpoint_a = max(current_a, min_charge_current).
+  Bisher wurde bei idle/PAUSE-Stunden mit positivem Ueberschuss
+  surplus_current_a ungecappt ausgegeben (z.B. +28 A statt +3 A).
+  Physikalisch: Reg. 2705 steht immer auf mindestens min_charge_current
+  (z.B. 3 A) — DVCC begrenzt den Ladestrom entsprechend.
+  Ausnahme SOC <= floor_soc: current_a = 0 aus _simulate_hour()
+  (Victron ESS Entladesperre aktiv) wird korrekt durchgereicht -> 0 A.
+
+=============================================================
+CHANGELOG v3.0.9.22 (2026-06-09)
+=============================================================
+Changed:
+- Ladeplanung: charge_current_a zeigt jetzt tatsaechlichen/erwarteten
+  Stromfluss mit Vorzeichen statt Reg-2705-Setpoint.
+  Formel Zukunft:  min(surplus_kwh * 1000 / nom_v, setpoint_a)
+                   negativ = Entladung, positiv = Ladung
+  Formel Vergangenheit: Integration von Reg. 842 (battery_power_w)
+  ueber die Stunde -> Wh / nom_v = mittlerer Strom [A]
+- EnergyAccumulator: neues Feld bat_wh (signed Wh, + = Laden)
+  integriert state.battery_power_w analog zu pv_kwh/load_kwh.
+  update() erhaelt neuen Parameter bat_w (default 0.0).
+- HourlyHistory: neues internes Feld _hour_start_bat_wh und
+  bat_energy_wh fuer Stunden-Integral Batteriestrom.
+  charge_current_a wird am Stundenende aus bat_energy_wh / nom_v
+  berechnet (Mittelwert), nicht mehr aus charge_current_setpoint.
+- build_schedule(): Zukunftsstunden berechnen planned_current_a
+  aus fc.net_kwh * 1000 / nom_v, gecappt an setpoint_a (signed).
+  Vergangene Stunden: charge_current_a direkt aus HourlyHistory
+  (integrierter Istwert).
+- Dashboard-Tabelle: Spalte "Strom" zeigt Vorzeichen (+/-),
+  gruen fuer Ladung, rot fuer Entladung, gedimmt fuer Prognose.
+
+=============================================================
+CHANGELOG v3.0.9.21 (2026-06-09)
+=============================================================
+Fixed:
+- Simulation unterschritt Reg 2901 ESS MinimumSocLimit im Notfall-Pfad:
+  _simulate_hour() verwendete max(0.0, ...) statt max(floor_soc, ...)
+  wenn soc_sim <= emergency_charge_soc und kein PV-Überschuss vorlag.
+  Da emergency_charge_soc == Reg 2901 (20%), sank der projizierte SOC
+  fälschlicherweise unter 20% (Dashboard zeigte z.B. 15.5%).
+  In der Realität verhindert Victron ESS die Entladung unter Reg 2901
+  durch Netzbezug — die Simulation muss diesen Boden einhalten.
+  Fix: max(0.0, ...) → max(floor_soc, ...) im discharging-Zweig des
+  Notfall-SOC-Blocks (_simulate_hour, Zeile ~1753).
+  Hinweis: emergency_charge_soc in config.yaml ist nur informativer
+  Fallback für den Fall dass Reg 2901 nicht gelesen werden kann.
+
+"""
+
+"""
+=============================================================
+CHANGELOG v3.0.9.20 (2026-06-08)
+=============================================================
+Fixed:
+- Trickle-Pfad griff auch bei vorhandenem PV-Überschuss (Bug #2):
+  decide() Pfad 7 (Trickle) hatte keinen Überschuss-Check. Wenn
+  grid_w kurzzeitig nahe 0 lag (z.B. nach evcc-Stop, Messrauschen)
+  ergab surplus_w fälschlicherweise 0 → Trickle statt Laden.
+  Fix: Trickle nur noch wenn raw_surplus_w < 200 W.
+  Neue Variable raw_surplus_w = max(0, pv_w - load_w) als Guard.
+
+- Hysterese fror falsche Entscheidung bis zu 10 Minuten ein (Bug #3):
+  force_new wurde nur bei SOC-Notfällen gesetzt. Massiver Export
+  (z.B. −1500 W nach evcc-Stop) und evcc-Statuswechsel lösten kein
+  force_new aus → Trickle/Idle blieb unnötig lange aktiv.
+  Fix: force_new bei grid_power_w < −1000 W (massiver Export) und
+  bei evcc-Statuswechsel (Start/Stop).
+
+CHANGELOG v3.0.9.19 (2026-06-07)
+=============================================================
+Fixed:
+- Heartbeat-Thread erhielt NameError weil dedup_stream nicht in
+  start_dashboard() sichtbar war (nur local in main()).
+  Fix: dedup_stream wird jetzt als Parameter übergeben.
+  Zusätzlich: dedup_file wird auch zurückgegeben (sauberere API).
+  Ergebnis: Journal zeigt alle 20 Minuten [IDLE]-Heartbeat,
+  unabhängig von Browser-Aktivität.
+
+"""
+
 
 import json
+import re
 import logging
 import logging.handlers
 import math
 import sys
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 from typing import Optional
 import threading
@@ -102,6 +213,7 @@ class SystemState:
     battery_voltage: float = 0.0
     battery_current: float = 0.0           # + = laden, - = entladen
     battery_power_w: float = 0.0            # int16, direkt W, + = laden, - = entladen
+    bat_energy_today_wh: float = 0.0        # signed Wh heute (EnergyAccumulator.bat_wh)
     charge_current_setpoint: float = 0.0   # zuletzt geschriebener Wert [A]
     charge_mode: str = "idle"              # idle|charging|full_charge
     charge_reason: str = ""
@@ -161,6 +273,11 @@ class HourlyHistory:
     # NEU: Kumulativwerte zu Stundenbeginn (fuer korrekte Stundensumme)
     _hour_start_pv_total: float = 0.0
     _hour_start_cons_total: float = 0.0
+    # Batteriestrom-Integration (Reg. 842): signed Wh pro Stunde
+    # charge_current_a wird am Stundenende daraus berechnet: bat_energy_wh / nom_v
+    bat_energy_wh: float = 0.0            # integrierter Batterieenergiefluss [Wh], signed
+    _hour_start_bat_wh: float = 0.0       # EnergyAccumulator.bat_wh zu Stundenbeginn
+    _raw_bat_wh: float = 0.0              # letzter EnergyAccumulator.bat_wh-Wert
 
 def load_config(config_path: str = "config.yaml") -> dict:
     path = Path(config_path)
@@ -174,16 +291,133 @@ def load_config(config_path: str = "config.yaml") -> dict:
 # Logging
 # ─────────────────────────────────────────────
 
-def setup_logging(cfg: dict) -> logging.Logger:
+class DeduplicatingFilter(logging.Filter):
+    """
+    Deduplizierungs-Filter mit Heartbeat (v3.0.9.19).
+
+    Unterdrückt aufeinanderfolgende identische Log-Nachrichten.
+    Erzwingt trotzdem alle N Minuten einen Heartbeat-Log, damit man
+    sieht dass das Programm noch lebt — auch wenn sich der Zustand
+    nicht geändert hat.
+
+    Der Heartbeat-Marker wird direkt ins record.msg geschrieben,
+    kein separater Formatter nötig.
+
+    Konfigurierbar via config.yaml:
+      logging:
+        dedup_heartbeat_minutes: 20   # Default: 20 Minuten
+        dedup_enabled: true           # Default: true
+    """
+    def __init__(self, heartbeat_minutes: float = 20.0, enabled: bool = True):
+        super().__init__()
+        self._enabled = enabled
+        self._heartbeat_s = heartbeat_minutes * 60.0
+        self._last_msg: str = ""
+        self._last_ts: float = 0.0
+        self._lock = threading.Lock()
+        # Handler-Referenz für emit_heartbeat_if_due(); wird von
+        # setup_logging() nach Handler-Erstellung gesetzt.
+        self._handler: Optional[logging.Handler] = None
+
+    def _normalize(self, msg: str) -> str:
+        """
+        Normalisiert Log-Nachrichten für den Vergleich.
+        Entfernt variable Teile (Datum, Zeit, IP, Pfad) aus bekannten
+        Log-Mustern, damit z.B. alle Dashboard-HTTP-Requests (GET /,
+        GET /api/state, …) als identisch erkannt werden.
+
+        Behandelte Muster:
+        1. Werkzeug Access-Log (normales Format):
+           '192.168.168.60 - - [06/Jun/2026 13:04:19] "GET /api/state HTTP/1.1" 200 -'
+        2. Werkzeug Access-Log mit %s-Platzhaltern (internes Format, noch
+           nicht durch getMessage() expandiert — tritt auf wenn record.args
+           nicht None ist):
+           '"%s" %s %s'  →  normalisiert auf "HTTP_ACCESS"
+        """
+        # Muster 1: vollständig formatierter Werkzeug-Access-Log-Eintrag
+        # Alle HTTP-Methoden und alle Pfade werden zu "HTTP_ACCESS" zusammengefasst,
+        # damit GET / und GET /api/state denselben Heartbeat-Bucket teilen.
+        if re.match(
+                r'^[\d\.]+\s+-\s+-\s+\[.+?\]\s+"(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+\S+\s+HTTP/\d\.\d"\s+\d+',
+                msg):
+            return "HTTP_ACCESS"
+        # Muster 2: Werkzeug-internes %s-Format (record.args noch gesetzt)
+        # Tritt auf wenn filter() vor getMessage() auf record.msg schaut.
+        # Sicherheitsnetz: auch diese Variante zu HTTP_ACCESS normalisieren.
+        if re.match(r'^"%s"\s+%s\s+%s', msg):
+            return "HTTP_ACCESS"
+        return msg
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not self._enabled:
+            return True
+        # getMessage() liefert den vollständig formatierten String
+        # (record.args werden eingesetzt), unabhängig davon ob Werkzeug
+        # intern noch %s-Templates verwendet.
+        formatted = record.getMessage()
+        msg = self._normalize(formatted)
+        now = time.monotonic()
+
+        with self._lock:
+            if msg == self._last_msg:
+                # Identische Nachricht — Heartbeat fällig?
+                if (now - self._last_ts) >= self._heartbeat_s:
+                    # Heartbeat: record.msg auf den bereits formatierten String
+                    # setzen und args leeren, damit kein doppeltes %-Formatting
+                    # stattfindet (verhindert '"%s" %s %s (Heartbeat)' im Journal).
+                    self._last_ts = now
+                    record.msg = formatted + " (Heartbeat)"
+                    record.args = None
+                    return True
+                # Kein Heartbeat: unterdrücken
+                return False
+            else:
+                # Bucket wechseln — Timer NICHT zurücksetzen.
+                # Der 20-Minuten-Takt läuft absolut weiter, unabhängig davon
+                # ob zwischendurch andere Nachrichten erscheinen.
+                self._last_msg = msg
+                return True
+
+    def emit_heartbeat_if_due(self) -> None:
+        """
+        Vom Hintergrund-Thread aufgerufen (alle 60s). Prüft ob der
+        Heartbeat fällig ist und schreibt einen synthetischen LogRecord
+        direkt an self._handler — ohne erneut durch filter() zu laufen.
+        Dadurch wird _last_msg nicht durch einen Fremd-String korrumpiert,
+        und der nächste echte Log-Eintrag wird weiterhin korrekt dedupliziert.
+        """
+        if not self._enabled or self._handler is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if not self._last_msg:
+                return
+            if (now - self._last_ts) < self._heartbeat_s:
+                return
+            self._last_ts = now
+            last_msg = self._last_msg
+        # LogRecord direkt an Handler schreiben, Filter wird übersprungen.
+        if last_msg == "HTTP_ACCESS":
+            text = "- (Heartbeat: kein Browser-Request seit 20min)"
+        else:
+            text = last_msg + " (Heartbeat)"
+        r = logging.LogRecord(
+            name="heartbeat", level=logging.INFO,
+            pathname="", lineno=0, msg=text, args=None, exc_info=None)
+        self._handler.emit(r)
+
+def setup_logging(cfg: dict) -> tuple[logging.Logger, DeduplicatingFilter, DeduplicatingFilter]:
     log_cfg = cfg.get("logging", {})
     log_file = log_cfg.get("file", "battery_manager.log")
     log_level = getattr(logging, log_cfg.get("level", "INFO"))
     max_bytes = log_cfg.get("max_size_mb", 10) * 1024 * 1024
     backup = log_cfg.get("backup_count", 3)
+    dedup_enabled = log_cfg.get("dedup_enabled", True)
+    dedup_heartbeat = log_cfg.get("dedup_heartbeat_minutes", 20.0)
 
     logger = logging.getLogger("BatteryManager")
     if logger.handlers:
-        return logger
+        return logger, None, None
     logger.setLevel(log_level)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
@@ -191,33 +425,49 @@ def setup_logging(cfg: dict) -> logging.Logger:
     import os
     is_systemd = bool(os.environ.get("INVOCATION_ID"))
 
+    # Je eine eigene Dedup-Instanz pro Handler (v3.0.9.19).
+    # FileHandler und StreamHandler dürfen NICHT dieselbe Instanz teilen:
+    # der FileHandler würde bei jedem [IDLE]-Durchlauf _last_ts aktualisieren
+    # und damit den Heartbeat-Timer des StreamHandlers (Journal) stören.
+    dedup_file   = DeduplicatingFilter(heartbeat_minutes=dedup_heartbeat, enabled=dedup_enabled)
+    dedup_stream = DeduplicatingFilter(heartbeat_minutes=dedup_heartbeat, enabled=dedup_enabled)
+
     if is_systemd:
-        # Systemd-Journal: stdout/stderr werden von journalctl erfasst.
-        # FileHandler nur wenn explizit gewuenscht (nicht 'journal' oder leer).
         if log_file and log_file.lower() not in ("", "null", "/dev/null", "journal"):
             Path(log_file).parent.mkdir(parents=True, exist_ok=True)
             fh = logging.handlers.RotatingFileHandler(
                 log_file, maxBytes=max_bytes, backupCount=backup)
             fh.setFormatter(fmt)
+            fh.addFilter(dedup_file)
+            dedup_file._handler = fh
             logger.addHandler(fh)
-        # StreamHandler fuer journalctl (StandardOutput=journal im Service)
         ch = logging.StreamHandler()
         ch.setFormatter(fmt)
+        ch.addFilter(dedup_stream)
+        dedup_stream._handler = ch
         logger.addHandler(ch)
     else:
-        # Manueller Start: File + Console
         if log_file:
             Path(log_file).parent.mkdir(parents=True, exist_ok=True)
             fh = logging.handlers.RotatingFileHandler(
                 log_file, maxBytes=max_bytes, backupCount=backup)
             fh.setFormatter(fmt)
+            fh.addFilter(dedup_file)
+            dedup_file._handler = fh
             logger.addHandler(fh)
         ch = logging.StreamHandler()
         ch.setFormatter(fmt)
+        ch.addFilter(dedup_stream)
+        dedup_stream._handler = ch
         logger.addHandler(ch)
 
+    if dedup_enabled:
+        logger.info(
+            f"Deduplizierung aktiv: identische Zeilen werden unterdrückt, "
+            f"Heartbeat alle {dedup_heartbeat:.0f} Minuten")
+
     logger.propagate = False
-    return logger
+    return logger, dedup_file, dedup_stream
 
 
 # ─────────────────────────────────────────────
@@ -636,8 +886,8 @@ class VrmForecastManager:
             self.logger.info(f"VRM API Request: {url}")
             self.logger.info(
                 f"VRM Zeitbereich lokal: {start} bis {end}  |  "
-                f"UTC: {datetime.utcfromtimestamp(start_unix)} bis "
-                f"{datetime.utcfromtimestamp(end_unix)}"
+                f"UTC: {datetime.fromtimestamp(start_unix, tz=timezone.utc)} bis "
+                f"{datetime.fromtimestamp(end_unix, tz=timezone.utc)}"
             )
 
             resp = requests.get(url, headers=self._headers(),
@@ -1011,15 +1261,17 @@ class EnergyAccumulator:
         self._last_ts: Optional[float] = None
         self._last_pv:  float = 0.0
         self._last_ld:  float = 0.0
+        self._last_bat: float = 0.0
         self._day: Optional[date] = None
         self.pv_kwh:   float = 0.0
         self.load_kwh: float = 0.0
+        self.bat_wh:   float = 0.0   # signed Wh: + = Laden, - = Entladen
 
-    def update(self, pv_w: float, load_w: float):
+    def update(self, pv_w: float, load_w: float, bat_w: float = 0.0):
         now_ts = time.monotonic()
         today  = date.today()
         if self._day and self._day != today:   # Tageswechsel
-            self.pv_kwh = self.load_kwh = 0.0
+            self.pv_kwh = self.load_kwh = self.bat_wh = 0.0
         self._day = today
         if self._last_ts is not None:
             dt_s = now_ts - self._last_ts
@@ -1027,15 +1279,18 @@ class EnergyAccumulator:
             # Zeitstempel aber NICHT aktualisiert, damit das naechste
             # gueltiges Update das korrekte Intervall sieht.
             if dt_s < self.MIN_UPDATE_INTERVAL_S:
-                self._last_pv = pv_w
-                self._last_ld = load_w
+                self._last_pv  = pv_w
+                self._last_ld  = load_w
+                self._last_bat = bat_w
                 return
             dt_h = dt_s / 3600.0
-            self.pv_kwh   += self._last_pv * dt_h / 1000.0
-            self.load_kwh += self._last_ld * dt_h / 1000.0
-        self._last_ts = now_ts
-        self._last_pv = pv_w
-        self._last_ld = load_w
+            self.pv_kwh   += self._last_pv  * dt_h / 1000.0
+            self.load_kwh += self._last_ld  * dt_h / 1000.0
+            self.bat_wh   += self._last_bat * dt_h   # Wh, signed (W * h = Wh)
+        self._last_ts  = now_ts
+        self._last_pv  = pv_w
+        self._last_ld  = load_w
+        self._last_bat = bat_w
 
 
 # ─────────────────────────────────────────────
@@ -1109,6 +1364,7 @@ class ChargeController:
         # damit der EnergyAccumulator nach Neustart korrekt weiterlaeuft
         self._energy_base_pv:   float = 0.0
         self._energy_base_load: float = 0.0
+        self._energy_base_bat:  float = 0.0   # Wh, signed
         self._load_energy_base()
         # Hysterese: Mindestdauer einer Ladeentscheidung
         self._last_decision_ts: float = 0.0
@@ -1141,6 +1397,7 @@ class ChargeController:
                     # Selber Tag: Basis wiederherstellen
                     self._energy_base_pv   = float(data.get("energy_base_pv",   0.0))
                     self._energy_base_load = float(data.get("energy_base_load", 0.0))
+                    self._energy_base_bat  = float(data.get("energy_base_bat",  0.0))
                     self.logger.info(
                         f"Energie-Basis geladen: PV={self._energy_base_pv:.3f} kWh, "
                         f"Last={self._energy_base_load:.3f} kWh")
@@ -1174,6 +1431,7 @@ class ChargeController:
             # Aktuellen Gesamtenergie-Stand = Akkumulator + Basis aus letztem Neustart
             pv_total   = self.state.pv_energy_today_kwh   + self._energy_base_pv
             load_total = self.state.load_energy_today_kwh + self._energy_base_load
+            bat_total  = self.state.bat_energy_today_wh   + self._energy_base_bat
             payload = json.dumps({
                 "last_full_charge_date":   self.state.last_full_charge_date,
                 "days_since_full_charge":  self.state.days_since_full_charge,
@@ -1185,6 +1443,7 @@ class ChargeController:
                 "energy_date":             date.today().isoformat(),
                 "energy_base_pv":          round(pv_total,   3),
                 "energy_base_load":        round(load_total, 3),
+                "energy_base_bat":         round(bat_total,  1),
             }, indent=2)
             # Atomic write: erst in Temp-Datei, dann atomares rename().
             # Verhindert korrupte state.json bei Stromausfall waehrend des Schreibens.
@@ -1282,12 +1541,46 @@ class ChargeController:
         dyn_target = self._calculate_target_soc()
         self.state.target_soc = round(dyn_target, 1)
 
-        # ── Zentrale Leistungsglättung (v3.0.9.3) ─────────────
+        # ── Zentrale Leistungsglättung (v3.0.9.11) ────────────
         # Einmal pro Zyklus geglättet, alle Verzweigungen nutzen dieselben Werte
         pv_raw   = self.state.pv_power_w
         load_raw = self.state.load_power_w
         pv_w, load_w = self._power_smoother.update(pv_raw, load_raw)
-        surplus_w = max(0.0, pv_w - load_w)
+
+        # NEU: Zuverlässiger Überschuss über Grid-Leistung (v3.0.9.11)
+        # Grid-Power: + = Bezug (Netzimport), - = Einspeisung (Export)
+        # Export = wirklicher Überschuss, der ins Netz geht oder in den Akku könnte.
+        # Grid ist zuverlässiger als PV-Load weil es alle Verluste, DC-Lasten
+        # und den aktuellen Batterieladestrom automatisch mitberücksichtigt.
+        grid_w = self.state.grid_power_w
+
+        # Surplus = negativer Grid-Bezug = Export = verfügbarer Überschuss
+        # Mindestens 50W Export (Toleranz für Messrauschen), sonst kein echter Überschuss.
+        # Bei positiver Grid-Leistung (Import): surplus = 0 (kein Überschuss).
+        surplus_from_grid = max(0.0, -grid_w) if grid_w < -50 else 0.0
+
+        # Rohüberschuss: PV - Last (ohne Batteriekorrektur).
+        # load_w ist AC-seitig gemessen und enthält den Batterie-Ladestrom NICHT →
+        # ein zusätzlicher Abzug von battery_power_w wäre eine Doppelkorrektur.
+        # raw_surplus_w dient sowohl als Fallback (wenn Grid-Messung nahe 0) als
+        # auch als Guard im Trickle-Pfad. (v3.0.9.20 Bugfix: war pv_w - load_w - battery_charge_w)
+        raw_surplus_w = max(0.0, pv_w - load_w)
+
+        # Verwende Grid-basierten Überschuss wenn verfügbar (aussagekräftig),
+        # sonst Rohüberschuss PV-Last. Grid ist zuverlässiger weil es alle Verluste
+        # und DC-Lasten automatisch mitberücksichtigt.
+        if abs(grid_w) > 50:  # Grid-Messung aktiv und aussagekräftig
+            surplus_w = surplus_from_grid
+            surplus_source = "Grid"
+        else:
+            surplus_w = raw_surplus_w
+            surplus_source = "PV-Load"
+
+        self.logger.debug(
+            f"Surplus: Grid={grid_w:.0f}W, PV={pv_w:.0f}W, Load={load_w:.0f}W, "
+            f"raw={raw_surplus_w:.0f}W → surplus={surplus_w:.0f}W "
+            f"(Quelle: {surplus_source})"
+        )
 
         # ── Effektiver Min-SOC: evcc kann diesen angehoben haben ─
         effective_min_soc = self.bat["min_soc"]
@@ -1409,56 +1702,67 @@ class ChargeController:
                         f"({pv_in_optimal:.1f} kWh < {needed_kwh:.1f} kWh)")
                 return max_a, "charging", f"Morgen: {reason}, fruehes Laden noetig"
 
-        # ── 6. PV-Ueberschuss mit dynamischem Strom im Optimal-Fenster (v3.0.9.7) ──
+        # ── 6. PV-Ueberschuss mit dynamischem Strom (v3.0.9.11) ──
+        # Überschuss wird über Grid-Leistung bestimmt (zuverlässiger als PV-Load),
+        # oder als Fallback PV - Load - Battery_Charge. Der tatsächlich verfügbare
+        # Überschuss limitiert den Ladestrom — nie mehr Strom setzen als PV liefert.
         h_now = datetime.now().hour
         opt_start, opt_end = self._get_optimal_charge_window()
+
+        # Maximal sinnvoller Ladestrom aus verfügbarem Überschuss.
+        # Bei 50V Akkuspannung: 1A ≈ 50W. Nie mehr Strom fordern als Überschuss
+        # vorhanden ist — sonst wird aus dem Netz geladen (Grid-Bezug).
+        nom_v = self.bat.get("voltage_nominal", 48.0)
+        actual_v = max(self.state.battery_voltage, nom_v * 0.875, 42.0)
+        max_from_surplus = surplus_w / actual_v if surplus_w > 0 else 0.0
+
         if opt_start <= h_now <= opt_end and surplus_w > 200:
             needed_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
             fc_list = self.forecast.get_forecast()
             pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
             if pv_in_optimal >= needed_kwh * 1.5:
-                # Dynamischer Strom basierend auf verbleibendem Energiebedarf
                 missing_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
 
                 if missing_kwh <= 0.1:
-                    # Ziel praktisch erreicht (0.1 kWh ≈ 0.7% bei 14 kWh)
                     gentle_a = self.bat.get("min_charge_current", 5)
                     return gentle_a, "trickle", (
                         f"Optimal-Fenster: Ziel fast erreicht, sanft {gentle_a}A "
                         f"(SOC {soc:.1f}% ≈ {dyn_target:.0f}%)")
 
-                # Restzeit im Fenster (minutengenau, mindestens 0.5h)
-                # v3.0.9.10: Float-Berechnung statt Integer-Stunden, damit z.B.
-                # 11:59 im Fenster 11–15 korrekt ~3.0h statt 1.0h liefert.
                 minute_now = datetime.now().minute
                 hours_left = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
-
-                # Benoetigte Ladeleistung mit 15% Sicherheitsreserve
                 required_kw = (missing_kwh * 1.15) / hours_left
-
-                # Echte Batteriespannung verwenden; harter Boden bei 42V (LFP min)
-                # verhindert unrealistisch hohe Ströme bei Modbus-Ausfall.
-                # v3.0.9.10: Fallback-Minimum von nom_v * 0.9 auf max(42V, nom_v * 0.875) angehoben.
-                nom_v = self.bat.get("voltage_nominal", 48.0)
-                actual_v = max(self.state.battery_voltage, nom_v * 0.875, 42.0)
                 required_a = (required_kw * 1000.0) / actual_v
 
-                # Begrenzen: min_charge_current <= charge_a <= reduced_a
                 optimal_min_a = self.cc.get("optimal_window_min_current_a", 10)
                 reduced_a = self.cc.get("reduced_charge_current_a", 20)
-                charge_a = max(optimal_min_a, min(required_a, reduced_a))
+
+                # v3.0.9.11: Auch im Optimal-Fenster durch Überschuss limitieren!
+                # Nie mehr Strom als verfügbarer Überschuss erlaubt.
+                charge_a = min(max_from_surplus, required_a, reduced_a)
+                charge_a = max(optimal_min_a, charge_a)
 
                 return charge_a, "charging", (
-                    f"Optimal-Fenster dynamisch: {charge_a:.0f}A "
-                    f"({missing_kwh:.1f} kWh in {hours_left:.1f}h, "
-                    f"reserve +15%)")
+                    f"Optimal-Fenster: Überschuss {surplus_w:.0f}W [{surplus_source}] → "
+                    f"max {max_from_surplus:.1f}A, setze {charge_a:.0f}A "
+                    f"({missing_kwh:.1f} kWh in {hours_left:.1f}h, reserve +15%)")
 
         if surplus_w > 200:
-            return max_a, "charging", (
-                f"PV-Ueberschuss {surplus_w:.0f} W -> {max_a:.0f} A "
-                f"(SOC {soc:.1f}% -> Ziel {dyn_target:.0f}%)")
+            # v3.0.9.11: Strom auf tatsächlich verfügbaren Überschuss limitieren.
+            # Beispiel: 292W Überschuss / 50V = 5.8A → max 6A, nicht 50A!
+            charge_a = min(max_from_surplus, max_a)
+            # Mindestens min_charge_current, aber nie mehr als Überschuss erlaubt
+            charge_a = max(self.bat.get("min_charge_current", 3), charge_a)
+            return charge_a, "charging", (
+                f"PV-Überschuss {surplus_w:.0f}W [{surplus_source}] → "
+                f"max {max_from_surplus:.1f}A, setze {charge_a:.0f}A "
+                f"(SOC {soc:.1f}% → Ziel {dyn_target:.0f}%)")
         # ── 7. Trickle ────────────────────────────────────────
-        if soc < dyn_target - 10:
+        # Nur wenn wirklich kein PV-Überschuss vorhanden (raw_surplus_w < 200 W).
+        # Verhindert Trickle bei vorhandenem Überschuss wenn Grid-Messung kurz
+        # nahe 0 liegt (z.B. nach evcc-Stop, Messrauschen) und surplus_w dadurch
+        # fälschlicherweise 0 ergibt. (v3.0.9.20 Bugfix)
+        if soc < dyn_target - 10 and raw_surplus_w < 200:
             gentle_a = self.bat.get("min_charge_current", 5)
             return gentle_a, "trickle", (
                 f"SOC {soc:.1f}% weit unter Ziel {dyn_target:.0f}%, "
@@ -1510,6 +1814,7 @@ class ChargeController:
 
         action = "idle"
         current_a = 0.0
+        min_charge_a = float(self.bat.get("min_charge_current", 3.0))
 
         # Maximale Ladeenergie pro Stunde durch Strombegrenzung
         max_charge_kwh = max_a * nom_v / 1000.0  # z.B. 50A * 48V / 1000 = 2.4 kWh
@@ -1522,9 +1827,8 @@ class ChargeController:
             charge_kwh = min(fc.net_kwh, max_charge_kwh)
             soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             return action, current_a, soc_sim
-        # Wenn SOC < min_soc und KEIN PV-Ueberschuss: Normale Defizit-Logik
-        # läuft weiter. Der SOC sinkt physikalisch korrekt bis floor_soc
-        # (Reg 2901). Kein künstliches Einfrieren.
+        # Wenn SOC < min_soc und KEIN PV-Ueberschuss: weiter zum Notfall-SOC-Block.
+        # Bei soc <= floor_soc friert der SOC ein (Victron ESS, s.u.).
 
         # Notfall-SOC
         if soc_sim <= self.cc.get("emergency_charge_soc", 25):
@@ -1535,12 +1839,18 @@ class ChargeController:
                 charge_kwh = min(fc.net_kwh, max_charge_kwh)
                 soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             else:
-                # ESS-Modus (DE): kein Netzbezug moeglich -> Akku entlaedt sich trotz Notfall
-                # action = "discharging" zeigt im Dashboard den echten Zustand
+                # Kein PV-Ueberschuss und SOC <= emergency_charge_soc (= floor_soc):
+                # Victron ESS sperrt Batterieentladung unter Reg 2901 — Verbraucher
+                # werden aus dem Netz gespeist, SOC bleibt konstant.
+                # State 11 (SOC < MinSOC): Entladen gesperrt.
+                # State 12 (Minimal-Ladung aus Netz): erhoeht SOC nicht nennenswert,
+                # wird in der Simulation nicht modelliert (kein PV-Ueberschuss-Pfad).
                 action = "discharging"
                 current_a = 0.0
-                deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-                soc_sim = max(0.0, soc_sim - (deficit / cap) * 100)
+                if soc_sim > floor_soc:
+                    deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+                    soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)
+                # soc_sim <= floor_soc: SOC eingefroren
             return action, current_a, soc_sim
 
         if needs_full and soc_sim < max_soc - hyst:
@@ -1551,24 +1861,45 @@ class ChargeController:
                 charge_kwh = min(fc.net_kwh, max_charge_kwh)
                 soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             else:
-                # ESS-Modus (DE): kein Netzbezug moeglich! Akku entlaedt sich trotz
-                # gesetztem Ladestrom, da Last > PV. Vollladung wird naechsten Tag/PV versucht.
+                # Kein PV-Ueberschuss und SOC >= floor_soc:
+                # Victron ESS sperrt Batterieentladung unter floor_soc (Reg 2901) —
+                # Verbraucher werden aus dem Netz gespeist, Batterie weder geladen
+                # noch entladen. SOC friert bei floor_soc ein.
+                # Vollladung wird naechsten Tag / bei ausreichend PV nachgeholt.
                 action = "full_charge"  # Soll-Aktion bleibt (Setpoint wird geschrieben)
-                current_a = max_a       # Setpoint bleibt, aber Netz laedt nicht
-                deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-                soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)
+                current_a = max_a       # Setpoint bleibt, aber Netz laedt nicht in Batterie
+                if soc_sim > floor_soc:
+                    deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+                    soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)
+                # soc_sim <= floor_soc: SOC eingefroren, kein Deficit abziehen
             return action, current_a, soc_sim
 
-        def _apply_deficit(soc: float) -> tuple[str, float]:
-            """Berechnet Deficit und setzt action: discharging wenn Ueberschuss negativ, sonst idle."""
+        def _apply_deficit(soc: float) -> tuple[str, float, float]:
+            """Berechnet Deficit und setzt action: discharging wenn Ueberschuss negativ, sonst idle.
+
+            Bei soc <= floor_soc (Reg 2901 ESS MinimumSocLimit):
+            Victron ESS sperrt die Batterieentladung — Verbraucher werden aus dem Netz
+            gespeist, Batterie weder geladen noch entladen. SOC bleibt konstant.
+            max(floor_soc, ...) bildet dieses Verhalten ab.
+
+            v3.0.9.24: Reg. 2705 steht auch im idle-Zustand auf mindestens
+            min_charge_current (3 A). Bei soc > floor_soc fliesst dieser Strom
+            tatsaechlich in die Batterie (~1 %/h bei 3 A / 48 V / 100 Ah).
+            Die Simulation bildet das ab: current_a = min_charge_a, SOC steigt leicht.
+            Ausnahme: soc <= floor_soc → current_a = 0 (Entladesperre, kein Laden).
+            """
             deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
-            new_soc = soc - (deficit / cap) * 100
-            # Harte Untergrenze: Victron ESS MinimumSocLimit (Reg 2901) verhindert
-            # Entladung unter diesen Wert (State 11). Die Simulation darf nicht
-            # darunter sinken, da die Hardware diesen Boden durchsetzt.
-            new_soc = max(floor_soc, new_soc)
             act = "discharging" if fc.net_kwh < 0 else "idle"
-            return act, new_soc
+            if soc > floor_soc:
+                # Trickle: min_charge_a fliesst, netto SOC-Aenderung =
+                # (min_charge_kwh - deficit_kwh), aber nie unter floor_soc.
+                trickle_kwh = min_charge_a * nom_v / 1000.0
+                new_soc = soc + ((trickle_kwh - deficit) / cap) * 100
+                new_soc = max(floor_soc, new_soc)
+                return act, min_charge_a, new_soc
+            else:
+                # SOC <= floor_soc: Entladesperre aktiv, SOC eingefroren
+                return act, 0.0, soc
 
         # Morgen-Notladung in der Simulation (v3.0.4)
         # Wenn SOC unter min_required: Sofort laden bei Ueberschuss, aber nur
@@ -1583,7 +1914,8 @@ class ChargeController:
                 soc_sim = min(min_required, soc_sim + (charge_kwh / cap) * 100)
                 return action, current_a, soc_sim
             else:
-                # Kein Ueberschuss: Akku entlaedt sich trotz Bedarf (ESS-Modus)
+                # Kein PV-Ueberschuss: Victron ESS sperrt Batterieentladung bei
+                # soc <= floor_soc — SOC friert ein, Verbraucher aus Netz gespeist.
                 deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
                 soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)
                 return "discharging", 0.0, soc_sim
@@ -1593,7 +1925,7 @@ class ChargeController:
         # erst bei soc_sim >= dyn_target (nicht bei dyn_target - hyst), damit
         # Ladeplan und Realsteuerung konsistent bleiben.
         if soc_sim >= dyn_target:
-            action, soc_sim = _apply_deficit(soc_sim)
+            action, current_a, soc_sim = _apply_deficit(soc_sim)
             # Ping-Pong-Schutz: Deficits kleiner als Hysterese-Energie klemmen SOC
             hyst_kwh = hyst / 100.0 * cap
             if fc.net_kwh >= -hyst_kwh:
@@ -1612,7 +1944,7 @@ class ChargeController:
             # Wenn Stunde noch vor dem optimalen Fenster und SOC nicht kritisch -> warte
             if h < opt_start:
                 if soc_sim >= min_required:
-                    action, soc_sim = _apply_deficit(soc_sim)
+                    action, current_a, soc_sim = _apply_deficit(soc_sim)
                     return action, current_a, soc_sim
 
             # Fruehes Laden noetig oder im optimalen Fenster
@@ -1627,7 +1959,7 @@ class ChargeController:
                 charge_kwh = min(fc.net_kwh, current_a * nom_v / 1000.0)
                 soc_sim = min(dyn_target, soc_sim + (charge_kwh / cap) * 100)
             else:
-                action, soc_sim = _apply_deficit(soc_sim)
+                action, current_a, soc_sim = _apply_deficit(soc_sim)
             return action, current_a, soc_sim
 
         # PV-Ueberschuss mit adaptivem Strom (v3.0.0)
@@ -1643,7 +1975,7 @@ class ChargeController:
             # Deckelung auf dyn_target (nicht max_soc)
             soc_sim = min(dyn_target, soc_sim + (charge_kwh / cap) * 100)
         else:
-            action, soc_sim = _apply_deficit(soc_sim)
+            action, current_a, soc_sim = _apply_deficit(soc_sim)
 
         return action, current_a, soc_sim
     def build_schedule(self) -> list:
@@ -1742,13 +2074,32 @@ class ChargeController:
                 floor_soc=floor_soc
             )
 
+            # Geplanter Stromfluss: universelle Formel fuer alle Stunden:
+            #   planned_current_a = min(surplus_current_a, effective_setpoint_a)
+            # effective_setpoint_a = max(current_a, min_charge_current)
+            # Begruendung: Reg. 2705 steht immer auf mindestens min_charge_current
+            # (write_charge_current() clampt auf min_charge_current als Untergrenze).
+            # v3.0.9.24: _simulate_hour() gibt bei idle (soc > floor_soc) bereits
+            # current_a = min_charge_a zurueck, sodass max() hier idempotent ist.
+            # Ausnahme SOC <= floor_soc: _simulate_hour() gibt current_a=0 zurueck
+            # (Victron ESS Entladesperre) — effective_setpoint_a bleibt 0 -> 0 A.
+            nom_v = self.bat.get("voltage_nominal", 48.0)
+            min_charge_a = float(self.bat.get("min_charge_current", 3.0))
+            surplus_current_a = fc.net_kwh * 1000.0 / nom_v
+            # Entladesperre: current_a==0 von _simulate_hour() durchreichen (nicht auf 3A anheben)
+            effective_setpoint_a = 0.0 if current_a == 0.0 else max(current_a, min_charge_a)
+            if surplus_current_a >= 0:
+                planned_current_a = round(min(surplus_current_a, effective_setpoint_a), 1)
+            else:
+                planned_current_a = round(surplus_current_a, 1)
+
             result.append({
                 "hour": h,
                 "pv_kwh": fc.pv_kwh,
                 "consumption_kwh": fc.consumption_kwh,
                 "surplus_kwh": round(fc.net_kwh, 3),
                 "action": action,
-                "charge_current_a": round(current_a, 1),
+                "charge_current_a": planned_current_a,
                 "projected_soc": round(soc_sim, 1),
                 "is_past": False,
                 "is_actual": False,
@@ -1767,11 +2118,17 @@ class ChargeController:
         der Stunde (seit Stundenbeginn), nicht nur den Diff des letzten Updates.
         Zusaetzlich: Energie-Basis nach Neustart wird beruecksichtigt.
 
+        v3.0.9.22: charge_current_a wird aus integriertem Batteriestrom (Reg. 842)
+        berechnet: bat_energy_wh / nom_v -> mittlerer Strom [A], signed.
+        Waehrend der laufenden Stunde: laufend aktualisiert.
+        Beim Stundenabschluss: Endwert eingefroren.
+
         Erzeugt HourlyHistory-Dataclass-Objekte (keine Dictionaries!)
         """
         now = datetime.now()
         today_iso = now.date().isoformat()
         current_hour = now.hour
+        nom_v = self.bat.get("voltage_nominal", 48.0)
 
         # Letzten Eintrag suchen (gleiche Stunde oder vorherige)
         last_entry = None
@@ -1782,31 +2139,46 @@ class ChargeController:
         # Energie-Totals: aus EnergyAccumulator + persistierter Basis nach Neustart
         pv_total   = self.state.pv_energy_today_kwh   + self._energy_base_pv
         load_total = self.state.load_energy_today_kwh + self._energy_base_load
+        bat_wh_total = self.state.bat_energy_today_wh + self._energy_base_bat  # signed Wh + Neustart-Basis
+
+        def _bat_current_a(bat_wh_hour: float, elapsed_h: float) -> float:
+            """Mittlerer Batteriestrom [A] aus Wh-Integral. signed: + Laden, - Entladen."""
+            if elapsed_h < 1e-6:
+                return 0.0
+            return round(bat_wh_hour / (nom_v * elapsed_h), 1)
 
         if last_entry and last_entry.hour == current_hour:
             # Gleiche Stunde: Update mit GESAMTDIFF seit Stundenbeginn
             # (nicht nur Diff seit letztem Update!)
             pv_hour_total = max(0.0, pv_total - last_entry._hour_start_pv_total)
             cons_hour_total = max(0.0, load_total - last_entry._hour_start_cons_total)
+            bat_wh_hour = bat_wh_total - last_entry._hour_start_bat_wh
 
             last_entry.pv_kwh = round(pv_hour_total, 3)
             last_entry.consumption_kwh = round(cons_hour_total, 3)
             last_entry.surplus_kwh = round(pv_hour_total - cons_hour_total, 3)
             last_entry.action = self.state.charge_mode
-            last_entry.charge_current_a = self.state.charge_current_setpoint
+            last_entry.bat_energy_wh = round(bat_wh_hour, 1)
+            # Laufender Mittelwert: elapsed = aktuelle Minute / 60
+            elapsed_h = now.minute / 60.0 + now.second / 3600.0
+            last_entry.charge_current_a = _bat_current_a(bat_wh_hour, max(elapsed_h, 1/60))
             last_entry.soc_end = round(self.state.soc, 1)
             # Aktuelle Kumulativwerte fuer naechsten Update speichern
-            last_entry._raw_pv_total  = pv_total
+            last_entry._raw_pv_total   = pv_total
             last_entry._raw_cons_total = load_total
+            last_entry._raw_bat_wh     = bat_wh_total
 
         elif last_entry and last_entry.hour < current_hour:
             # NEUE STUNDE: Letzten Eintrag der VORHERIGEN Stunde abschliessen
-            # (auf den letzten bekannten Zustand setzen, falls kein Update mehr kam)
             pv_hour_total = max(0.0, last_entry._raw_pv_total - last_entry._hour_start_pv_total)
             cons_hour_total = max(0.0, last_entry._raw_cons_total - last_entry._hour_start_cons_total)
+            bat_wh_hour = last_entry._raw_bat_wh - last_entry._hour_start_bat_wh
             last_entry.pv_kwh = round(pv_hour_total, 3)
             last_entry.consumption_kwh = round(cons_hour_total, 3)
             last_entry.surplus_kwh = round(pv_hour_total - cons_hour_total, 3)
+            last_entry.bat_energy_wh = round(bat_wh_hour, 1)
+            # Abgeschlossene Stunde: Mittelwert ueber volle Stunde (elapsed_h = 1.0)
+            last_entry.charge_current_a = _bat_current_a(bat_wh_hour, 1.0)
             last_entry.soc_end = round(self.state.soc, 1)
 
             # Neuen Eintrag fuer aktuelle Stunde erstellen
@@ -1817,16 +2189,18 @@ class ChargeController:
                 consumption_kwh=0.0,
                 surplus_kwh=0.0,
                 action=self.state.charge_mode,
-                charge_current_a=self.state.charge_current_setpoint,
+                charge_current_a=0.0,   # wird laufend aus bat_energy_wh berechnet
                 soc_start=round(self.state.soc, 1),
                 soc_end=round(self.state.soc, 1),
                 is_actual=True,
             )
             # Stundenbeginn-Kumulativwerte speichern (inkl. Energie-Basis)
-            new_entry._hour_start_pv_total = pv_total
-            new_entry._hour_start_cons_total = load_total
-            new_entry._raw_pv_total  = pv_total
+            new_entry._hour_start_pv_total   = pv_total
+            new_entry._hour_start_cons_total  = load_total
+            new_entry._hour_start_bat_wh      = bat_wh_total
+            new_entry._raw_pv_total   = pv_total
             new_entry._raw_cons_total = load_total
+            new_entry._raw_bat_wh     = bat_wh_total
             self.state.history_buffer.append(new_entry)
 
         else:
@@ -1838,15 +2212,17 @@ class ChargeController:
                 consumption_kwh=0.0,
                 surplus_kwh=0.0,
                 action=self.state.charge_mode,
-                charge_current_a=self.state.charge_current_setpoint,
+                charge_current_a=0.0,
                 soc_start=round(self.state.soc, 1),
                 soc_end=round(self.state.soc, 1),
                 is_actual=True,
             )
-            new_entry._hour_start_pv_total = pv_total
-            new_entry._hour_start_cons_total = load_total
-            new_entry._raw_pv_total  = pv_total
+            new_entry._hour_start_pv_total   = pv_total
+            new_entry._hour_start_cons_total  = load_total
+            new_entry._hour_start_bat_wh      = bat_wh_total
+            new_entry._raw_pv_total   = pv_total
             new_entry._raw_cons_total = load_total
+            new_entry._raw_bat_wh     = bat_wh_total
             self.state.history_buffer.append(new_entry)
 
         # DEBUG: Logge letzte Stunde fuer Vergleich mit VRM Portal
@@ -1855,6 +2231,7 @@ class ChargeController:
                 f"History H{last_entry.hour:02d}: PV={last_entry.pv_kwh:.3f} kWh, "
                 f"Cons={last_entry.consumption_kwh:.3f} kWh, "
                 f"Surplus={last_entry.surplus_kwh:.3f} kWh, "
+                f"BatStrom={last_entry.charge_current_a:+.1f} A, "
                 f"SOC={last_entry.soc_end:.1f}%, "
                 f"Action={last_entry.action}"
             )
@@ -1884,6 +2261,7 @@ class ChargeController:
             self._soc_98_reached_at    = None
             self._balancing_reset_date = _today_iso
             self._power_smoother.reset()  # Glättungspuffer bei Tageswechsel leeren
+            self._energy_base_bat = 0.0  # Wh-Basis zurücksetzen
             self.logger.info("Mitternachts-Reset: Balancing-Timer und Glättung zurueckgesetzt")
 
         # ── days_since_full_charge immer aktuell aus Datum berechnen ──────────
@@ -1943,6 +2321,24 @@ class ChargeController:
         if self._needs_full_charge() and self.state.soc < self.bat["max_soc"] - self.cc.get("soc_hysteresis", 2):
             force_new = True
 
+        # Massiver Export ins Netz → sofort neu entscheiden, nicht 10 min warten.
+        # Verhindert dass eine veraltete Trickle/Idle-Entscheidung eingefroren bleibt
+        # während hunderte Watt unnötig eingespeist werden. (v3.0.9.20 Bugfix)
+        if self.state.grid_power_w < -1000:
+            force_new = True
+            self.logger.debug(
+                f"Massiver Export {self.state.grid_power_w:.0f}W → force_new=True")
+
+        # evcc-Statuswechsel (Start/Stop) → sofort neu entscheiden.
+        # Nach evcc-Stop fällt die Last schlagartig → Überschuss steigt → sofort laden.
+        # Nach evcc-Start steigt die Last → Ladestrom muss reduziert werden. (v3.0.9.20 Bugfix)
+        evcc_now = self.state.evcc_active
+        if evcc_now != getattr(self, "_last_evcc_active", evcc_now):
+            force_new = True
+            self.logger.info(
+                f"evcc-Statuswechsel {'→ aktiv' if evcc_now else '→ gestoppt'} → force_new=True")
+        self._last_evcc_active = evcc_now
+
         # Neue Entscheidung nur wenn Hysterese abgelaufen oder forced
         if force_new or (now - self._last_decision_ts) >= min_dur:
             target_a, mode, reason = self.decide()
@@ -1983,6 +2379,38 @@ class ChargeController:
             a = self.state.charge_current_setpoint
             log_suffix = " [KEIN WRITE]" if (target_a >= 0 and not write_performed) else ""
             self.logger.info(f"[{mode.upper()}] {a:.0f}A | {reason[:120]}{log_suffix}")
+
+# ── Hintergrund-Heartbeat für Werkzeug-Logger ────────────────────────────
+# Wenn der Browser-Tab geschlossen ist, kommen keine HTTP-Requests rein.
+# Der DeduplicatingFilter prüft den Heartbeat-Timer nur bei eingehenden
+# Log-Einträgen. Ohne Requests wird kein Heartbeat ausgelöst.
+# Lösung: Ein Daemon-Thread prüft alle 60 Sekunden, ob der Heartbeat
+# fällig ist, und emitiert einen synthetischen Log-Eintrag.
+
+class _HeartbeatThread(threading.Thread):
+    """
+    Prüft alle check_interval_s Sekunden ob Heartbeats fällig sind.
+    Überwacht alle übergebenen DeduplicatingFilter-Instanzen:
+    sowohl Werkzeug-HTTP-Access als auch BatteryManager-StreamHandler.
+    """
+    def __init__(self, filters: list, check_interval_s: float = 60.0):
+        super().__init__(daemon=True, name="DeduplicatingHeartbeat")
+        self._filters = filters
+        self._interval = check_interval_s
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.is_set():
+            self._stop.wait(self._interval)
+            if self._stop.is_set():
+                break
+            for f in self._filters:
+                f.emit_heartbeat_if_due()
+
+    def stop(self):
+        self._stop.set()
+
+
 # ─────────────────────────────────────────────
 # Web Dashboard (Flask, eingebettet)
 # ─────────────────────────────────────────────
@@ -1992,7 +2420,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Solar Batterie Manager v3.0.9.10</title>
+<title>Solar Batterie Manager v3.0.9.24</title>
 <style>
 :root{--bg:#0f1117;--bg2:#1a1d27;--bg3:#252836;
   --acc:#f59e0b;--grn:#22c55e;--red:#ef4444;--blu:#3b82f6;--vio:#a78bfa;
@@ -2035,12 +2463,12 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
 .rl{font-size:.66rem;text-transform:uppercase;color:var(--mut);margin-bottom:3px}
 .evb{background:rgba(167,139,250,.08);border:1px solid var(--vio);border-radius:8px;
      padding:9px 13px;margin:0 14px 12px;font-size:.8rem;color:var(--vio)}
-.ft{text-align:center;color:var(--mut);font-size:.7rem;padding-bottom:14px}
+
 </style>
 </head>
 <body>
 <div class="hd">
-  <h1>&#9889; Solar Batterie Manager <span style="font-size:0.7rem;color:var(--mut);font-weight:400">v3.0.9.10</span></h1>
+  <h1>&#9889; Solar Batterie Manager <span style="font-size:0.7rem;color:var(--mut);font-weight:400">v3.0.9.24</span></h1>
   <div class="hdr">
     <div class="sp"><div class="dot" id="mdot"></div><span id="mst">Verbinde...</span></div>
     <div class="sp"><div class="dot" id="edot"></div><span id="est">evcc -</span></div>
@@ -2109,7 +2537,6 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
     </table>
   </div>
 </div>
-<div class="ft" id="ft">-</div>
 <script>
 const REFRESH=__REFRESH__*1000, CAP=__CAP__;
 function sc(s){return s>=80?'var(--grn)':s>=40?'var(--acc)':'var(--red)'}
@@ -2247,16 +2674,21 @@ async function refresh(){
       const sur=(s.surplus_kwh||0)>=0
         ?`<span style="color:var(--grn)">+${(s.surplus_kwh||0).toFixed(2)}</span>`
         :`<span style="color:var(--red)">${(s.surplus_kwh||0).toFixed(2)}</span>`;
+      const ca=s.charge_current_a||0;
+      const caSign=ca>=0?'+':'';
+      const caColor=ca>0.5?'var(--grn)':ca<-0.5?'var(--red)':'var(--txt)';
+      const caOpacity=s.is_past?'1':'0.6';
+      const caStr=ca!==0
+        ?`<span style="color:${caColor};opacity:${caOpacity}">${caSign}${ca.toFixed(1)} A</span>`
+        :`<span style="opacity:0.35">0 A</span>`;
       return`<tr class="${cl}">
         <td>${String(s.hour).padStart(2,'0')}:00</td>
         <td>${(s.pv_kwh||0).toFixed(3)}</td><td>${(s.consumption_kwh||0).toFixed(3)}</td>
         <td>${sur}</td><td>${bdg(s.action)}</td>
-        <td>${s.charge_current_a>0?s.charge_current_a+'A':'-'}</td>
+        <td>${caStr}</td>
         <td><span style="color:${sc(s.projected_soc||0)}">${(s.projected_soc||0).toFixed(1)}%</span></td>
       </tr>`;
     }).join('');
-    document.getElementById('ft').textContent=
-      `v3.0.9.10 | Aktualisiert: ${new Date().toLocaleTimeString('de')} - naechste in ${REFRESH/1000}s`;
   }catch(e){document.getElementById('rea').textContent='Fehler: '+e.message;}
 }
 refresh();setInterval(refresh,REFRESH);
@@ -2265,7 +2697,8 @@ refresh();setInterval(refresh,REFRESH);
 """
 
 
-def start_dashboard(cfg: dict, state: SystemState, logger: logging.Logger):
+def start_dashboard(cfg: dict, state: SystemState, logger: logging.Logger,
+                    dedup_stream: DeduplicatingFilter):
     try:
         from flask import Flask, jsonify, Response
     except ImportError:
@@ -2278,6 +2711,41 @@ def start_dashboard(cfg: dict, state: SystemState, logger: logging.Logger):
     html    = (DASHBOARD_HTML
                .replace("__REFRESH__", str(refresh))
                .replace("__CAP__",     str(cap)))
+
+    # Werkzeug Access-Logs deduplizieren (sonst alle 30s im journal)
+    log_cfg = cfg.get("logging", {})
+    dedup_enabled = log_cfg.get("dedup_enabled", True)
+    dedup_heartbeat = log_cfg.get("dedup_heartbeat_minutes", 20.0)
+
+    werkzeug_log = logging.getLogger('werkzeug')
+    # Safe clear: werkzeug logger might not have handlers initialized yet
+    if hasattr(werkzeug_log, 'handlers') and werkzeug_log.handlers:
+        werkzeug_log.handlers.clear()
+    werkzeug_log.setLevel(logging.INFO)
+    werkzeug_log.propagate = False  # Nicht zum Root-Logger durchreichen
+
+    dedup_werkzeug = DeduplicatingFilter(
+        heartbeat_minutes=dedup_heartbeat, enabled=dedup_enabled)
+    fmt_werkzeug = logging.Formatter("%(message)s")
+    ch_werkzeug = logging.StreamHandler()
+    ch_werkzeug.setFormatter(fmt_werkzeug)
+    ch_werkzeug.addFilter(dedup_werkzeug)
+    dedup_werkzeug._handler = ch_werkzeug
+    werkzeug_log.addHandler(ch_werkzeug)
+
+    if dedup_enabled:
+        logger.info(
+            f"Werkzeug-Access-Log Deduplizierung aktiv: identische Requests "
+            f"werden unterdrückt, Heartbeat alle {dedup_heartbeat:.0f} Minuten")
+
+    # Hintergrund-Heartbeat-Thread: überwacht alle Dedup-Instanzen.
+    # dedup_stream = BatteryManager StreamHandler → [IDLE]-Heartbeats im Journal
+    # dedup_werkzeug = Werkzeug StreamHandler → HTTP-Heartbeats im Journal
+    # Beide feuern alle 20min, auch ohne Browser und ohne [IDLE]-Änderungen.
+    heartbeat_thread = _HeartbeatThread(
+        filters=[dedup_stream, dedup_werkzeug],
+        check_interval_s=60.0)
+    heartbeat_thread.start()
 
     app = Flask(__name__)
 
@@ -2389,10 +2857,10 @@ def _forecast_source(forecast: "ForecastManager") -> str:
 def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
     cfg    = load_config(config_path)
-    logger = setup_logging(cfg)
+    logger, dedup_file, dedup_stream = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v3.0.9.10  (Modbus TCP) - Predictive Charging")
+    logger.info("Solar Batterie Manager v3.0.9.24  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 
@@ -2451,7 +2919,7 @@ def main():
 
     # Dashboard
     if cfg.get("dashboard", {}).get("enabled", True):
-        start_dashboard(cfg, state, logger)
+        start_dashboard(cfg, state, logger, dedup_stream)
 
     # Hauptschleife
     interval    = cfg["charging"].get("control_interval_seconds", 60)
@@ -2468,10 +2936,11 @@ def main():
             # 1. Messwerte per Modbus lesen
             victron.read_all()
 
-            # 2. Tages-Energie aufsummieren
-            energy.update(state.pv_power_w, state.load_power_w)
-            state.pv_energy_today_kwh  = round(energy.pv_kwh,   3)
+            # 2. Tages-Energie aufsummieren (inkl. Batteriestrom-Integration)
+            energy.update(state.pv_power_w, state.load_power_w, state.battery_power_w)
+            state.pv_energy_today_kwh   = round(energy.pv_kwh,   3)
             state.load_energy_today_kwh = round(energy.load_kwh, 3)
+            state.bat_energy_today_wh   = energy.bat_wh   # signed Wh, fuer _update_history
 
             # 3. evcc Status abfragen
             evcc.update()
