@@ -102,36 +102,44 @@ Multiplus II / ESS:
 ### Entscheidungsbaum (60-Sekunden-Zyklus)
 
 ```
-┌─ Morgen-Notladung: SOC < max(min_soc, emergency_charge_soc) im Morgenfenster?
-│   └─ JA → Sofort mit max_charge_current laden (kein Warten)
+┌─ ESS State 11 oder 12 (Victron Entladesperre / Zwangsladung)?
+│   └─ JA → Sofort mit max_charge_current laden
+│
+├─ Morgen-Notladung: SOC < max(min_soc, emergency_charge_soc) im Morgenfenster?
+│   └─ JA → Sofort mit max_charge_current laden
 │
 ├─ SOC ≤ emergency_charge_soc (Notfall)?
 │   └─ JA → Sofort mit max_charge_current laden
 │
-├─ evcc-Schnellladen aktiv (Reg 2901 > 25%)?
-│   └─ JA → Laden erlaubt, Min-SOC auf Reg-2901-Wert angehoben
+├─ Vollladung fällig (dyn_target ≥ 98%) und SOC < max_soc − Hysterese?
+│   └─ JA → Laden mit max_charge_current (full_charge)
+│       └─ Ziel erreicht (SOC ≥ max_soc): Trickle für Cellbalancing-Haltezeit
 │
-├─ ≥ 10 Tage seit letzter Vollladung?
-│   └─ JA → target_soc = 98% (Zellbalancing)
+├─ Nacht (dynamisch: Sonnenuntergang – Sonnenaufgang)?
+│   └─ JA → Kein Laden (idle)
 │
-├─ Nacht (21:00–06:00 Uhr)?
-│   └─ JA → Kein Laden
+├─ Ziel-SOC bereits erreicht (SOC ≥ dyn_target)?
+│   └─ JA → Kein Laden (idle)
 │
-├─ Morgen-Fenster (06:00–10:00 Uhr)?
-│   ├─ PV im Optimal-Fenster (11:00–15:00) ausreichend? → Warten
-│   ├─ SOC noch ausreichend? → Warten
-│   └─ Sonst → Frühes Laden (auch vor morning_delay_end_hour)
+├─ evcc MinSoc-Sperre aktiv (Reg 2901 > 25%)?
+│   └─ JA → effektiver Min-SOC auf Reg-2901-Wert angehoben (kein eigener Return)
 │
-├─ PV-Überschuss > 200W (PV > Verbrauch)?
-│   ├─ Im Optimal-Fenster (11:00–15:00) mit genug PV?
-│   │   └─ JA → Reduzierter Ladestrom (z.B. 20A) um Fenster auszunutzen
-│   └─ Sonst → Laden mit Überschuss-Strom (proportional, max 50A)
+├─ Morgenfenster (Sonnenaufgang + morning_delay_h, mind. bis Optimal-Fenster-Start)?
+│   ├─ Genug PV im Optimal-Fenster und SOC ≥ min_required? → Warten (idle)
+│   ├─ Im Optimal-Fenster und genug PV? → Reduzierter Ladestrom
+│   └─ Sonst → Laden mit max_charge_current (frühes Laden)
 │
-├─ SOC deutlich unter Ziel (> 10% Abstand)?
-│   └─ JA → Sanft laden (5A Trickle)
+├─ Im Optimal-Fenster (solar_noon ± offset) und Überschuss > 200W?
+│   └─ JA → Dynamischer Ladestrom (abhängig von fehlendem kWh, Restzeit, Überschuss)
+│       gecappt durch reduced_charge_current_a und actual_surplus / V
 │
-└─ Ziel-SOC erreicht?
-    └─ JA → Stop (Ladestrom = 0A)
+├─ PV-Überschuss > 200W (außerhalb Optimal-Fenster)?
+│   └─ JA → Laden mit min(surplus_w / V, max_charge_current)
+│
+├─ SOC > 10% unter Ziel UND raw_surplus < 200W?
+│   └─ JA → Trickle (min_charge_current)
+│
+└─ Sonst → Warten auf PV-Überschuss (idle)
 ```
 
 ### Dynamisches Ziel-SOC (v3.0)
