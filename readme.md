@@ -182,54 +182,59 @@ Das Ziel liegt also zwischen **25% und 98%** – je nach erwartetem Nachtverbrau
 
 ## 4. Modbus-Register Referenz
 
-### Wichtig: mbpoll vs. pymodbus Offset
+### Adressierung
 
-> **mbpoll** zählt Register ab **1** (Modbus-Spec-Darstellung)
-> **pymodbus** verwendet die **echte Adresse ab 0** (= mbpoll − 1)
-> Victron-Dokumentation verwendet mbpoll-Notation!
+Alle Register-Nummern in dieser Dokumentation entsprechen der **Victron-Dokumentation** (CCGX-Modbus-TCP-register-list) und werden **direkt** von pymodbus und mbpoll (mit `-0`) verwendet – kein Offset nötig.
+
+> `mbpoll` muss mit **`-0`** aufgerufen werden (0-basierte Adressierung), damit die Register-Nummern mit pymodbus und der Victron-Dokumentation übereinstimmen.
 
 ### Register-Tabelle (Unit-ID 100, Cerbo GX)
 
-| Messwert | Victron ID (pymodbus) | mbpoll-Anzeige | Typ | Skalierung |
-|---|---|---|---|---|
-| Batteriespannung | 840 | 841 | uint16 | ÷ 10 → V |
-| Batteriestrom | 841 | 842 | int16 | ÷ 10 → A |
-| Batterieleistung | 842 | 843 | int16 | direkt W |
-| Batterie SOC | 843 | 844 | uint16 | direkt % |
-| PV-WR L1 | 811 | 812 | uint16 | direkt W |
-| PV-WR L2 | 812 | 813 | uint16 | direkt W |
-| PV-WR L3 | 813 | 814 | uint16 | direkt W |
-| AC-Last L1 | 817 | 818 | uint16 | direkt W |
-| AC-Last L2 | 818 | 819 | uint16 | direkt W |
-| AC-Last L3 | 819 | 820 | uint16 | direkt W |
-| Netz L1 | 820 | 821 | int16 | direkt W |
-| Netz L2 | 821 | 822 | int16 | direkt W |
-| Netz L3 | 822 | 823 | int16 | direkt W |
-| **ESS MinSoc** | **2901** | **2902** | **uint16** | **direkt %** |
-| **DVCC MaxChargeCurrent** | **2705** | **2706** | **uint16** | **direkt A** |
+| Messwert | Register | Typ | Skalierung |
+|---|---|---|---|
+| Batteriespannung | 840 | uint16 | ÷ 10 → V |
+| Batteriestrom | 841 | int16 | ÷ 10 → A |
+| Batterieleistung | 842 | int16 | direkt W |
+| Batterie SOC | 843 | uint16 | direkt % |
+| PV-WR L1 | 811 | uint16 | direkt W |
+| PV-WR L2 | 812 | uint16 | direkt W |
+| PV-WR L3 | 813 | uint16 | direkt W |
+| AC-Last L1 | 817 | uint16 | direkt W |
+| AC-Last L2 | 818 | uint16 | direkt W |
+| AC-Last L3 | 819 | uint16 | direkt W |
+| Netz L1 | 820 | int16 | direkt W |
+| Netz L2 | 821 | int16 | direkt W |
+| Netz L3 | 822 | int16 | direkt W |
+| **ESS MinSoc** | **2901** | **uint16** | **direkt %** |
+| **DVCC MaxChargeCurrent** | **2705** | **uint16** | **direkt A** |
 
-> Netz: positiv = Bezug, negativ = Einspeisung
+> Netz: positiv = Bezug, negativ = Einspeisung  
 > Strom: positiv = laden, negativ = entladen
 
 ### Register manuell prüfen (mbpoll)
+
 ```bash
 sudo apt install mbpoll
 
 # SOC (sollte z.B. 89 zeigen)
-mbpoll -a 100 -r 844 -c 1 192.168.178.61
+mbpoll -0 -a 100 -r 843 -c 1 192.168.178.61
+
+# Spannung (÷10 → V)
+mbpoll -0 -a 100 -r 840 -c 1 192.168.178.61
 
 # PV-Leistung L1/L2/L3
-mbpoll -a 100 -r 812 -c 3 192.168.178.61
+mbpoll -0 -a 100 -r 811 -c 3 192.168.178.61
 
 # Netz L1/L2/L3 (signed)
-mbpoll -a 100 -r 821 -c 3 192.168.178.61
+mbpoll -0 -a 100 -r 820 -c 3 192.168.178.61
 
 # ESS MinSoc (evcc-Erkennung)
-mbpoll -a 100 -r 2902 -c 1 192.168.178.61
+mbpoll -0 -a 100 -r 2901 -c 1 192.168.178.61
 
 # MaxChargeCurrent schreiben (Test 10A)
-mbpoll -a 100 -r 2706 -t 4 192.168.178.61 10
+mbpoll -0 -a 100 -r 2705 -t 4 192.168.178.61 10
 ```
+
 Register 2705 DVCC MaxChargeCurrent
 
 <img width="467" height="277" alt="image" src="https://github.com/user-attachments/assets/1a35310f-cd22-43b7-8007-3f091916b0e3" />
@@ -556,19 +561,19 @@ nc -zv 192.168.178.61 502
 
 ### Falscher SOC / falsche Werte
 ```bash
-# Rohwerte direkt lesen (mbpoll = pymodbus +1)
+# Rohwerte direkt lesen
 sudo apt install mbpoll
-mbpoll -a 100 -r 844 -c 1 192.168.178.61  # SOC
-mbpoll -a 100 -r 841 -c 1 192.168.178.61  # Spannung (/10 → V)
-mbpoll -a 100 -r 812 -c 3 192.168.178.61  # PV L1/L2/L3
-mbpoll -a 100 -r 818 -c 3 192.168.178.61  # Last L1/L2/L3
-mbpoll -a 100 -r 821 -c 3 192.168.178.61  # Netz L1/L2/L3
+mbpoll -0 -a 100 -r 843 -c 1 192.168.178.61  # SOC
+mbpoll -0 -a 100 -r 840 -c 1 192.168.178.61  # Spannung (/10 → V)
+mbpoll -0 -a 100 -r 811 -c 3 192.168.178.61  # PV L1/L2/L3
+mbpoll -0 -a 100 -r 817 -c 3 192.168.178.61  # Last L1/L2/L3
+mbpoll -0 -a 100 -r 820 -c 3 192.168.178.61  # Netz L1/L2/L3
 ```
 
 ### Ladestrom wird nicht gesetzt
 ```bash
 # DVCC-Register manuell schreiben (Test: 10A)
-mbpoll -a 100 -r 2706 -t 4 192.168.178.61 10
+mbpoll -0 -a 100 -r 2705 -t 4 192.168.178.61 10
 
 # Prüfen ob DVCC aktiv
 # Cerbo GX: Einstellungen → DVCC → Ein
@@ -812,5 +817,3 @@ https://www.victronenergy.com/upload/documents/CCGX-Modbus-TCP-register-list-3.7
 ---
 
 *Erstellt: Mai 2026 | Getestet mit: Victron Cerbo GX Venus OS, Raspberry Pi OS Bookworm, pymodbus 3.13*
-
----
