@@ -32,10 +32,10 @@
 │       └──────────────────┼────────────────┘             │
 │                          │                              │
 │                   ChargeController                      │
-│                   (Ladeentscheidung 60s-Zyklus)          │
+│                   (Ladeentscheidung 60s-Zyklus)         │
 │                          │                              │
-│                   Flask Dashboard :5000                   │
-└──────────────────────────┼───────────────────────────────┘
+│                   Flask Dashboard :5000                 │
+└──────────────────────────┼──────────────────────────────┘
                            │ Modbus TCP Port 502
                     Cerbo GX (Venus OS)
                            │
