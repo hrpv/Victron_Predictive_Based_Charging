@@ -1,5 +1,226 @@
 # Changelog — battery_manager.py
 
+
+## CHANGELOG v3.0.9.28 (2026-06-12)
+
+Fixed:
+- run_cycle(): "(Hysterese)" wurde an alle gecachten Entscheidungen
+  angehaengt, nicht nur an Warte-Entscheidungen (mode="idle").
+
+  Alt:
+    elif not reason.endswith("(Hysterese)"):
+        reason = reason + " (Hysterese)"
+
+  Neu:
+    elif mode == "idle" and not reason.endswith("(Hysterese)"):
+        reason = reason + " (Hysterese)"
+
+  Begruendung: Das Suffix "(Hysterese)" signalisiert dem Nutzer dass die
+  Entscheidung aus dem Cache stammt (kein neuer decide()-Aufruf wegen
+  min_decision_interval). Bei mode="charging" oder "full_charge" ist
+  der Zusatz semantisch falsch und suggeriert faelschlicherweise einen
+  SOC-Hysterese-Wartemodus. Beispiel vorher:
+    "Netto-Ueberschuss nicht ausreichend ... fruehes Laden noetig (Hysterese)"
+  Beispiel nachher:
+    "Netto-Ueberschuss nicht ausreichend ... fruehes Laden noetig"
+
+- Versionsstring in GUI-Titel, h1, logger.info und Datei-Header
+  auf 3.0.9.28 aktualisiert.
+
+
+## CHANGELOG v3.0.9.27 (2026-06-12)
+
+### Fixed:
+- decide(): pv_in_optimal verwendete f.pv_kwh (Brutto-PV) statt
+  Netto-Ueberschuss (PV - Verbrauch). Dadurch wurde die Warteentscheidung
+  "PV im Optimal-Fenster ausreichend" gegenueber dem tatsaechlich in den
+  Akku fliessenden Strom zu optimistisch.
+
+  Alt:
+    pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
+    if pv_in_optimal >= needed_kwh and soc >= min_required:
+        return 0, "idle", "... warte"
+
+  Neu:
+    net_in_optimal = sum(max(0.0, f.net_kwh) for f in fc_list
+                         if opt_start <= f.hour <= opt_end)
+    if net_in_optimal >= needed_kwh and soc >= min_required:
+        return 0, "idle", "... warte"
+
+  Begruendung: needed_kwh ist die Netto-Energie die der Akku benoetigt
+  (SOC-Delta * Kapazitaet). Der Vergleichswert muss ebenfalls Netto sein.
+  Beispiel: PV 11-15 Uhr = 6.5 kWh, Verbrauch = 3.8 kWh -> netto 2.7 kWh.
+  Ziel-Energie: 5.9 kWh. Vorher: 6.5 >= 5.9 -> warte (falsch).
+  Nachher: 2.7 < 5.9 -> fruehes Laden noetig (korrekt).
+
+  Gleiches Fix auch im Optimal-Fenster-Block (Zeile ~1838) wo
+  pv_in_optimal >= needed_kwh * 1.5 als Eintrittsbedingung fuer den
+  adaptiven Ladestrom-Block genutzt wird.
+
+- _simulate_hour(): Morgen-Fenster (h < opt_start, soc >= min_required)
+  wartete immer ohne zu pruefen ob das Optimal-Fenster die benoetigte
+  Netto-Energie tatsaechlich liefert. Inkonsistenz zu decide().
+
+  Alt:
+    if h < opt_start:
+        if soc_sim >= min_required:
+            action, current_a, soc_sim = _apply_deficit(soc_sim)
+            return action, current_a, soc_sim
+
+  Neu:
+    if h < opt_start:
+        net_in_opt = sum(max(0.0, f2.net_kwh) for f2 in
+                         self.forecast.get_forecast()
+                         if opt_start <= f2.hour <= opt_end)
+        needed = max(0.0, (dyn_target - soc_sim) / 100.0 * cap)
+        if net_in_opt >= needed and soc_sim >= min_required:
+            action, current_a, soc_sim = _apply_deficit(soc_sim)
+            return action, current_a, soc_sim
+
+  Begruendung: Die Simulation muss dieselbe Warteentscheidung treffen
+  wie decide(). Ohne den Netto-Check zeigte der Ladeplan PAUSE fuer
+  Stunden mit positivem Ueberschuss (z.B. 09:00 PAUSE bei +0.20 kWh),
+  und der projizierte SOC erreichte das Ziel nie  -  obwohl decide()
+  "warte" sagt. Nach dem Fix stimmen Entscheidung und Ladeplan ueberein.
+
+- Versionsstring in GUI-Titel, h1, logger.info und Datei-Header
+  auf 3.0.9.27 aktualisiert.
+
+
+## [3.0.9.26] – 2026-06-11
+
+### Changed
+
+- **`decide()`: Sollwert im Optimal-Fenster stabilisiert — drei kombinierte Maßnahmen (A + C + Glättung)**
+
+  **Problem:** Im Optimal-Fenster oszillierte `charge_a` fast jede Minute zwischen 18/19/20 A,
+  obwohl physikalisch kein Unterschied bestand. Zwei unabhängige Ursachen:
+
+  1. `surplus_w` (aus Grid-Leistung Reg. 820–822) rauscht selbst bei ruhigem Wetter um ±2000 W
+     → `max_from_surplus` springt im Minutentakt (19 A → 110 A → 47 A → 156 A).
+  2. `required_a = (missing_kwh × 1.15) / hours_left / V` driftet langsam durch `hours_left`-
+     Abnahme (~0.02 A/min). Am Ende des Fensters kann dieser Drift eine Quantisierungsgrenze
+     überqueren und einen unnötigen Stufenwechsel auslösen.
+
+  Beide Ursachen wurden kombiniert behandelt:
+
+  **Alt:**
+  ```python
+  charge_a = min(max_from_surplus, required_a, reduced_a)
+  charge_a = max(optimal_min_a, charge_a)
+  # → z.B. 18, 19, 20, 19, 18, 20 A im Minutentakt → ~6–8 Writes/h
+  ```
+
+  **Neu (Reihenfolge ist semantisch wichtig):**
+  ```python
+  # 1. Glättung: required_a über N Zyklen mitteln (Ursache 2)
+  smoothed_required = self._smooth_required_a(required_a)
+  charge_a = min(max_from_surplus, smoothed_required, reduced_a)
+
+  # 2. reduced_a-Cap + Untergrenze explizit VOR Quantisierung
+  charge_a = max(optimal_min_a, min(reduced_a, charge_a))
+
+  # 3. Quantisierung auf Stromstufen (Ursache 1)
+  step = cc.get("optimal_window_current_step_a", 5)
+  if step > 0:
+      charge_a = round(charge_a / step) * step
+      charge_a = max(optimal_min_a, min(int(reduced_a), int(charge_a)))
+  ```
+
+  Der `reduced_a`-Cap wird **zweifach** angewendet — als `float` vor und als `int` nach
+  der Quantisierung. Das verhindert, dass `round()` einen Wert genau auf der Bandgrenze
+  (z.B. `20.0 → 30A` bei Bands `[…, 20, 30, …]`) über `reduced_a` hinausschiebt.
+
+- **`run_cycle()`: Write-Deadband im Optimal-Fenster erhöht (Option A)**
+
+  Selbst nach Quantisierung kann `_ramp_current` während des Hochlaufens intermediäre Werte
+  zwischen zwei Stufen annehmen (z.B. 17 A auf dem Weg von 15 → 20 A) und dabei eine
+  1-A-Differenz zu `_last_written_ramped_a` erzeugen.
+
+  **Alt:** `if abs(ramped - self._last_written_ramped_a) >= 1.0`
+
+  **Neu:**
+  ```python
+  write_threshold = 1.0
+  if mode == "charging" and "Optimal-Fenster" in reason:
+      write_threshold = cc.get("optimal_window_write_deadband_a", 3.0)
+  if abs(ramped - self._last_written_ramped_a) >= write_threshold:
+  ```
+
+  Für alle anderen Modi (Nacht, Notfall, Vollladung, Nachmittag) bleibt 1 A erhalten.
+
+  **Netto-Effekt A + C + Glättung:** Flash-Schreibrate im Optimal-Fenster sinkt von
+  ~6–8 Writes/Stunde auf < 2 Writes/Stunde. Im Log vom 2026-06-11 (14:42–15:24,
+  42 Minuten) wurden 12 Writes erzeugt; mit diesen Maßnahmen wären ≤ 2 nötig gewesen.
+
+- Versionsstring in GUI-Titel, h1-Überschrift, `logger.info` und Datei-Header
+  auf `3.0.9.26` aktualisiert.
+
+### Added
+  **config.yaml optionen
+```yaml
+ charging:
+  optimal_window_current_step_a: 5     # Quantisierung → 10/15/20 A
+  optimal_window_write_deadband_a: 3   # Deadband Ramp-Artefakte
+  required_a_smooth_window: 3          # Glättung ~3 Minuten
+```
+
+- **`ChargeController._smooth_required_a(required_a)`**: Gleitender Mittelwert über
+  `required_a_smooth_window` Zyklen (Default: 3). Stabilisiert den Zielstrom gegen
+  langsamen `hours_left`-Drift am Ende des Optimal-Fensters.
+
+- **Config-Option `charging.optimal_window_current_step_a`** (optional, Default `5`):
+  Quantisierungsschrittweite im Optimal-Fenster [A].
+  Bei `reduced_charge_current_a: 20` und `optimal_window_min_current_a: 10`
+  ergeben sich die Stufen 10 / 15 / 20 A. `0` deaktiviert die Quantisierung.
+
+- **Config-Option `charging.optimal_window_write_deadband_a`** (optional, Default `3.0`):
+  Mindest-Änderung des gerampten Sollwerts [A] für einen Modbus-Write im Optimal-Fenster.
+  Außerhalb des Optimal-Fensters gilt weiterhin 1 A.
+
+- **Config-Option `charging.required_a_smooth_window`** (optional, Default `3`):
+  Anzahl Zyklen für die `required_a`-Glättung. 1 = keine Glättung, 3 = empfohlen (~3 min),
+  5 = sehr träge. Muss ≥ 1 sein (wird in `validate_config()` geprüft).
+
+---
+
+## [3.0.9.25] – 2026-06-11
+
+### Changed
+
+- **`decide()`: Pfade 6 (PV-Überschuss außerhalb Optimal-Fenster) und 7 (Trickle) durch einfachen Nachmittags-Block ersetzt**
+
+  **Problem:** Die 200 W-Schwelle in Pfad 6 verursachte ständiges Flackern des `MaxChargeCurrent`
+  im 10-Minuten-Takt (z.B. 3 A → 10 A → 3 A → 10 A …), wenn die PV-Leistung durch Bewölkung
+  um die Schwelle schwankte. Pfad 7 (Trickle) sprang bei `raw_surplus_w < 200 W` auf 3 A,
+  Pfad 6 bei `surplus_w > 200 W` zurück auf den berechneten Überschussstrom — ein klassischer
+  Oszillator bei grenzwertiger Einstrahlung.
+
+  **Alt:**
+  ```
+  surplus_w > 200 W  →  charge_a = min(surplus / V, max_a)       [Pfad 6]
+  soc < dyn_target − 10 AND raw_surplus_w < 200 W  →  trickle_a  [Pfad 7]
+  ```
+
+  **Neu:**
+  ```
+  soc < dyn_target  →  charge_a = max_a, mode = "charging"        [Pfad 6]
+  ```
+
+  **Begründung:** Victron ESS im Selbstverbrauchsmodus lädt nie aus dem Netz ohne PV-Überschuss —
+  DVCC und ESS begrenzen den tatsächlichen Ladestrom automatisch auf das, was PV über den
+  Eigenverbrauch hinaus liefert. Der `surplus_w`-Guard in `decide()` war physikalisch redundant
+  und verursachte nur Instabilität. Mit `max_a` auf Reg. 2705 bleibt der Setpoint konstant;
+  der reale Stromfluss folgt dem PV-Angebot.
+
+  `surplus_w`, `raw_surplus_w`, `surplus_source`, `max_from_surplus` bleiben erhalten —
+  sie werden weiterhin im Optimal-Fenster-Block (Pfad 5) verwendet.
+
+- Versionsstring in GUI-Titel, h1-Überschrift, `logger.info` und Datei-Header
+  auf `3.0.9.25` aktualisiert.
+
+---
+
 ## [3.0.9.24] – 2026-06-10
 
 ### Changed

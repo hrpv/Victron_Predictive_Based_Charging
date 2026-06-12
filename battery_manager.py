@@ -1,63 +1,264 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 =============================================================
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.9.24 (Modbus TCP, kein MQTT)
+Version: 3.0.9.28 (Modbus TCP, kein MQTT)
 
 Kommunikation:
-- Lesen:     Modbus TCP → Cerbo GX (Port 502, Unit-ID 100)
-- Schreiben: Modbus TCP → DVCC MaxChargeCurrent (Reg. 2705)
-- evcc:      HTTP REST API → Konflikt-Koordination
+- Lesen:     Modbus TCP -> Cerbo GX (Port 502, Unit-ID 100)
+- Schreiben: Modbus TCP -> DVCC MaxChargeCurrent (Reg. 2705)
+- evcc:      HTTP REST API -> Konflikt-Koordination
 
 Steuerlogik:
 - Verzögertes Laden am Morgen (PV-Prognose abwarten)
 - SOC-Fenster bevorzugt 20-80 % (LFP-schonend)
 - Alle N Tage Vollladung auf 98 % (Zellbalancing)
-- evcc-Priorität: bei Schnellladen Auto → eigene Steuerung pausieren
+- evcc-Priorität: bei Schnellladen Auto -> eigene Steuerung pausieren
 - evcc MinSoc-Sperre (Reg 2901) wird im Ladeplan berücksichtigt
 
 =============================================================
 Victron Modbus-TCP Register (Cerbo GX, Unit-ID 100):
-  843  /Soc                Battery SOC            raw ÷ 10  → %
-  840  /Voltage            Batteriespannung        raw ÷ 100 → V
-  841  /Current            Batteriestrom           raw ÷ 10  → A  (signed)
-  850  /Dc/Pv/Power        PV-Gesamtleistung       raw       → W
-  817  /Ac/Consumption L1  Verbrauch Phase 1       raw       → W  (signed)
-  818  /Ac/Consumption L2  Verbrauch Phase 2       raw       → W  (signed)
-  819  /Ac/Consumption L3  Verbrauch Phase 3       raw       → W  (signed)
-  820  /Ac/Grid L1         Netzbezug Phase 1       raw       → W  (signed, + = Bezug)
-  821  /Ac/Grid L2         Netzbezug Phase 2       raw       → W
-  822  /Ac/Grid L3         Netzbezug Phase 3       raw       → W
+  843  /Soc                Battery SOC            raw ÷ 10  -> %
+  840  /Voltage            Batteriespannung        raw ÷ 100 -> V
+  841  /Current            Batteriestrom           raw ÷ 10  -> A  (signed)
+  850  /Dc/Pv/Power        PV-Gesamtleistung       raw       -> W
+  817  /Ac/Consumption L1  Verbrauch Phase 1       raw       -> W  (signed)
+  818  /Ac/Consumption L2  Verbrauch Phase 2       raw       -> W  (signed)
+  819  /Ac/Consumption L3  Verbrauch Phase 3       raw       -> W  (signed)
+  820  /Ac/Grid L1         Netzbezug Phase 1       raw       -> W  (signed, + = Bezug)
+  821  /Ac/Grid L2         Netzbezug Phase 2       raw       -> W
+  822  /Ac/Grid L3         Netzbezug Phase 3       raw       -> W
 
   Schreiben (DVCC):
-  2705 MaxChargeCurrent    Maximaler Ladestrom     raw       → A
+  2705 MaxChargeCurrent    Maximaler Ladestrom     raw       -> A
        Wert 0 = kein Laden, 50 = Maximalstrom
 
   ESS-Status (read-only):
-  2900 BatteryLife State   ESS Zustand             raw       → Enum
+  2900 BatteryLife State   ESS Zustand             raw       -> Enum
        Relevant fuer "Optimiert ohne BatteryLife" (Standard LFP):
-       10=Self-consumption (SOC >= MinSOC) → normaler Betrieb
-       11=Self-consumption (SOC <  MinSOC) → Entladen gesperrt!
-       12=Recharge (SOC >5% unter MinSOC) → Zwangsladung aus Netz
+       10=Self-consumption (SOC >= MinSOC) -> normaler Betrieb
+       11=Self-consumption (SOC <  MinSOC) -> Entladen gesperrt!
+       12=Recharge (SOC >5% unter MinSOC) -> Zwangsladung aus Netz
        Weitere States (nur bei "Optimiert mit BatteryLife"):
        2=Self-consumption  3=Self-consumption (SOC>85%)
        4=Self-consumption (SOC=100%)
-       5=SOC below dynamic limit → Entladen gesperrt (BatteryLife)
-       6=SOC>24h unter Limit → Laden mit 5A
+       5=SOC below dynamic limit -> Entladen gesperrt (BatteryLife)
+       6=SOC>24h unter Limit -> Laden mit 5A
        7=Multi/Quattro sustain
-  2901 ESS MinimumSocLimit  Konfigurierter SOC-Mindestwert  raw / 10 → %
+  2901 ESS MinimumSocLimit  Konfigurierter SOC-Mindestwert  raw / 10 -> %
        Wird von evcc temporaer angehoben beim Schnellladen.
        Unser battery_manager liest diesen Wert (EvccMonitor).
   2903 ESS Active SoC Limit  Nur relevant bei "Optimiert mit BatteryLife"
        Im Modus "Optimiert ohne BatteryLife" wird dieser Wert von
-       Victron ignoriert → nicht einlesen.
+       Victron ignoriert -> nicht einlesen.
 
   Hinweis: Register koennen je nach Firmware-Version leicht abweichen.
   Pruefen mit:  mosquitto_sub oder Victron Modbus-TCP Register-Liste
   (https://github.com/victronenergy/venus-modbus-tcp-specification)
 =============================================================
+"""
+"""
+=============================================================
+CHANGELOG v3.0.9.28 (2026-06-12)
+=============================================================
+Fixed:
+- run_cycle(): "(Hysterese)" wurde an alle gecachten Entscheidungen
+  angehaengt, nicht nur an Warte-Entscheidungen (mode="idle").
+
+  Alt:
+    elif not reason.endswith("(Hysterese)"):
+        reason = reason + " (Hysterese)"
+
+  Neu:
+    elif mode == "idle" and not reason.endswith("(Hysterese)"):
+        reason = reason + " (Hysterese)"
+
+  Begruendung: Das Suffix "(Hysterese)" signalisiert dem Nutzer dass die
+  Entscheidung aus dem Cache stammt (kein neuer decide()-Aufruf wegen
+  min_decision_interval). Bei mode="charging" oder "full_charge" ist
+  der Zusatz semantisch falsch und suggeriert faelschlicherweise einen
+  SOC-Hysterese-Wartemodus. Beispiel vorher:
+    "Netto-Ueberschuss nicht ausreichend ... fruehes Laden noetig (Hysterese)"
+  Beispiel nachher:
+    "Netto-Ueberschuss nicht ausreichend ... fruehes Laden noetig"
+
+- Versionsstring in GUI-Titel, h1, logger.info und Datei-Header
+  auf 3.0.9.28 aktualisiert.
+
+"""
+"""
+=============================================================
+CHANGELOG v3.0.9.27 (2026-06-12)
+=============================================================
+Fixed:
+- decide(): pv_in_optimal verwendete f.pv_kwh (Brutto-PV) statt
+  Netto-Ueberschuss (PV - Verbrauch). Dadurch wurde die Warteentscheidung
+  "PV im Optimal-Fenster ausreichend" gegenueber dem tatsaechlich in den
+  Akku fliessenden Strom zu optimistisch.
+
+  Alt:
+    pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
+    if pv_in_optimal >= needed_kwh and soc >= min_required:
+        return 0, "idle", "... warte"
+
+  Neu:
+    net_in_optimal = sum(max(0.0, f.net_kwh) for f in fc_list
+                         if opt_start <= f.hour <= opt_end)
+    if net_in_optimal >= needed_kwh and soc >= min_required:
+        return 0, "idle", "... warte"
+
+  Begruendung: needed_kwh ist die Netto-Energie die der Akku benoetigt
+  (SOC-Delta * Kapazitaet). Der Vergleichswert muss ebenfalls Netto sein.
+  Beispiel: PV 11-15 Uhr = 6.5 kWh, Verbrauch = 3.8 kWh -> netto 2.7 kWh.
+  Ziel-Energie: 5.9 kWh. Vorher: 6.5 >= 5.9 -> warte (falsch).
+  Nachher: 2.7 < 5.9 -> fruehes Laden noetig (korrekt).
+
+  Gleiches Fix auch im Optimal-Fenster-Block (Zeile ~1838) wo
+  pv_in_optimal >= needed_kwh * 1.5 als Eintrittsbedingung fuer den
+  adaptiven Ladestrom-Block genutzt wird.
+
+- _simulate_hour(): Morgen-Fenster (h < opt_start, soc >= min_required)
+  wartete immer ohne zu pruefen ob das Optimal-Fenster die benoetigte
+  Netto-Energie tatsaechlich liefert. Inkonsistenz zu decide().
+
+  Alt:
+    if h < opt_start:
+        if soc_sim >= min_required:
+            action, current_a, soc_sim = _apply_deficit(soc_sim)
+            return action, current_a, soc_sim
+
+  Neu:
+    if h < opt_start:
+        net_in_opt = sum(max(0.0, f2.net_kwh) for f2 in
+                         self.forecast.get_forecast()
+                         if opt_start <= f2.hour <= opt_end)
+        needed = max(0.0, (dyn_target - soc_sim) / 100.0 * cap)
+        if net_in_opt >= needed and soc_sim >= min_required:
+            action, current_a, soc_sim = _apply_deficit(soc_sim)
+            return action, current_a, soc_sim
+
+  Begruendung: Die Simulation muss dieselbe Warteentscheidung treffen
+  wie decide(). Ohne den Netto-Check zeigte der Ladeplan PAUSE fuer
+  Stunden mit positivem Ueberschuss (z.B. 09:00 PAUSE bei +0.20 kWh),
+  und der projizierte SOC erreichte das Ziel nie  -  obwohl decide()
+  "warte" sagt. Nach dem Fix stimmen Entscheidung und Ladeplan ueberein.
+
+- Versionsstring in GUI-Titel, h1, logger.info und Datei-Header
+  auf 3.0.9.27 aktualisiert.
+
+"""
+"""
+=============================================================
+CHANGELOG v3.0.9.26 (2026-06-11)
+=============================================================
+Changed:
+- decide(): Optimal-Fenster-Sollwert wird jetzt auf konfigurierbare
+  Stromstufen quantisiert (Option C).
+
+  Alt:
+    charge_a = min(max_from_surplus, required_a, reduced_a)
+    charge_a = max(optimal_min_a, charge_a)
+    # -> kontinuierlicher Wert z.B. 18, 19, 20 A
+
+  Neu:
+    charge_a = min(max_from_surplus, required_a, reduced_a)
+    charge_a = max(optimal_min_a, charge_a)
+    # Quantisierung auf Stufen (z.B. 5 A -> 10, 15, 20 A)
+    step = self.cc.get("optimal_window_current_step_a", 5)
+    charge_a = round(charge_a / step) * step
+    charge_a = max(optimal_min_a, min(reduced_a, charge_a))
+
+  Begruendung: Grid-basiertes surplus_w schwankt selbst bei ruhigem
+  Wetter um ±2000 W (Messrauschen, Phasenunsymmetrie). Das fuehrt
+  zu charge_a-Werten von z.B. 18/19/20 A im Minutentakt, obwohl
+  physikalisch kein Unterschied besteht. Mit 5-A-Quantisierung sind
+  nur noch 3 Stufen moeglich (10/15/20 A) -> Sollwert wechselt nur
+  bei echten Ueberschuss-Sprüngen. Konfigurierbar via
+  charging.optimal_window_current_step_a (Default: 5 A).
+
+- run_cycle(): Schreib-Hysterese (Write-Deadband) im Optimal-Fenster
+  auf charging.optimal_window_write_deadband_a angehoben (Option A).
+
+  Alt:
+    if abs(ramped - self._last_written_ramped_a) >= 1.0:
+    # -> schreibt bei jeder 1-A-Aenderung
+
+  Neu:
+    write_threshold = 1.0
+    if mode == "charging" and "Optimal-Fenster" in reason:
+        write_threshold = self.cc.get("optimal_window_write_deadband_a", 3.0)
+    if abs(ramped - self._last_written_ramped_a) >= write_threshold:
+
+  Begruendung: Selbst nach Quantisierung koennen Ramp-Artefakte
+  (self._ramp_current laeuft schrittweise) 1-A-Writes ausloesen
+  wenn der Rampenzaehler zwischen zwei quantisierten Stufen liegt.
+  Das Deadband von 3 A verhindert diese Micro-Writes und haelt
+  Flash-Schreibrate niedrig. Fuer alle anderen Modi bleibt die
+  bisherige 1-A-Schwelle erhalten (Nacht, Vollladung, Notfall usw.).
+  Konfigurierbar via charging.optimal_window_write_deadband_a
+  (Default: 3 A).
+
+  Netto-Effekt beider Massnahmen (A+C): Flash-Schreibrate im
+  Optimal-Fenster sinkt von ~6-8 Writes/Stunde auf < 2 Writes/Stunde.
+
+- Versionsstring in GUI-Titel, h1, logger.info und Datei-Header
+  auf 3.0.9.26 aktualisiert.
+
+=============================================================
+CHANGELOG v3.0.9.25_fixed (2026-06-11)
+=============================================================
+Fixed:
+- _simulate_hour(): PV-Ueberschuss-Block ausserhalb Optimal-Fenster
+  (ab Zeile ~1987) war inkonsistent mit decide().
+
+  Alt:
+    current_a = min(fc.net_kwh * 1000 / nom_v, max_a)
+    # Cap durch fc.net_kwh unnoetig und inkonistent mit decide()
+
+  Neu:
+    if soc_sim < dyn_target:
+        current_a = max_a          # konsistent mit decide() Pfad 6 neu
+    else:
+        current_a = min_charge_a   # defensiv; sollte durch soc>=dyn_target-Block
+                                   # oben bereits abgefangen sein (toter Code)
+
+  Begruendung: decide() setzt ausserhalb des Optimal-Fensters bei
+  soc < dyn_target ebenfalls max_a ohne Netz-kWh-Cap  -  ESS/DVCC
+  begrenzen den tatsaechlichen Strom physikalisch. Der fc.net_kwh-Cap
+  in der Simulation fuehrte zu systematisch zu niedrigen current_a-Werten
+  im Ladeplan (Prognose-Stunden mit wenig PV zeigten falschen Strom).
+
+=============================================================
+CHANGELOG v3.0.9.25 (2026-06-11)
+=============================================================
+Changed:
+- decide(): Pfad 6 (PV-Überschuss außerhalb Optimal-Fenster) und
+  Pfad 7 (Trickle) entfernt und durch einfachen Nachmittags-Block ersetzt.
+
+  Alt:
+    surplus_w > 200 W -> charge_a = min(surplus/V, max_a)   (Pfad 6)
+    soc < dyn_target-10 AND raw_surplus_w < 200 W -> trickle (Pfad 7)
+
+  Neu:
+    soc < dyn_target -> charge_a = max_a, mode="charging"
+
+  Begründung: Die 200W-Schwelle verursachte ständiges Flackern des
+  MaxChargeCurrent (z.B. 3A <-> 10A im 10-Minuten-Takt) wenn PV-Leistung
+  durch Wolken um die Schwelle schwankte. Victron ESS im
+  Selbstverbrauchsmodus lädt nie aus dem Netz ohne PV-Überschuss  - 
+  DVCC und ESS begrenzen den Strom automatisch. Der surplus_w-Guard
+  war somit physikalisch redundant und verursachte nur Instabilität.
+
+  Die surplus_w/raw_surplus_w/surplus_source/max_from_surplus-Variablen
+  bleiben erhalten, da sie weiterhin im Optimal-Fenster-Block (Pfad 6
+  alt, jetzt Teil von Pfad 5/6) verwendet werden.
+
+- Versionsstring in GUI-Titel, h1, logger.info und Datei-Header
+  auf 3.0.9.25 aktualisiert.
+
 """
 """
 =============================================================
@@ -67,10 +268,10 @@ Changed:
 - _simulate_hour(): bei action=idle und SOC > floor_soc wird jetzt
   current_a = min_charge_current (z.B. 3 A) statt 0.0 A verwendet.
   Physikalisch korrekt: Reg. 2705 steht auch im idle-Zustand auf
-  mindestens min_charge_current — dieser Strom fliesst tatsaechlich.
+  mindestens min_charge_current  -  dieser Strom fliesst tatsaechlich.
   SOC-Simulation steigt entsprechend leicht (~1 %/h bei 3 A / 48 V
   / 100 Ah), statt konstant zu bleiben.
-  Entladesperre-Ausnahme unveraendert: SOC <= floor_soc → current_a=0,
+  Entladesperre-Ausnahme unveraendert: SOC <= floor_soc -> current_a=0,
   SOC eingefroren (Victron ESS State 11/12).
 - _apply_deficit() gibt jetzt 3-Tupel (action, current_a, new_soc)
   zurueck (vorher 2-Tupel ohne current_a).
@@ -92,7 +293,7 @@ Fixed:
   Bisher wurde bei idle/PAUSE-Stunden mit positivem Ueberschuss
   surplus_current_a ungecappt ausgegeben (z.B. +28 A statt +3 A).
   Physikalisch: Reg. 2705 steht immer auf mindestens min_charge_current
-  (z.B. 3 A) — DVCC begrenzt den Ladestrom entsprechend.
+  (z.B. 3 A)  -  DVCC begrenzt den Ladestrom entsprechend.
   Ausnahme SOC <= floor_soc: current_a = 0 aus _simulate_hour()
   (Victron ESS Entladesperre aktiv) wird korrekt durchgereicht -> 0 A.
 
@@ -130,8 +331,8 @@ Fixed:
   Da emergency_charge_soc == Reg 2901 (20%), sank der projizierte SOC
   fälschlicherweise unter 20% (Dashboard zeigte z.B. 15.5%).
   In der Realität verhindert Victron ESS die Entladung unter Reg 2901
-  durch Netzbezug — die Simulation muss diesen Boden einhalten.
-  Fix: max(0.0, ...) → max(floor_soc, ...) im discharging-Zweig des
+  durch Netzbezug  -  die Simulation muss diesen Boden einhalten.
+  Fix: max(0.0, ...) -> max(floor_soc, ...) im discharging-Zweig des
   Notfall-SOC-Blocks (_simulate_hour, Zeile ~1753).
   Hinweis: emergency_charge_soc in config.yaml ist nur informativer
   Fallback für den Fall dass Reg 2901 nicht gelesen werden kann.
@@ -146,15 +347,15 @@ Fixed:
 - Trickle-Pfad griff auch bei vorhandenem PV-Überschuss (Bug #2):
   decide() Pfad 7 (Trickle) hatte keinen Überschuss-Check. Wenn
   grid_w kurzzeitig nahe 0 lag (z.B. nach evcc-Stop, Messrauschen)
-  ergab surplus_w fälschlicherweise 0 → Trickle statt Laden.
+  ergab surplus_w fälschlicherweise 0 -> Trickle statt Laden.
   Fix: Trickle nur noch wenn raw_surplus_w < 200 W.
   Neue Variable raw_surplus_w = max(0, pv_w - load_w) als Guard.
 
 - Hysterese fror falsche Entscheidung bis zu 10 Minuten ein (Bug #3):
   force_new wurde nur bei SOC-Notfällen gesetzt. Massiver Export
-  (z.B. −1500 W nach evcc-Stop) und evcc-Statuswechsel lösten kein
-  force_new aus → Trickle/Idle blieb unnötig lange aktiv.
-  Fix: force_new bei grid_power_w < −1000 W (massiver Export) und
+  (z.B. -1500 W nach evcc-Stop) und evcc-Statuswechsel lösten kein
+  force_new aus -> Trickle/Idle blieb unnötig lange aktiv.
+  Fix: force_new bei grid_power_w < -1000 W (massiver Export) und
   bei evcc-Statuswechsel (Start/Stop).
 
 CHANGELOG v3.0.9.19 (2026-06-07)
@@ -177,6 +378,7 @@ import logging.handlers
 import math
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
@@ -229,7 +431,7 @@ class SystemState:
     forecast_updated: str = ""
     forecast_source: str = ""        # vrm | solcast | open_meteo | dummy
     evcc_active: bool = False               # Auto wird gerade geladen (Info)
-    evcc_discharge_locked: bool = False     # evcc hat Reg 2901 erhoeht → kein Entladen
+    evcc_discharge_locked: bool = False     # evcc hat Reg 2901 erhoeht -> kein Entladen
     evcc_mode: str = ""                     # "off"|"now"|"minpv"|"pv"
     evcc_charge_power_w: float = 0.0        # Wallbox-Ladeleistung [W]
     evcc_min_soc: float = 0.0              # Aktueller Wert in Reg 2901 [%]
@@ -297,7 +499,7 @@ class DeduplicatingFilter(logging.Filter):
 
     Unterdrückt aufeinanderfolgende identische Log-Nachrichten.
     Erzwingt trotzdem alle N Minuten einen Heartbeat-Log, damit man
-    sieht dass das Programm noch lebt — auch wenn sich der Zustand
+    sieht dass das Programm noch lebt  -  auch wenn sich der Zustand
     nicht geändert hat.
 
     Der Heartbeat-Marker wird direkt ins record.msg geschrieben,
@@ -330,9 +532,9 @@ class DeduplicatingFilter(logging.Filter):
         1. Werkzeug Access-Log (normales Format):
            '192.168.168.60 - - [06/Jun/2026 13:04:19] "GET /api/state HTTP/1.1" 200 -'
         2. Werkzeug Access-Log mit %s-Platzhaltern (internes Format, noch
-           nicht durch getMessage() expandiert — tritt auf wenn record.args
+           nicht durch getMessage() expandiert  -  tritt auf wenn record.args
            nicht None ist):
-           '"%s" %s %s'  →  normalisiert auf "HTTP_ACCESS"
+           '"%s" %s %s'  ->  normalisiert auf "HTTP_ACCESS"
         """
         # Muster 1: vollständig formatierter Werkzeug-Access-Log-Eintrag
         # Alle HTTP-Methoden und alle Pfade werden zu "HTTP_ACCESS" zusammengefasst,
@@ -360,7 +562,7 @@ class DeduplicatingFilter(logging.Filter):
 
         with self._lock:
             if msg == self._last_msg:
-                # Identische Nachricht — Heartbeat fällig?
+                # Identische Nachricht  -  Heartbeat fällig?
                 if (now - self._last_ts) >= self._heartbeat_s:
                     # Heartbeat: record.msg auf den bereits formatierten String
                     # setzen und args leeren, damit kein doppeltes %-Formatting
@@ -372,7 +574,7 @@ class DeduplicatingFilter(logging.Filter):
                 # Kein Heartbeat: unterdrücken
                 return False
             else:
-                # Bucket wechseln — Timer NICHT zurücksetzen.
+                # Bucket wechseln  -  Timer NICHT zurücksetzen.
                 # Der 20-Minuten-Takt läuft absolut weiter, unabhängig davon
                 # ob zwischendurch andere Nachrichten erscheinen.
                 self._last_msg = msg
@@ -382,7 +584,7 @@ class DeduplicatingFilter(logging.Filter):
         """
         Vom Hintergrund-Thread aufgerufen (alle 60s). Prüft ob der
         Heartbeat fällig ist und schreibt einen synthetischen LogRecord
-        direkt an self._handler — ohne erneut durch filter() zu laufen.
+        direkt an self._handler  -  ohne erneut durch filter() zu laufen.
         Dadurch wird _last_msg nicht durch einen Fremd-String korrumpiert,
         und der nächste echte Log-Eintrag wird weiterhin korrekt dedupliziert.
         """
@@ -584,13 +786,13 @@ class VictronModbus:
                 if new_ess_state != self.state.ess_battery_life_state:
                     ess_state_names = {
                         10: "Self-consumption (SOC >= MinSOC)",
-                        11: "SOC below MinSOC → Entladen GESPERRT",
+                        11: "SOC below MinSOC -> Entladen GESPERRT",
                         12: "Recharge (SOC >5% unter MinSOC)",
                     }
                     desc = ess_state_names.get(new_ess_state, str(new_ess_state))
                     self.logger.info(
                         f"ESS BatteryLife State geaendert: "
-                        f"{self.state.ess_battery_life_state} → {new_ess_state} ({desc})")
+                        f"{self.state.ess_battery_life_state} -> {new_ess_state} ({desc})")
                 self.state.ess_battery_life_state = new_ess_state
 
             self.state.timestamp    = datetime.now().isoformat()
@@ -621,7 +823,7 @@ class VictronModbus:
                         min(float(bat["max_charge_current"]), current_a))
         current_a = round(current_a)
 
-        # Schicht-1: Shadow-Variable – identischer Wert → kein Write
+        # Schicht-1: Shadow-Variable – identischer Wert -> kein Write
         if self._last_written_a is not None and self._last_written_a == current_a:
             self.state.charge_current_setpoint = current_a
             return True   # aus Sicht des Aufrufers erfolgreich (Wert stimmt bereits)
@@ -711,8 +913,8 @@ class EvccMonitor:
       - evcc_mode:          "off"|"now"|"minpv"|"pv"
       - evcc_charge_power:  Ladeleistung Wallbox [W]
       - evcc_discharge_locked: Reg 2901 > normaler MinSoc
-                                → evcc sperrt Akkuentladung
-                                → wir duerfen laden, aber SOC-Ziel
+                                -> evcc sperrt Akkuentladung
+                                -> wir duerfen laden, aber SOC-Ziel
                                   nicht unter evcc-MinSoc senken
 
     Einfluss auf Ladesteuerung:
@@ -811,7 +1013,7 @@ class VrmForecastManager:
 
     Voraussetzungen:
     - Anlage muss in VRM registriert sein (mind. 30 Tage Daten)
-    - VRM Access Token (VRM Portal → Einstellungen → Integrationen → Access Tokens)
+    - VRM Access Token (VRM Portal -> Einstellungen -> Integrationen -> Access Tokens)
     - Installation ID (Zahl in der VRM-URL: vrm.victronenergy.com/installation/XXXXX)
 
     Fallback: bei Fehler wird Open-Meteo verwendet.
@@ -872,7 +1074,7 @@ class VrmForecastManager:
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             # End: 23:59 heute Lokalzeit
             end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
-            start_unix = int(start.timestamp())   # korrekte Lokalzeit → Unix
+            start_unix = int(start.timestamp())   # korrekte Lokalzeit -> Unix
             end_unix   = int(end.timestamp())
             avg_h = self.cfg["charging"].get(
                 "avg_daily_consumption_kwh", 8.0) / 24
@@ -909,7 +1111,7 @@ class VrmForecastManager:
                 return None
 
             # KORREKTUR: Aggregation pro Stunde (mehrere Eintraege werden summiert)
-            # Nur Eintraege des heutigen Tages verwenden — VRM liefert auch Eintraege
+            # Nur Eintraege des heutigen Tages verwenden  -  VRM liefert auch Eintraege
             # vom Vortag (letzte Stunden des UTC-Tages), die auf lokale Stunden 22/23
             # gemappt werden und die echten Tagesstunden ueberschreiben wuerden.
             pv_by_hour: dict = {}
@@ -940,9 +1142,9 @@ class VrmForecastManager:
                     continue
                 cons_by_hour[dt.hour] = cons_by_hour.get(dt.hour, 0.0) + float(wh)
 
-            # PV-Prognose in HourlyForecast umwandeln — alle 24h, nicht nur PV-Stunden.
+            # PV-Prognose in HourlyForecast umwandeln  -  alle 24h, nicht nur PV-Stunden.
             # VRM liefert PV-Daten nur fuer Tagesstunden; Nachtstunden fehlen in pv_by_hour.
-            # Ohne range(24) wuerden Nachtstunden in night_consumption_kwh() fehlen → zu niedriger Wert.
+            # Ohne range(24) wuerden Nachtstunden in night_consumption_kwh() fehlen -> zu niedriger Wert.
             out = []
             total_pv_kwh = 0.0
             for h in range(24):
@@ -988,7 +1190,7 @@ class VrmForecastManager:
 class ForecastManager:
     """
     Holt stundliche PV-Prognose.
-    Prioritaet: VRM API (anlagenspezifisch) → Solcast → Open-Meteo → Dummy
+    Prioritaet: VRM API (anlagenspezifisch) -> Solcast -> Open-Meteo -> Dummy
     """
 
     def __init__(self, cfg: dict, logger: logging.Logger):
@@ -1383,6 +1585,9 @@ class ChargeController:
         # v3.0.9.3: Leistungsglättung (3 Zyklen gleitender Durchschnitt)
         smooth_window = self.cc.get("power_smooth_window_cycles", 3)
         self._power_smoother = PowerSmoother(window_cycles=smooth_window)
+        # v3.0.9.26: required_a-Glaettung (gleitender Mittelwert)
+        smooth_window_req = self.cc.get("required_a_smooth_window", 3)
+        self._required_a_history: deque = deque(maxlen=smooth_window_req)
         # Tagesreset-Tracking: Mitternachts-Reset der Balancing-Timer
         self._balancing_reset_date: str = date.today().isoformat()
 
@@ -1560,7 +1765,7 @@ class ChargeController:
         surplus_from_grid = max(0.0, -grid_w) if grid_w < -50 else 0.0
 
         # Rohüberschuss: PV - Last (ohne Batteriekorrektur).
-        # load_w ist AC-seitig gemessen und enthält den Batterie-Ladestrom NICHT →
+        # load_w ist AC-seitig gemessen und enthält den Batterie-Ladestrom NICHT ->
         # ein zusätzlicher Abzug von battery_power_w wäre eine Doppelkorrektur.
         # raw_surplus_w dient sowohl als Fallback (wenn Grid-Messung nahe 0) als
         # auch als Guard im Trickle-Pfad. (v3.0.9.20 Bugfix: war pv_w - load_w - battery_charge_w)
@@ -1578,7 +1783,7 @@ class ChargeController:
 
         self.logger.debug(
             f"Surplus: Grid={grid_w:.0f}W, PV={pv_w:.0f}W, Load={load_w:.0f}W, "
-            f"raw={raw_surplus_w:.0f}W → surplus={surplus_w:.0f}W "
+            f"raw={raw_surplus_w:.0f}W -> surplus={surplus_w:.0f}W "
             f"(Quelle: {surplus_source})"
         )
 
@@ -1594,15 +1799,15 @@ class ChargeController:
 
         # ── 1. ESS State 11/12: Entladen gesperrt oder Netzladung erzwungen ──
         # HOECHSTE PRIORITAET: Hardware-Eingriff durch Victron ESS.
-        # State 11: SOC < MinSOC → Entladen blockiert, Last aus Netz
-        # State 12: SOC >5% unter MinSOC → Zwangsladung aus Netz
+        # State 11: SOC < MinSOC -> Entladen blockiert, Last aus Netz
+        # State 12: SOC >5% unter MinSOC -> Zwangsladung aus Netz
         # In beiden Faellen: sofort max. Ladestrom, unabhaengig von Tag/Nacht/Morgen-Logik.
         # Muss VOR Morgen-Notladung geprueft werden, da sonst ab morning_delay_start_hour
         # der Morgen-Block greift und ESS State 11 ignoriert wird (v3.0.7 Bugfix).
         if self.state.ess_battery_life_state in {11, 12}:
             return max_a, "charging", (
                 f"ESS State {self.state.ess_battery_life_state}: "
-                f"Notladung/Entladesperre → max {max_a}A")
+                f"Notladung/Entladesperre -> max {max_a}A")
 
         # ── Morgen-Notladung (v3.0.9.7) ────────────────────────
         # SOC unter Minimum: sofort mit max_a laden bis min_soc erreicht.
@@ -1658,7 +1863,7 @@ class ChargeController:
         # ── 5. Morgen-Fenster mit adaptiver Logik (v3.0.2) ────
         # WICHTIG: Das Morgen-Verzoegerungs-Fenster muss bis zum Optimal-Fenster
         # reichen, sonst entsteht eine Luecke (z.B. morn_e=10, opt_start=11)
-        # in der sofort geladen wird — obwohl das Optimal-Fenster noch ausreichend
+        # in der sofort geladen wird  -  obwohl das Optimal-Fenster noch ausreichend
         # PV verspricht.
         h_now = datetime.now().hour
         opt_start, opt_end = self._get_optimal_charge_window()
@@ -1671,20 +1876,22 @@ class ChargeController:
         if morn_s <= h_now < effective_morn_e:
             needed_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
             fc_list = self.forecast.get_forecast()
-            pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
+            # v3.0.9.27: Netto-Ueberschuss statt Brutto-PV  -  needed_kwh ist die
+            # Energie die der Akku benoetigt, der Vergleichswert muss ebenfalls Netto sein.
+            net_in_optimal = sum(max(0.0, f.net_kwh) for f in fc_list if opt_start <= f.hour <= opt_end)
 
             # Warte auf Optimal-Fenster wenn:
-            # - genug PV dort erwartet wird  UND
+            # - genug Netto-Ueberschuss dort erwartet wird  UND
             # - SOC nicht im Notfall-Bereich (>= min_required)
-            if pv_in_optimal >= needed_kwh and soc >= min_required:
+            if net_in_optimal >= needed_kwh and soc >= min_required:
                 return 0, "idle", (
                     f"Morgen: PV im Optimal-Fenster ({opt_start}:00-{opt_end}:00) "
-                    f"ausreichend ({pv_in_optimal:.1f} kWh >= {needed_kwh:.1f} kWh), warte")
+                    f"ausreichend ({net_in_optimal:.1f} kWh >= {needed_kwh:.1f} kWh), warte")
 
             # Nicht genug PV im optimalen Fenster -> fruehes Laden noetig
             if soc < dyn_target - hyst:
                 # Im optimalen Fenster mit genug PV -> reduzierter Strom
-                if opt_start <= h_now <= opt_end and pv_in_optimal >= needed_kwh * 1.2:
+                if opt_start <= h_now <= opt_end and net_in_optimal >= needed_kwh * 1.2:
                     reduced_a = self.cc.get("reduced_charge_current_a", 20)
                     return reduced_a, "charging", (
                         f"Morgen: Optimal-Fenster, reduzierter Ladestrom {reduced_a}A "
@@ -1692,26 +1899,26 @@ class ChargeController:
                 # v3.0.9.10: Logtext unterscheidet zwischen zwei Ablehnungsgründen:
                 # a) PV im Fenster ausreichend, aber SOC zu niedrig zum Warten (< min_required)
                 # b) PV im Fenster wirklich nicht ausreichend
-                if pv_in_optimal >= needed_kwh:
+                if net_in_optimal >= needed_kwh:
                     reason = (
                         f"SOC {soc:.1f}% < min {min_required}%, kann nicht warten; "
-                        f"PV im Fenster ausreichend ({pv_in_optimal:.1f} kWh >= {needed_kwh:.1f} kWh)")
+                        f"Netto-Ueberschuss im Fenster ausreichend ({net_in_optimal:.1f} kWh >= {needed_kwh:.1f} kWh)")
                 else:
                     reason = (
-                        f"PV nicht ausreichend im Optimal-Fenster "
-                        f"({pv_in_optimal:.1f} kWh < {needed_kwh:.1f} kWh)")
+                        f"Netto-Ueberschuss nicht ausreichend im Optimal-Fenster "
+                        f"({net_in_optimal:.1f} kWh < {needed_kwh:.1f} kWh)")
                 return max_a, "charging", f"Morgen: {reason}, fruehes Laden noetig"
 
         # ── 6. PV-Ueberschuss mit dynamischem Strom (v3.0.9.11) ──
         # Überschuss wird über Grid-Leistung bestimmt (zuverlässiger als PV-Load),
         # oder als Fallback PV - Load - Battery_Charge. Der tatsächlich verfügbare
-        # Überschuss limitiert den Ladestrom — nie mehr Strom setzen als PV liefert.
+        # Überschuss limitiert den Ladestrom  -  nie mehr Strom setzen als PV liefert.
         h_now = datetime.now().hour
         opt_start, opt_end = self._get_optimal_charge_window()
 
         # Maximal sinnvoller Ladestrom aus verfügbarem Überschuss.
         # Bei 50V Akkuspannung: 1A ≈ 50W. Nie mehr Strom fordern als Überschuss
-        # vorhanden ist — sonst wird aus dem Netz geladen (Grid-Bezug).
+        # vorhanden ist  -  sonst wird aus dem Netz geladen (Grid-Bezug).
         nom_v = self.bat.get("voltage_nominal", 48.0)
         actual_v = max(self.state.battery_voltage, nom_v * 0.875, 42.0)
         max_from_surplus = surplus_w / actual_v if surplus_w > 0 else 0.0
@@ -1719,8 +1926,9 @@ class ChargeController:
         if opt_start <= h_now <= opt_end and surplus_w > 200:
             needed_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
             fc_list = self.forecast.get_forecast()
-            pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
-            if pv_in_optimal >= needed_kwh * 1.5:
+            # v3.0.9.27: Netto-Ueberschuss statt Brutto-PV
+            net_in_optimal = sum(max(0.0, f.net_kwh) for f in fc_list if opt_start <= f.hour <= opt_end)
+            if net_in_optimal >= needed_kwh * 1.5:
                 missing_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
 
                 if missing_kwh <= 0.1:
@@ -1739,37 +1947,41 @@ class ChargeController:
 
                 # v3.0.9.11: Auch im Optimal-Fenster durch Überschuss limitieren!
                 # Nie mehr Strom als verfügbarer Überschuss erlaubt.
-                charge_a = min(max_from_surplus, required_a, reduced_a)
-                charge_a = max(optimal_min_a, charge_a)
+                # v3.0.9.26: required_a glaetten (Ursache 2: langsamer Drift
+                # durch hours_left-Aenderung ueberschreitet Quantisierungsgrenze).
+                smoothed_required = self._smooth_required_a(required_a)
+                charge_a = min(max_from_surplus, smoothed_required, reduced_a)
+                # reduced_a-Cap explizit vor Quantisierung sicherstellen:
+                charge_a = max(optimal_min_a, min(reduced_a, charge_a))
+
+                # v3.0.9.26 Option C: Quantisierung auf Stromstufen.
+                # Grid-Messung rauscht ±2000 W -> charge_a wechselt sonst
+                # jeden Zyklus zwischen z.B. 18/19/20 A ohne physikalischen
+                # Unterschied. Mit step=5 A sind nur 10/15/20 A moeglich;
+                # ein Write entsteht nur bei echtem Ueberschuss-Sprung.
+                step = self.cc.get("optimal_window_current_step_a", 5)
+                if step > 0:
+                    charge_a = round(charge_a / step) * step
+                    charge_a = max(optimal_min_a, min(int(reduced_a), int(charge_a)))
 
                 return charge_a, "charging", (
-                    f"Optimal-Fenster: Überschuss {surplus_w:.0f}W [{surplus_source}] → "
+                    f"Optimal-Fenster: Überschuss {surplus_w:.0f}W [{surplus_source}] -> "
                     f"max {max_from_surplus:.1f}A, setze {charge_a:.0f}A "
                     f"({missing_kwh:.1f} kWh in {hours_left:.1f}h, reserve +15%)")
 
-        if surplus_w > 200:
-            # v3.0.9.11: Strom auf tatsächlich verfügbaren Überschuss limitieren.
-            # Beispiel: 292W Überschuss / 50V = 5.8A → max 6A, nicht 50A!
-            charge_a = min(max_from_surplus, max_a)
-            # Mindestens min_charge_current, aber nie mehr als Überschuss erlaubt
-            charge_a = max(self.bat.get("min_charge_current", 3), charge_a)
-            return charge_a, "charging", (
-                f"PV-Überschuss {surplus_w:.0f}W [{surplus_source}] → "
-                f"max {max_from_surplus:.1f}A, setze {charge_a:.0f}A "
-                f"(SOC {soc:.1f}% → Ziel {dyn_target:.0f}%)")
-        # ── 7. Trickle ────────────────────────────────────────
-        # Nur wenn wirklich kein PV-Überschuss vorhanden (raw_surplus_w < 200 W).
-        # Verhindert Trickle bei vorhandenem Überschuss wenn Grid-Messung kurz
-        # nahe 0 liegt (z.B. nach evcc-Stop, Messrauschen) und surplus_w dadurch
-        # fälschlicherweise 0 ergibt. (v3.0.9.20 Bugfix)
-        if soc < dyn_target - 10 and raw_surplus_w < 200:
-            gentle_a = self.bat.get("min_charge_current", 5)
-            return gentle_a, "trickle", (
-                f"SOC {soc:.1f}% weit unter Ziel {dyn_target:.0f}%, "
-                f"sanft laden {gentle_a} A "
-                f"(PV {pv_w:.0f} W [glatt], Last {load_w:.0f} W [glatt])")
+        # ── 6. Nachmittag außerhalb Optimal-Fenster: SOC < Ziel -> max laden ──
+        # Keine surplus-Abhängigkeit außerhalb des Optimal-Fensters.
+        # Die bisherige surplus_w-Schwelle (200W) verursachte ständiges Flackern
+        # zwischen Trickle (3A) und PV-Überschuss-Laden wenn PV um die Schwelle
+        # schwankte. Victron ESS im Selbstverbrauchsmodus lädt nie aus dem Netz
+        # wenn kein PV-Überschuss da ist  -  DVCC und ESS begrenzen den Strom
+        # automatisch auf das, was PV tatsächlich liefert.
+        if soc < dyn_target:
+            return max_a, "charging", (
+                f"Nachmittag: SOC {soc:.1f}% < Ziel {dyn_target:.0f}% "
+                f"-> lade mit {max_a:.0f}A")
 
-        # ── 8. Warten ─────────────────────────────────────────
+        # ── 7. Warten ─────────────────────────────────────────
         return 0, "idle", (
             f"Warte auf PV-Ueberschuss "
             f"(SOC {soc:.1f}%, PV {pv_w:.0f} W [glatt], Last {load_w:.0f} W [glatt])")
@@ -1782,6 +1994,16 @@ class ChargeController:
             self._ramp_current = max(self._ramp_current - step, target_a)
         return self._ramp_current
 
+    def _smooth_required_a(self, required_a: float) -> float:
+        """Gleitender Mittelwert ueber N Zyklen fuer required_a.
+
+        Verhindert Stufenwechsel durch langsamen hours_left-Drift am
+        Ende des Optimal-Fensters. Konfigurierbar via
+        charging.required_a_smooth_window (Default: 3 Zyklen ~ 3 Minuten).
+        """
+        self._required_a_history.append(required_a)
+        return sum(self._required_a_history) / len(self._required_a_history)
+
     def _simulate_hour(self, h: int, fc: HourlyForecast, soc_sim: float,
                        needs_full: bool, pv_rem_total: float, night_cons: float,
                        is_forecast: bool = True,
@@ -1792,7 +2014,7 @@ class ChargeController:
 
         v3.0.3: floor_soc beruecksichtigt evcc MinSoc-Sperre (Reg 2901).
                 Wenn evcc den MinSoc angehoben hat, kann der Akku physikalisch
-                nicht unter diesen Wert entladen — die Simulation muss das
+                nicht unter diesen Wert entladen  -  die Simulation muss das
                 abbilden, sonst sind die projizierten SOC-Werte zu niedrig.
         """
         cap = self.bat["capacity_kwh"]
@@ -1840,7 +2062,7 @@ class ChargeController:
                 soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             else:
                 # Kein PV-Ueberschuss und SOC <= emergency_charge_soc (= floor_soc):
-                # Victron ESS sperrt Batterieentladung unter Reg 2901 — Verbraucher
+                # Victron ESS sperrt Batterieentladung unter Reg 2901  -  Verbraucher
                 # werden aus dem Netz gespeist, SOC bleibt konstant.
                 # State 11 (SOC < MinSOC): Entladen gesperrt.
                 # State 12 (Minimal-Ladung aus Netz): erhoeht SOC nicht nennenswert,
@@ -1862,7 +2084,7 @@ class ChargeController:
                 soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             else:
                 # Kein PV-Ueberschuss und SOC >= floor_soc:
-                # Victron ESS sperrt Batterieentladung unter floor_soc (Reg 2901) —
+                # Victron ESS sperrt Batterieentladung unter floor_soc (Reg 2901)  - 
                 # Verbraucher werden aus dem Netz gespeist, Batterie weder geladen
                 # noch entladen. SOC friert bei floor_soc ein.
                 # Vollladung wird naechsten Tag / bei ausreichend PV nachgeholt.
@@ -1878,7 +2100,7 @@ class ChargeController:
             """Berechnet Deficit und setzt action: discharging wenn Ueberschuss negativ, sonst idle.
 
             Bei soc <= floor_soc (Reg 2901 ESS MinimumSocLimit):
-            Victron ESS sperrt die Batterieentladung — Verbraucher werden aus dem Netz
+            Victron ESS sperrt die Batterieentladung  -  Verbraucher werden aus dem Netz
             gespeist, Batterie weder geladen noch entladen. SOC bleibt konstant.
             max(floor_soc, ...) bildet dieses Verhalten ab.
 
@@ -1886,7 +2108,7 @@ class ChargeController:
             min_charge_current (3 A). Bei soc > floor_soc fliesst dieser Strom
             tatsaechlich in die Batterie (~1 %/h bei 3 A / 48 V / 100 Ah).
             Die Simulation bildet das ab: current_a = min_charge_a, SOC steigt leicht.
-            Ausnahme: soc <= floor_soc → current_a = 0 (Entladesperre, kein Laden).
+            Ausnahme: soc <= floor_soc -> current_a = 0 (Entladesperre, kein Laden).
             """
             deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
             act = "discharging" if fc.net_kwh < 0 else "idle"
@@ -1915,13 +2137,13 @@ class ChargeController:
                 return action, current_a, soc_sim
             else:
                 # Kein PV-Ueberschuss: Victron ESS sperrt Batterieentladung bei
-                # soc <= floor_soc — SOC friert ein, Verbraucher aus Netz gespeist.
+                # soc <= floor_soc  -  SOC friert ein, Verbraucher aus Netz gespeist.
                 deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
                 soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)
                 return "discharging", 0.0, soc_sim
 
         # Ziel erreicht?
-        # v3.0.9.10: Asymmetrische Hysterese analog zu decide() — Simulation stoppt
+        # v3.0.9.10: Asymmetrische Hysterese analog zu decide()  -  Simulation stoppt
         # erst bei soc_sim >= dyn_target (nicht bei dyn_target - hyst), damit
         # Ladeplan und Realsteuerung konsistent bleiben.
         if soc_sim >= dyn_target:
@@ -1942,8 +2164,14 @@ class ChargeController:
         if morn_s <= h < effective_morn_e:
 
             # Wenn Stunde noch vor dem optimalen Fenster und SOC nicht kritisch -> warte
+            # v3.0.9.27: Nur warten wenn Optimal-Fenster den Netto-Ueberschuss tatsaechlich
+            # liefert  -  spiegelt decide() exakt (pv_in_optimal -> net_in_optimal Fix).
             if h < opt_start:
-                if soc_sim >= min_required:
+                fc_list_sim = self.forecast.get_forecast()
+                net_in_opt = sum(max(0.0, f2.net_kwh) for f2 in fc_list_sim
+                                 if opt_start <= f2.hour <= opt_end)
+                needed = max(0.0, (dyn_target - soc_sim) / 100.0 * cap)
+                if net_in_opt >= needed and soc_sim >= min_required:
                     action, current_a, soc_sim = _apply_deficit(soc_sim)
                     return action, current_a, soc_sim
 
@@ -1970,7 +2198,15 @@ class ChargeController:
                 reduced_a = self.cc.get("reduced_charge_current_a", 20)
                 current_a = min(fc.net_kwh * 1000 / nom_v, reduced_a)
             else:
-                current_a = min(fc.net_kwh * 1000 / nom_v, max_a)
+                # Ausserhalb Optimal-Fenster: konsistent mit decide()
+                # Kein fc.net_kwh-Cap: ESS/DVCC begrenzen physikalisch,
+                # decide() setzt ebenfalls max_a wenn soc < dyn_target.
+                if soc_sim < dyn_target:
+                    current_a = max_a
+                else:
+                    # Ziel bereits erreicht (defensiv, sollte durch
+                    # soc_sim >= dyn_target-Block oben abgefangen sein).
+                    current_a = min_charge_a
             charge_kwh = min(fc.net_kwh, current_a * nom_v / 1000.0)
             # Deckelung auf dyn_target (nicht max_soc)
             soc_sim = min(dyn_target, soc_sim + (charge_kwh / cap) * 100)
@@ -2082,7 +2318,7 @@ class ChargeController:
             # v3.0.9.24: _simulate_hour() gibt bei idle (soc > floor_soc) bereits
             # current_a = min_charge_a zurueck, sodass max() hier idempotent ist.
             # Ausnahme SOC <= floor_soc: _simulate_hour() gibt current_a=0 zurueck
-            # (Victron ESS Entladesperre) — effective_setpoint_a bleibt 0 -> 0 A.
+            # (Victron ESS Entladesperre)  -  effective_setpoint_a bleibt 0 -> 0 A.
             nom_v = self.bat.get("voltage_nominal", 48.0)
             min_charge_a = float(self.bat.get("min_charge_current", 3.0))
             surplus_current_a = fc.net_kwh * 1000.0 / nom_v
@@ -2321,22 +2557,22 @@ class ChargeController:
         if self._needs_full_charge() and self.state.soc < self.bat["max_soc"] - self.cc.get("soc_hysteresis", 2):
             force_new = True
 
-        # Massiver Export ins Netz → sofort neu entscheiden, nicht 10 min warten.
+        # Massiver Export ins Netz -> sofort neu entscheiden, nicht 10 min warten.
         # Verhindert dass eine veraltete Trickle/Idle-Entscheidung eingefroren bleibt
         # während hunderte Watt unnötig eingespeist werden. (v3.0.9.20 Bugfix)
         if self.state.grid_power_w < -1000:
             force_new = True
             self.logger.debug(
-                f"Massiver Export {self.state.grid_power_w:.0f}W → force_new=True")
+                f"Massiver Export {self.state.grid_power_w:.0f}W -> force_new=True")
 
-        # evcc-Statuswechsel (Start/Stop) → sofort neu entscheiden.
-        # Nach evcc-Stop fällt die Last schlagartig → Überschuss steigt → sofort laden.
-        # Nach evcc-Start steigt die Last → Ladestrom muss reduziert werden. (v3.0.9.20 Bugfix)
+        # evcc-Statuswechsel (Start/Stop) -> sofort neu entscheiden.
+        # Nach evcc-Stop fällt die Last schlagartig -> Überschuss steigt -> sofort laden.
+        # Nach evcc-Start steigt die Last -> Ladestrom muss reduziert werden. (v3.0.9.20 Bugfix)
         evcc_now = self.state.evcc_active
         if evcc_now != getattr(self, "_last_evcc_active", evcc_now):
             force_new = True
             self.logger.info(
-                f"evcc-Statuswechsel {'→ aktiv' if evcc_now else '→ gestoppt'} → force_new=True")
+                f"evcc-Statuswechsel {'-> aktiv' if evcc_now else '-> gestoppt'} -> force_new=True")
         self._last_evcc_active = evcc_now
 
         # Neue Entscheidung nur wenn Hysterese abgelaufen oder forced
@@ -2350,13 +2586,22 @@ class ChargeController:
             # remaining_min jeden Zyklus aktuell berechnet wird (kein eingefrorener Countdown)
             if mode == "trickle" and self._balancing_hold_until > 0:
                 target_a, mode, reason = self.decide()
-            elif not reason.endswith("(Hysterese)"):
+            elif mode == "idle" and not reason.endswith("(Hysterese)"):
+                # "(Hysterese)" nur bei idle anhaengen  -  signalisiert dass
+                # die Warteentscheidung im Cache ist, nicht eine Lade-Entscheidung.
                 reason = reason + " (Hysterese)"
         # Schreiben nur wenn sich der gerampte Sollwert tatsaechlich geaendert hat
+        # v3.0.9.26 Option A: Im Optimal-Fenster hoehere Schreib-Hysterese.
+        # Selbst nach Quantisierung koennen Ramp-Artefakte 1-A-Writes ausloesen
+        # (self._ramp_current laeuft schrittweise zwischen Stufen).
+        # Ausserhalb des Optimal-Fensters bleibt die 1-A-Schwelle erhalten.
         write_performed = False
         if target_a >= 0:
             ramped = self._ramp(target_a)
-            if abs(ramped - self._last_written_ramped_a) >= 1.0:
+            write_threshold = 1.0
+            if mode == "charging" and "Optimal-Fenster" in reason:
+                write_threshold = self.cc.get("optimal_window_write_deadband_a", 3.0)
+            if abs(ramped - self._last_written_ramped_a) >= write_threshold:
                 if self.victron.set_max_charge_current(ramped):
                     # WICHTIG: _last_written_ramped_a muss den tatsaechlich geschriebenen
                     # Wert enthalten (nach Clamping in set_max_charge_current), nicht den
@@ -2420,7 +2665,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Solar Batterie Manager v3.0.9.24</title>
+<title>Solar Batterie Manager v3.0.9.28</title>
 <style>
 :root{--bg:#0f1117;--bg2:#1a1d27;--bg3:#252836;
   --acc:#f59e0b;--grn:#22c55e;--red:#ef4444;--blu:#3b82f6;--vio:#a78bfa;
@@ -2468,7 +2713,7 @@ tr.past td{opacity:.38}tr.now td{background:rgba(245,158,11,.05)}
 </head>
 <body>
 <div class="hd">
-  <h1>&#9889; Solar Batterie Manager <span style="font-size:0.7rem;color:var(--mut);font-weight:400">v3.0.9.24</span></h1>
+  <h1>&#9889; Solar Batterie Manager <span style="font-size:0.7rem;color:var(--mut);font-weight:400">v3.0.9.28</span></h1>
   <div class="hdr">
     <div class="sp"><div class="dot" id="mdot"></div><span id="mst">Verbinde...</span></div>
     <div class="sp"><div class="dot" id="edot"></div><span id="est">evcc -</span></div>
@@ -2739,8 +2984,8 @@ def start_dashboard(cfg: dict, state: SystemState, logger: logging.Logger,
             f"werden unterdrückt, Heartbeat alle {dedup_heartbeat:.0f} Minuten")
 
     # Hintergrund-Heartbeat-Thread: überwacht alle Dedup-Instanzen.
-    # dedup_stream = BatteryManager StreamHandler → [IDLE]-Heartbeats im Journal
-    # dedup_werkzeug = Werkzeug StreamHandler → HTTP-Heartbeats im Journal
+    # dedup_stream = BatteryManager StreamHandler -> [IDLE]-Heartbeats im Journal
+    # dedup_werkzeug = Werkzeug StreamHandler -> HTTP-Heartbeats im Journal
     # Beide feuern alle 20min, auch ohne Browser und ohne [IDLE]-Änderungen.
     heartbeat_thread = _HeartbeatThread(
         filters=[dedup_stream, dedup_werkzeug],
@@ -2837,6 +3082,11 @@ def validate_config(cfg: dict, logger: logging.Logger) -> bool:
                     f"charging.optimal_window_min_current_a ({opt_min}) darf nicht groesser "
                     f"als reduced_charge_current_a ({red_a}) sein")
 
+    # v3.0.9.26: required_a_smooth_window
+    if "required_a_smooth_window" in cc:
+        if cc["required_a_smooth_window"] < 1:
+            issues.append("charging.required_a_smooth_window muss >= 1 sein")
+
     if issues:
         for issue in issues:
             logger.error(f"Config-Fehler: {issue}")
@@ -2860,7 +3110,7 @@ def main():
     logger, dedup_file, dedup_stream = setup_logging(cfg)
 
     logger.info("=" * 60)
-    logger.info("Solar Batterie Manager v3.0.9.24  (Modbus TCP) - Predictive Charging")
+    logger.info("Solar Batterie Manager v3.0.9.28  (Modbus TCP) - Predictive Charging")
     logger.info(f"Konfiguration: {config_path}")
     logger.info("=" * 60)
 
@@ -2948,7 +3198,7 @@ def main():
             # 4. Prognose aktualisieren wenn faellig
             if now_ts - last_fc_ts > fc_interval:
                 try:
-                    # v3.0.9.4: Bei VRM immer force=True — VRM aktualisiert stündlich,
+                    # v3.0.9.4: Bei VRM immer force=True  -  VRM aktualisiert stündlich,
                     # besonders bei Wetterwechseln. Der Server cached selbst.
                     use_force = forecast.vrm.enabled
                     fc = forecast.get_forecast(force=use_force)
