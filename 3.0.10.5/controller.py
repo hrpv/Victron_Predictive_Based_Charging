@@ -166,6 +166,11 @@ class ChargeController:
         self._last_written_ramped_a: float = 0.0
         # Persistenter Zustand: nur alle 5 Minuten auf SD-Karte schreiben
         self._last_persistent_save: float = 0.0
+        # v3.0.9.28: Hysterese auf dem QUANTISIERTEN Sollwert, nicht dem
+        # gerampeten Wert. Verhindert Oszillation 10A↔15A durch Ramp-Artefakte
+        # wenn decide() zwischen Stufen wechselt und _ramp() schrittweise
+        # durchläuft.
+        self._last_quantized_target_a: float = 0.0
         # v3.0.0: Morgen-Notladung Tracking
         self._morning_emergency_done: bool = False
         # v3.0.0: Auto-Reset Vollladung Tracking
@@ -528,7 +533,15 @@ class ChargeController:
                         f"(SOC {soc:.1f}% ≈ {dyn_target:.0f}%)")
 
                 minute_now = datetime.now().minute
-                hours_left = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
+                # v3.0.10.6: hours_left auf 0.5h-Stufen quantisieren.
+                # Ohne Quantisierung aendert sich hours_left jede Minute leicht
+                # (z.B. 4.53 -> 4.52h), was required_a langsam driftet und an
+                # Quantisierungsgrenzen (z.B. 12.4 -> 12.6 A -> round() kippt
+                # von 10A auf 15A) einen Write ausloest. Mit 0.5h-Stufen aendert
+                # sich hours_left nur 2x pro Stunde -> required_a ist 30 Minuten
+                # stabil, kein Stufenwechsel durch Minutendrift.
+                hours_left_raw = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
+                hours_left = max(round(hours_left_raw * 2) / 2, 0.5)
                 required_kw = (missing_kwh * 1.15) / hours_left
                 required_a = (required_kw * 1000.0) / actual_v
 
@@ -539,6 +552,9 @@ class ChargeController:
                 # Nie mehr Strom als verfügbarer Überschuss erlaubt.
                 # v3.0.9.26: required_a glaetten (Ursache 2: langsamer Drift
                 # durch hours_left-Aenderung ueberschreitet Quantisierungsgrenze).
+                # v3.0.10.6: _smooth_required_a bleibt als Absicherung gegen
+                # SOC-Messrauschen erhalten; durch hours_left-Quantisierung ist
+                # sie aber nicht mehr der primaere Stabilisierungsmechanismus.
                 smoothed_required = self._smooth_required_a(required_a)
                 charge_a = min(max_from_surplus, smoothed_required, reduced_a)
                 # reduced_a-Cap explizit vor Quantisierung sicherstellen:
@@ -1180,18 +1196,30 @@ class ChargeController:
                 # "(Hysterese)" nur bei idle anhaengen  -  signalisiert dass
                 # die Warteentscheidung im Cache ist, nicht eine Lade-Entscheidung.
                 reason = reason + " (Hysterese)"
-        # Schreiben nur wenn sich der gerampte Sollwert tatsaechlich geaendert hat
-        # v3.0.9.26 Option A: Im Optimal-Fenster hoehere Schreib-Hysterese.
-        # Selbst nach Quantisierung koennen Ramp-Artefakte 1-A-Writes ausloesen
-        # (self._ramp_current laeuft schrittweise zwischen Stufen).
-        # Ausserhalb des Optimal-Fensters bleibt die 1-A-Schwelle erhalten.
+        # Schreiben nur wenn sich der QUANTISIERTE Sollwert tatsaechlich geaendert hat
+        # v3.0.9.28: Hysterese auf dem QUANTISIERTEN Zielwert, nicht dem
+        # gerampeten Wert. _ramp() driftet schrittweise zwischen Stufen
+        # (z.B. 10 -> 15 in 5A-Schritten), was bei Hysterese auf gerampetem
+        # Wert einen Write pro Schritt ausloest. Stattdessen: nur schreiben
+        # wenn sich das quantisierte Ziel von _last_quantized_target_a um
+        # >= write_threshold unterscheidet. Der gerampete Wert wird nur fuer
+        # den tatsaechlichen Modbus-Write verwendet, nicht fuer die
+        # Entscheidung ob geschrieben wird.
         write_performed = False
         if target_a >= 0:
             ramped = self._ramp(target_a)
             write_threshold = 1.0
             if mode == "charging" and "Optimal-Fenster" in reason:
                 write_threshold = self.cc.get("optimal_window_write_deadband_a", 3.0)
-            if abs(ramped - self._last_written_ramped_a) >= write_threshold:
+            # Hysterese auf dem quantisierten Sollwert (target_a),
+            # nicht dem gerampeten Wert. target_a ist bereits in decide()
+            # quantisiert (10/15/20A...). Nur wenn sich diese Stufe aendert,
+            # wird ein Write ausgeloest. Der gerampete Wert wird trotzdem
+            # an set_max_charge_current() uebergeben (sanftes Rampen),
+            # aber die Entscheidung "schreiben oder nicht" basiert auf dem
+            # stabilen quantisierten Ziel.
+            if abs(target_a - self._last_quantized_target_a) >= write_threshold:
+                self._last_quantized_target_a = target_a
                 if self.victron.set_max_charge_current(ramped):
                     # WICHTIG: _last_written_ramped_a muss den tatsaechlich geschriebenen
                     # Wert enthalten (nach Clamping in set_max_charge_current), nicht den
@@ -1214,19 +1242,3 @@ class ChargeController:
             a = self.state.charge_current_setpoint
             log_suffix = " [KEIN WRITE]" if (target_a >= 0 and not write_performed) else ""
             self.logger.info(f"[{mode.upper()}] {a:.0f}A | {reason[:120]}{log_suffix}")
-
-# ── Hintergrund-Heartbeat für Werkzeug-Logger ────────────────────────────
-# Wenn der Browser-Tab geschlossen ist, kommen keine HTTP-Requests rein.
-# Der DeduplicatingFilter prüft den Heartbeat-Timer nur bei eingehenden
-# Log-Einträgen. Ohne Requests wird kein Heartbeat ausgelöst.
-# Lösung: Ein Daemon-Thread prüft alle 60 Sekunden, ob der Heartbeat
-# fällig ist, und emitiert einen synthetischen Log-Eintrag.
-
-
-# ─────────────────────────────────────────────
-# Hauptprogramm
-# ─────────────────────────────────────────────
-
-# ─────────────────────────────────────────────
-# Hauptprogramm
-# ─────────────────────────────────────────────

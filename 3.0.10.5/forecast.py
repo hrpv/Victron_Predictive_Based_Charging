@@ -64,14 +64,6 @@ class VrmForecastManager:
         return {"x-authorization": f"Token {self.token}",
                 "Content-Type": "application/json"}
 
-    def _sundown_unix(self) -> int:
-        """Sonnenuntergang heute: 21 Uhr Ortszeit als Unix-Timestamp."""
-        now = datetime.now()
-        sundown = now.replace(hour=21, minute=0, second=0, microsecond=0)
-        if sundown < now:
-            sundown = sundown + timedelta(days=1)
-        return int(sundown.timestamp())
-
     def fetch(self, force: bool = False) -> Optional[list]:
         """
         Gibt stundliche HourlyForecast-Liste zurueck oder None bei Fehler.

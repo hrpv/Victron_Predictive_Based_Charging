@@ -4,6 +4,34 @@ Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 
 ---
 
+## v3.0.10.5 — Code-Review Cleanup (2026-06-12)
+
+Changed:
+- `battery_manager.py`: Veralteten Header aktualisiert (v3.0.10.0 → v3.0.10.5,
+  Dateistruktur zeigt jetzt alle 8 Module).
+- `battery_manager.py`: Überflüssige Imports entfernt — `HourlyForecast`,
+  `HourlyHistory` (nirgends verwendet), `DeduplicatingFilter` (nur
+  `setup_logging()` nötig, Instanz wird zurückgegeben).
+- `battery_manager.py`: 6 Migrationskommentar-Blöcke entfernt (Relikte des
+  Refactorings, kein Mehrwert nach Abschluss der Aufteilung).
+- `battery_manager.py`: Guard `if dedup_stream is not None` vor
+  `start_dashboard()`-Aufruf (defensiv gegen theoretischen Doppel-Init).
+- `dashboard.py`: `TYPE_CHECKING`-Import korrigiert:
+  `from battery_manager import ...` → `from models import SystemState` /
+  `from logging_setup import DeduplicatingFilter` (verhindert zirkulären
+  Import bei aktiviertem Type-Checker).
+- `dashboard.py`: Ungenutzten `import re as _re` entfernt (Copy-Paste-Relikt
+  aus `DeduplicatingFilter._normalize()`).
+- `forecast.py`: Tote Methode `_sundown_unix()` entfernt (obsolet seit
+  `_get_dynamic_night_window()` astronomische Zeiten berechnet).
+- `modbus_victron.py`: Ungenutzten `ModbusException`-Import entfernt
+  (alle Fehler werden durch generisches `except Exception` abgefangen).
+- `controller.py`: Doppelten `# Hauptprogramm`-Kommentar-Header und
+  veralteten Heartbeat-Erklärungskommentar am Dateiende entfernt
+  (Heartbeat lebt seit Refactoring in `dashboard.py`).
+
+---
+
 ## v3.0.10.5 (2026-06-12)
 
 Changed:

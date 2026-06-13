@@ -32,10 +32,8 @@ if TYPE_CHECKING:
 
 try:
     from pymodbus.client import ModbusTcpClient
-    from pymodbus.exceptions import ModbusException
 except ImportError:
     ModbusTcpClient = None
-    ModbusException = Exception
 
 
 # ─────────────────────────────────────────────

@@ -5,7 +5,7 @@
 Prognosebasiertes Laden - Batterielebensdauer optimieren
 LFP Akku | Victron Multiplus II + Cerbo GX
 =============================================================
-Version: 3.0.10.0 (Modbus TCP, kein MQTT)
+Version: siehe version.py (Modbus TCP, kein MQTT)
 
 Kommunikation:
 - Lesen:     Modbus TCP -> Cerbo GX (Port 502, Unit-ID 100)
@@ -19,8 +19,15 @@ Steuerlogik:
 - evcc-Priorität: bei Schnellladen Auto -> eigene Steuerung pausieren
 - evcc MinSoc-Sperre (Reg 2901) wird im Ladeplan berücksichtigt
 
-Dateistruktur (ab v3.0.10.0):
-- battery_manager.py  : Steuerlogik, Modbus, Prognose (diese Datei)
+Dateistruktur (ab v3.0.10.6):
+- battery_manager.py  : Entry Point, Config-Validierung, Hauptschleife
+- version.py          : Versionsstring (einzige Stelle)
+- controller.py       : Ladelogik, ChargeController, EnergyAccumulator
+- forecast.py         : VRM / Open-Meteo / Solcast / Dummy Prognose
+- modbus_victron.py   : Modbus-TCP, Register-Mapping, DVCC-Schreiben
+- evcc.py             : evcc REST-Polling, Reg-2901-Überwachung
+- logging_setup.py    : DeduplicatingFilter, setup_logging
+- models.py           : Dataclasses (SystemState, HourlyForecast, ...)
 - dashboard.py        : HTML-Template, Flask-Server, Heartbeat-Thread
 - CHANGELOG.md        : Versionshistorie
 
@@ -66,10 +73,6 @@ Victron Modbus-TCP Register (Cerbo GX, Unit-ID 100):
 =============================================================
 """
 
-# Einzige Stelle für den Versionsstring.
-# Wird an dashboard.py übergeben und in logger.info verwendet.
-VERSION = "3.0.10.5"
-
 import logging
 import os
 import sys
@@ -81,20 +84,15 @@ from typing import Optional
 import requests
 import yaml
 
-from models import SystemState, HourlyForecast, HourlyHistory
-from logging_setup import DeduplicatingFilter, setup_logging
+from version import VERSION
+from models import SystemState
+from logging_setup import setup_logging
 from modbus_victron import VictronModbus
 from evcc import EvccMonitor
 from forecast import ForecastManager
 from controller import EnergyAccumulator, ChargeController
 from dashboard import start_dashboard
 
-
-# ─────────────────────────────────────────────
-# Datenstrukturen -> models.py
-# ─────────────────────────────────────────────
-# SystemState, HourlyForecast, HourlyHistory sind nach models.py ausgelagert.
-# Import erfolgt oben: from models import SystemState, HourlyForecast, HourlyHistory
 
 def load_config(config_path: str = "config.yaml") -> dict:
     path = Path(config_path)
@@ -103,42 +101,6 @@ def load_config(config_path: str = "config.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
-
-# ─────────────────────────────────────────────
-# Logging -> logging_setup.py
-# ─────────────────────────────────────────────
-# DeduplicatingFilter und setup_logging() sind nach logging_setup.py ausgelagert.
-# Import erfolgt oben: from logging_setup import DeduplicatingFilter, setup_logging
-
-# ─────────────────────────────────────────────
-# Victron Modbus-TCP Interface -> modbus_victron.py
-# ─────────────────────────────────────────────
-# VictronModbus ist nach modbus_victron.py ausgelagert.
-# Import erfolgt oben: from modbus_victron import VictronModbus
-
-# ─────────────────────────────────────────────
-# evcc Koordination -> evcc.py
-# ─────────────────────────────────────────────
-# EvccMonitor ist nach evcc.py ausgelagert.
-# Import erfolgt oben: from evcc import EvccMonitor
-
-# PV-Prognose -> forecast.py
-# ─────────────────────────────────────────────
-# VrmForecastManager und ForecastManager sind nach forecast.py ausgelagert.
-# Import erfolgt oben: from forecast import ForecastManager
-
-
-# ─────────────────────────────────────────────
-# Ladesteuerung -> controller.py
-# ─────────────────────────────────────────────
-# EnergyAccumulator, PowerSmoother, ChargeController sind nach controller.py ausgelagert.
-# Import erfolgt oben: from controller import EnergyAccumulator, ChargeController
-
-
-
-# ─────────────────────────────────────────────
-# Hauptprogramm
-# ─────────────────────────────────────────────
 
 # ─────────────────────────────────────────────
 # Hauptprogramm
@@ -298,7 +260,11 @@ def main():
 
     # Dashboard
     if cfg.get("dashboard", {}).get("enabled", True):
-        start_dashboard(cfg, state, logger, dedup_stream, version=VERSION)
+        if dedup_stream is not None:
+            start_dashboard(cfg, state, logger, dedup_stream, version=VERSION)
+        else:
+            logger.warning("dedup_stream=None: Dashboard ohne Deduplizierung gestartet")
+            start_dashboard(cfg, state, logger, dedup_stream, version=VERSION)
 
     # Hauptschleife
     interval    = cfg["charging"].get("control_interval_seconds", 60)

@@ -27,7 +27,8 @@ from dataclasses import asdict
 # übergeben – kein echter Import nötig.
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from battery_manager import SystemState, DeduplicatingFilter
+    from models import SystemState
+    from logging_setup import DeduplicatingFilter
 
 
 # ─────────────────────────────────────────────
@@ -62,7 +63,7 @@ class _HeartbeatThread(threading.Thread):
 # HTML-Template
 # ─────────────────────────────────────────────
 # Platzhalter die zur Laufzeit ersetzt werden:
-#   __VERSION__  -> VERSION aus battery_manager.py (z.B. "3.0.10.0")
+#   __VERSION__  -> VERSION aus battery_manager.py (z.B. "3.0.10.5")
 #   __REFRESH__  -> refresh_interval_seconds aus config.yaml
 #   __CAP__      -> battery.capacity_kwh aus config.yaml
 
@@ -384,8 +385,6 @@ def start_dashboard(cfg: dict, state, logger: logging.Logger,
     dedup_heartbeat  = log_cfg.get("dedup_heartbeat_minutes", 20.0)
 
     # Import hier um zirkulären Top-Level-Import zu vermeiden
-    import re as _re
-
     # DeduplicatingFilter-Klasse aus dem aufrufenden Modul holen
     # (wird als Instanz übergeben, Klasse für neues Objekt nötig)
     DeduplicatingFilter = type(dedup_stream)
