@@ -327,11 +327,13 @@ async function refresh(){
         ?`<span style="color:var(--grn)">+${(s.surplus_kwh||0).toFixed(2)}</span>`
         :`<span style="color:var(--red)">${(s.surplus_kwh||0).toFixed(2)}</span>`;
       const ca=s.charge_current_a||0;
-      const caSign=ca>=0?'+':'';
       const caColor=ca>0.5?'var(--grn)':ca<-0.5?'var(--red)':'var(--txt)';
       const caOpacity=s.is_past?'1':'0.6';
+      const caFmt=s.is_past
+        ?(ca>=0?`+${ca.toFixed(1)}`:`${ca.toFixed(1)}`)
+        :`${Math.abs(ca).toFixed(1)}`;
       const caStr=ca!==0
-        ?`<span style="color:${caColor};opacity:${caOpacity}">${caSign}${ca.toFixed(1)} A</span>`
+        ?`<span style="color:${caColor};opacity:${caOpacity}">${caFmt} A</span>`
         :`<span style="opacity:0.35">0 A</span>`;
       return`<tr class="${cl}">
         <td>${String(s.hour).padStart(2,'0')}:00</td>

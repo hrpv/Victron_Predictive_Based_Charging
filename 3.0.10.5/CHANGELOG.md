@@ -80,8 +80,12 @@ Fixed (während Live-Test 2026-06-14 entdeckt):
   Nach Stundenabschluss greift wie bisher der History-Wert (`bat_energy_wh`-
   integrierter Ist-Strom). Kein Dashboard-Update nötig.
 
-- `version.py`: VERSION auf 3.0.11 aktualisiert.
+- `dashboard.py`: Stromwerte im Ladeplan ohne Vorzeichen für laufende und
+  zukünftige Stunden (Sollwerte/Prognose). Vergangene Stunden zeigen weiterhin
+  vorzeichenbehafteten Ist-Strom (`+9.3 A` laden / `-16.7 A` entladen).
+  Nur `dashboard.py` betroffen, kein `controller.py`-Update.
 
+- `version.py`: VERSION auf 3.0.11 aktualisiert.
 
 ---
 
