@@ -973,6 +973,15 @@ class ChargeController:
             else:
                 planned_current_a = round(surplus_current_a, 1)
 
+            # v3.0.11: Für die laufende Stunde im Optimal-Fenster den echten
+            # Stunden-Setpoint aus _opt_setpoint_a anzeigen statt des simulierten
+            # Wertes. Simulation kennt keine Defizit-Korrekturen aus Vorjahr-Stunden.
+            is_current_hour = (h == now_h and now_m < 55)
+            if is_current_hour and self._opt_plan_hour == now_h:
+                planned_current_a = round(self._opt_setpoint_a, 1)
+                if action != "trickle":
+                    action = "charging"
+
             result.append({
                 "hour": h,
                 "pv_kwh": fc.pv_kwh,

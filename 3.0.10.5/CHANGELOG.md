@@ -73,6 +73,13 @@ Fixed (während Live-Test 2026-06-14 entdeckt):
   Prognose immer >2400Wh → immer 50A. Fix: `planned_wh` auf `needed_wh`
   (Bedarf bis Ziel-SOC pro Reststunde) gedeckelt, Prognose als Obergrenze.
 
+- **Ladeplan zeigt echten Sollwert für laufende Stunde**: `build_schedule()`
+  verwendete für die aktuelle Stunde den simulierten Strom aus
+  `_simulate_hour()`, der keine Defizit-Korrekturen aus Vorjahr-Stunden kennt.
+  Fix: wenn `_opt_plan_hour == now_h`, wird `_opt_setpoint_a` direkt eingesetzt.
+  Nach Stundenabschluss greift wie bisher der History-Wert (`bat_energy_wh`-
+  integrierter Ist-Strom). Kein Dashboard-Update nötig.
+
 - `version.py`: VERSION auf 3.0.11 aktualisiert.
 
 
