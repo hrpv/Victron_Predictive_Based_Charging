@@ -186,6 +186,22 @@ class ChargeController:
         # Tagesreset-Tracking: Mitternachts-Reset der Balancing-Timer
         self._balancing_reset_date: str = date.today().isoformat()
 
+        # v3.0.11: Optimal-Fenster Prognose-basierte Stundensteuerung
+        # Kein Filter, keine Quantisierung, keine Glättung im Optimal-Fenster.
+        # Strom wird stündlich aus dem Prognose-Netto-Überschuss gesetzt.
+        # Defizit aus Vorjahr-Stunde wird auf Reststunden aufgeteilt.
+        #
+        # _opt_plan_hour:    Stunde für die der aktuelle Setpoint gilt (-1 = noch kein Plan)
+        # _opt_planned_wh:   Geplante Ladeenergie dieser Stunde [Wh] (positiv = Laden)
+        # _opt_bat_wh_snapshot: bat_wh_total beim Stundenbeginn (für Ist-Energie-Messung)
+        # _opt_carried_wh:   Kumuliertes Defizit aus Vorjahr-Stunden [Wh]
+        # _opt_setpoint_a:   Aktuell gültiger Ladestrom aus Stundenplanung [A]
+        self._opt_plan_hour: int = -1
+        self._opt_planned_wh: float = 0.0
+        self._opt_bat_wh_snapshot: float = 0.0
+        self._opt_carried_wh: float = 0.0
+        self._opt_setpoint_a: float = 0.0
+
     def _load_energy_base(self):
         """Laedt letzten bekannten Energie-Akkumulatorstand aus state.json."""
         try:
@@ -504,76 +520,98 @@ class ChargeController:
                         f"({net_in_optimal:.1f} kWh < {needed_kwh:.1f} kWh)")
                 return max_a, "charging", f"Morgen: {reason}, fruehes Laden noetig"
 
-        # ── 6. PV-Ueberschuss mit dynamischem Strom (v3.0.9.11) ──
-        # Überschuss wird über Grid-Leistung bestimmt (zuverlässiger als PV-Load),
-        # oder als Fallback PV - Load - Battery_Charge. Der tatsächlich verfügbare
-        # Überschuss limitiert den Ladestrom  -  nie mehr Strom setzen als PV liefert.
+        # ── 6. Optimal-Fenster: Prognose-basierte Stundensteuerung (v3.0.11) ────
+        # Kein Filter, keine Quantisierung, keine Glättung.
+        # Strom wird beim Fenstereintritt und zu jeder vollen Stunde neu gesetzt,
+        # basierend auf dem prognostizierten Netto-Überschuss der nächsten Stunde.
+        # Defizit aus Vorjahr-Stunde (Ist < Plan) wird auf Reststunden verteilt.
+        #
+        # Innerhalb der Stunde: nur SOC vs. dyn_target wird überwacht.
+        # Wenn SOC > dyn_target -> sofort auf min_charge_current.
         h_now = datetime.now().hour
         opt_start, opt_end = self._get_optimal_charge_window()
-
-        # Maximal sinnvoller Ladestrom aus verfügbarem Überschuss.
-        # Bei 50V Akkuspannung: 1A ≈ 50W. Nie mehr Strom fordern als Überschuss
-        # vorhanden ist  -  sonst wird aus dem Netz geladen (Grid-Bezug).
         nom_v = self.bat.get("voltage_nominal", 48.0)
         actual_v = max(self.state.battery_voltage, nom_v * 0.875, 42.0)
-        max_from_surplus = surplus_w / actual_v if surplus_w > 0 else 0.0
+        max_a_opt = self.bat["max_charge_current"]
+        min_charge_a_opt = float(self.bat.get("min_charge_current", 3.0))
 
-        if opt_start <= h_now <= opt_end and surplus_w > 200:
-            needed_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
+        if opt_start <= h_now <= opt_end:
+            # SOC-Schutz: Ziel überschritten -> sofort Strom reduzieren
+            if soc > dyn_target:
+                self._opt_plan_hour = -1  # Plan zurücksetzen, Ziel erreicht
+                return min_charge_a_opt, "trickle", (
+                    f"Optimal-Fenster: SOC {soc:.1f}% > Ziel {dyn_target:.0f}% "
+                    f"-> reduziere auf {min_charge_a_opt:.0f}A")
+
             fc_list = self.forecast.get_forecast()
-            # v3.0.9.27: Netto-Ueberschuss statt Brutto-PV
-            net_in_optimal = sum(max(0.0, f.net_kwh) for f in fc_list if opt_start <= f.hour <= opt_end)
-            if net_in_optimal >= needed_kwh * 1.5:
-                missing_kwh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"])
+            fc_by_hour_opt = {f.hour: f for f in fc_list}
 
-                if missing_kwh <= 0.1:
-                    gentle_a = self.bat.get("min_charge_current", 5)
-                    return gentle_a, "trickle", (
-                        f"Optimal-Fenster: Ziel fast erreicht, sanft {gentle_a}A "
-                        f"(SOC {soc:.1f}% ≈ {dyn_target:.0f}%)")
+            # Verbleibende Stunden im Fenster (inkl. aktueller Stunde)
+            hours_left = max(1, opt_end - h_now + 1)
 
-                minute_now = datetime.now().minute
-                # v3.0.10.6: hours_left auf 0.5h-Stufen quantisieren.
-                # Ohne Quantisierung aendert sich hours_left jede Minute leicht
-                # (z.B. 4.53 -> 4.52h), was required_a langsam driftet und an
-                # Quantisierungsgrenzen (z.B. 12.4 -> 12.6 A -> round() kippt
-                # von 10A auf 15A) einen Write ausloest. Mit 0.5h-Stufen aendert
-                # sich hours_left nur 2x pro Stunde -> required_a ist 30 Minuten
-                # stabil, kein Stufenwechsel durch Minutendrift.
-                hours_left_raw = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
-                hours_left = max(round(hours_left_raw * 2) / 2, 0.5)
-                required_kw = (missing_kwh * 1.15) / hours_left
-                required_a = (required_kw * 1000.0) / actual_v
+            # Bat-Wh-Total für Ist-Messung: EnergyAccumulator + Neustart-Basis
+            bat_wh_total_now = self.state.bat_energy_today_wh + self._energy_base_bat
 
-                optimal_min_a = self.cc.get("optimal_window_min_current_a", 10)
-                reduced_a = self.cc.get("reduced_charge_current_a", 20)
+            # Neue Stunde? Neu planen wenn Stunde gewechselt oder noch kein Plan
+            new_hour = (self._opt_plan_hour != h_now)
 
-                # v3.0.9.11: Auch im Optimal-Fenster durch Überschuss limitieren!
-                # Nie mehr Strom als verfügbarer Überschuss erlaubt.
-                # v3.0.9.26: required_a glaetten (Ursache 2: langsamer Drift
-                # durch hours_left-Aenderung ueberschreitet Quantisierungsgrenze).
-                # v3.0.10.6: _smooth_required_a bleibt als Absicherung gegen
-                # SOC-Messrauschen erhalten; durch hours_left-Quantisierung ist
-                # sie aber nicht mehr der primaere Stabilisierungsmechanismus.
-                smoothed_required = self._smooth_required_a(required_a)
-                charge_a = min(max_from_surplus, smoothed_required, reduced_a)
-                # reduced_a-Cap explizit vor Quantisierung sicherstellen:
-                charge_a = max(optimal_min_a, min(reduced_a, charge_a))
+            if new_hour:
+                # Defizit der abgeschlossenen Vorjahr-Stunde berechnen
+                if self._opt_plan_hour >= 0:
+                    # Tatsächlich geladene/entladene Wh seit Stundenbeginn (signed)
+                    actual_wh = bat_wh_total_now - self._opt_bat_wh_snapshot
+                    deficit_wh = self._opt_planned_wh - actual_wh
+                    self._opt_carried_wh += deficit_wh
+                    self.logger.info(
+                        f"Optimal-Fenster H{self._opt_plan_hour:02d} abgeschlossen: "
+                        f"Plan={self._opt_planned_wh:.0f}Wh, "
+                        f"Ist={actual_wh:.0f}Wh, "
+                        f"Defizit={deficit_wh:+.0f}Wh, "
+                        f"Übertrag={self._opt_carried_wh:+.0f}Wh")
 
-                # v3.0.9.26 Option C: Quantisierung auf Stromstufen.
-                # Grid-Messung rauscht ±2000 W -> charge_a wechselt sonst
-                # jeden Zyklus zwischen z.B. 18/19/20 A ohne physikalischen
-                # Unterschied. Mit step=5 A sind nur 10/15/20 A moeglich;
-                # ein Write entsteht nur bei echtem Ueberschuss-Sprung.
-                step = self.cc.get("optimal_window_current_step_a", 5)
-                if step > 0:
-                    charge_a = round(charge_a / step) * step
-                    charge_a = max(optimal_min_a, min(int(reduced_a), int(charge_a)))
+                # Prognose-Netto-Überschuss der aktuellen Stunde [Wh]
+                fc_now = fc_by_hour_opt.get(h_now)
+                forecast_surplus_wh = max(0.0, fc_now.net_kwh * 1000.0) if fc_now else 0.0
 
-                return charge_a, "charging", (
-                    f"Optimal-Fenster: Überschuss {surplus_w:.0f}W [{surplus_source}] -> "
-                    f"max {max_from_surplus:.1f}A, setze {charge_a:.0f}A "
-                    f"({missing_kwh:.1f} kWh in {hours_left:.1f}h, reserve +15%)")
+                # Fehlende Energie bis Ziel-SOC, gleichmäßig auf Reststunden verteilt.
+                # Begrenzt durch den Prognose-Überschuss dieser Stunde:
+                # Nie mehr anfordern als PV liefert, nie weniger als nötig.
+                missing_wh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"] * 1000.0)
+                needed_wh = missing_wh / max(hours_left, 1)
+
+                # Defizit-Anteil aus Vorjahr-Stunden gleichmäßig verteilen
+                deficit_share_wh = self._opt_carried_wh / max(hours_left, 1)
+
+                # Geplante Ladeenergie: benötigte Energie + Defizit-Ausgleich,
+                # nach oben begrenzt durch Prognose-Überschuss.
+                planned_wh = min(forecast_surplus_wh, needed_wh + deficit_share_wh)
+                # Sicherheit: nie weniger als Defizit-Anteil allein (Aufholen sicherstellen)
+                planned_wh = max(planned_wh, min(deficit_share_wh, forecast_surplus_wh))
+
+                # Ladestrom: E[Wh] / t[1h] / U[V] = I[A]
+                planned_a = planned_wh / actual_v
+                charge_a = max(min_charge_a_opt, min(max_a_opt, planned_a))
+
+                # Plan für diese Stunde speichern
+                self._opt_plan_hour = h_now
+                self._opt_planned_wh = planned_wh
+                self._opt_bat_wh_snapshot = bat_wh_total_now
+                self._opt_setpoint_a = charge_a
+
+                self.logger.info(
+                    f"Optimal-Fenster H{h_now:02d} neuer Plan: "
+                    f"Prognose={forecast_surplus_wh:.0f}Wh, "
+                    f"Bedarf={needed_wh:.0f}Wh/h ({missing_wh:.0f}Wh/{hours_left}h), "
+                    f"Defizitanteil={deficit_share_wh:+.0f}Wh, "
+                    f"Plan={planned_wh:.0f}Wh -> {charge_a:.1f}A")
+            else:
+                charge_a = self._opt_setpoint_a
+
+            return charge_a, "charging", (
+                f"Optimal-Fenster H{h_now:02d}: {charge_a:.0f}A "
+                f"(Plan {self._opt_planned_wh:.0f}Wh, "
+                f"Übertrag {self._opt_carried_wh:+.0f}Wh, "
+                f"SOC {soc:.1f}%→{dyn_target:.0f}%)")
 
         # ── 6. Nachmittag außerhalb Optimal-Fenster: SOC < Ziel -> max laden ──
         # Keine surplus-Abhängigkeit außerhalb des Optimal-Fensters.
@@ -1104,6 +1142,12 @@ class ChargeController:
             self._balancing_reset_date = _today_iso
             self._power_smoother.reset()  # Glättungspuffer bei Tageswechsel leeren
             self._energy_base_bat = 0.0  # Wh-Basis zurücksetzen
+            # v3.0.11: Optimal-Fenster Plan zurücksetzen (neuer Tag, neues Fenster)
+            self._opt_plan_hour = -1
+            self._opt_planned_wh = 0.0
+            self._opt_bat_wh_snapshot = 0.0
+            self._opt_carried_wh = 0.0
+            self._opt_setpoint_a = 0.0
             self.logger.info("Mitternachts-Reset: Balancing-Timer und Glättung zurueckgesetzt")
 
         # ── days_since_full_charge immer aktuell aus Datum berechnen ──────────
@@ -1196,30 +1240,32 @@ class ChargeController:
                 # "(Hysterese)" nur bei idle anhaengen  -  signalisiert dass
                 # die Warteentscheidung im Cache ist, nicht eine Lade-Entscheidung.
                 reason = reason + " (Hysterese)"
-        # Schreiben nur wenn sich der QUANTISIERTE Sollwert tatsaechlich geaendert hat
-        # v3.0.9.28: Hysterese auf dem QUANTISIERTEN Zielwert, nicht dem
-        # gerampeten Wert. _ramp() driftet schrittweise zwischen Stufen
-        # (z.B. 10 -> 15 in 5A-Schritten), was bei Hysterese auf gerampetem
-        # Wert einen Write pro Schritt ausloest. Stattdessen: nur schreiben
-        # wenn sich das quantisierte Ziel von _last_quantized_target_a um
-        # >= write_threshold unterscheidet. Der gerampete Wert wird nur fuer
-        # den tatsaechlichen Modbus-Write verwendet, nicht fuer die
-        # Entscheidung ob geschrieben wird.
+        # Schreiben nur wenn sich der Sollwert tatsaechlich geaendert hat
+        # v3.0.11: Einheitliche Rampe + Hysterese für alle Modi inkl. Optimal-Fenster.
+        # Im Optimal-Fenster ändert sich target_a nur stündlich (neuer Plan) oder
+        # beim SOC-Guard — die Rampe läuft schrittweise zum neuen Ziel, danach
+        # ist ramped == target_a == last_written → kein weiterer Write (Hysterese 1A).
+        # Außerhalb des Optimal-Fensters: identisches Verhalten.
         write_performed = False
         if target_a >= 0:
+            is_optimal = mode == "charging" and "Optimal-Fenster" in reason
+
+            # v3.0.11: Im Optimal-Fenster wird der Strom genau wie alle anderen
+            # Modi gerampet. Der Zielstrom ändert sich nur stündlich (neuer Plan)
+            # oder beim SOC-Guard — die Rampe dämpft den Sprung sanft.
+            # Kein Sofort-Sprung mehr (war v3.0.10.7-Erbschaft für alten Hysterese-Bug).
             ramped = self._ramp(target_a)
+
             write_threshold = 1.0
-            if mode == "charging" and "Optimal-Fenster" in reason:
-                write_threshold = self.cc.get("optimal_window_write_deadband_a", 3.0)
-            # Hysterese auf dem quantisierten Sollwert (target_a),
-            # nicht dem gerampeten Wert. target_a ist bereits in decide()
-            # quantisiert (10/15/20A...). Nur wenn sich diese Stufe aendert,
-            # wird ein Write ausgeloest. Der gerampete Wert wird trotzdem
-            # an set_max_charge_current() uebergeben (sanftes Rampen),
-            # aber die Entscheidung "schreiben oder nicht" basiert auf dem
-            # stabilen quantisierten Ziel.
-            if abs(target_a - self._last_quantized_target_a) >= write_threshold:
-                self._last_quantized_target_a = target_a
+
+            # Hysterese-Logik:
+            # - Optimal-Fenster: Hysterese auf target_a (ändert sich nur stündlich).
+            #   Die Rampe läuft schrittweise zum Ziel; geschrieben wird bei jedem
+            #   Rampenschritt (ramped != last_written) bis Ziel erreicht.
+            # - Alle anderen Modi: Hysterese auf gerampetem Wert.
+            should_write = abs(ramped - self._last_written_ramped_a) >= write_threshold
+
+            if should_write:
                 if self.victron.set_max_charge_current(ramped):
                     # WICHTIG: _last_written_ramped_a muss den tatsaechlich geschriebenen
                     # Wert enthalten (nach Clamping in set_max_charge_current), nicht den

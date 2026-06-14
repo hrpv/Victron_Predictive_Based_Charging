@@ -4,6 +4,208 @@ Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 
 ---
 
+## v3.0.11 — Optimal-Fenster: Prognose-basierte Stundensteuerung (2026-06-14)
+
+Changed:
+- `controller.py`: Optimal-Fenster-Logik grundlegend neu geschrieben.
+
+  **Alt (v3.0.10.x):** Ladestrom wurde jeden Zyklus aus dem Momentan-Überschuss
+  (Grid-Messung) berechnet, mit Quantisierung (5A-Stufen), `_smooth_required_a`-
+  Filter (3-Zyklen-Mittelwert) und `write_deadband` (3A) gegen Modbus-Flood.
+  Ursache aller Komplexität: Grid-Messung rauscht ±2000W → Strom schwankte
+  ständig, musste künstlich stabilisiert werden.
+
+  **Neu (v3.0.11):** Strom wird aus der **Prognose** und dem **Bedarf bis
+  Ziel-SOC** gesetzt — kein Momentanwert, kein Filter, kein Deadband.
+
+  Steuerprinzip:
+  - **Stundenbeginn** (Fenstereintritt oder volle Stunde xx:00):
+    ```
+    missing_wh  = (dyn_target - soc) / 100 * capacity_wh
+    needed_wh   = missing_wh / hours_left          # gleichmäßig verteilen
+    planned_wh  = min(forecast_surplus_wh,         # nie mehr als PV liefert
+                      needed_wh + deficit_share_wh)
+    charge_a    = planned_wh / battery_voltage     # clamp: min_a..max_a
+    ```
+    `dyn_target` ist echte Steuergröße: wenig Reststunden → höherer Strom,
+    Ziel fast erreicht → niedrigerer Strom. Kein fester `reduced_charge_current_a`
+    mehr nötig.
+  - **Innerhalb der Stunde:** Strom bleibt konstant, Rampe läuft schrittweise
+    zum neuen Zielwert. Kein Modbus-Write wenn Rampe abgeschlossen.
+  - **SOC-Guard** (`soc > dyn_target`): sofort auf `min_charge_current`,
+    Plan wird zurückgesetzt.
+  - **Stundenwechsel – Defizit-Ausgleich:**
+    Tatsächlich geladene Energie (`bat_wh_total`, signed — Entladung zählt mit)
+    wird mit dem Plan verglichen. Defizit kumuliert, beim nächsten Stundenbeginn
+    auf Reststunden verteilt und zum Bedarf addiert:
+    ```
+    deficit_wh    = planned_wh - actual_wh        # signed
+    carried_wh   += deficit_wh
+    deficit_share = carried_wh / hours_left       # nächste Stunde
+    ```
+  - **Rampe:** Stromänderungen weiterhin schrittweise (+/- `current_ramp_step`
+    A/Zyklus). Hysterese 1A verhindert Modbus-Write wenn Rampe abgeschlossen.
+  - **Midnight-Reset:** `_opt_plan_hour`, `_opt_carried_wh` etc. bei
+    Tageswechsel geleert.
+
+  Entfernte Config-Keys (können in `config.yaml` stehen bleiben, werden
+  stillschweigend ignoriert):
+  - `optimal_window_write_deadband_a`
+  - `optimal_window_current_step_a`
+  - `required_a_smooth_window`
+  - `optimal_window_min_current_a`
+
+  Log-Beispiel (Normalbetrieb, SOC 46%→79%, 5h Fenster):
+  ```
+  Optimal-Fenster H11 neuer Plan: Prognose=5336Wh, Bedarf=924Wh/h (4620Wh/5h), Defizitanteil=+0Wh, Plan=924Wh -> 19.2A
+  [CHARGING] 19A | Optimal-Fenster H11: 19A (Plan 924Wh, Übertrag +0Wh, SOC 46.0%→79%)
+  Optimal-Fenster H11 abgeschlossen: Plan=924Wh, Ist=900Wh, Defizit=+24Wh, Übertrag=+24Wh
+  Optimal-Fenster H12 neuer Plan: Prognose=5571Wh, Bedarf=924Wh/h (3696Wh/4h), Defizitanteil=+6Wh, Plan=930Wh -> 19.4A
+  ```
+
+Fixed (während Live-Test 2026-06-14 entdeckt):
+- **Rampe im Optimal-Fenster fehlte** (v3.0.11-Erbschaft aus v3.0.10.7):
+  `run_cycle()` setzte `ramped = target_a` direkt statt `_ramp(target_a)`.
+  Strom sprang sofort statt schrittweise. Fix: einheitliche Rampe für alle
+  Modi, `is_optimal`-Sonderbehandlung im Write-Block entfernt.
+- **Ladestrom klebte bei max_a** (50A): Ursprüngliche Formel ignorierte
+  `dyn_target` — `planned_wh = forecast_surplus_wh` ergab bei 5-6 kWh
+  Prognose immer >2400Wh → immer 50A. Fix: `planned_wh` auf `needed_wh`
+  (Bedarf bis Ziel-SOC pro Reststunde) gedeckelt, Prognose als Obergrenze.
+
+- `version.py`: VERSION auf 3.0.11 aktualisiert.
+
+
+---
+
+## v3.0.10.7 — Write-Hysterese Regression-Fix (2026-06-14)
+
+Fixed:
+- `controller.py` (v3.0.10.6 Regression): Die reine Hysterese auf
+  `target_a` brach bei **Idle/Nacht** und **Morgen-Notladung/Nachmittag**.
+
+  Ursache: `target_a = 0` bei Idle wurde einmalig mit dem gerampeten
+  Zwischenwert (z.B. 40A) geschrieben, weil `abs(0 - 50) >= 1` zutraf.
+  Danach wurde `_last_quantized_target_a = 0` gesetzt. Alle folgenden
+  Zyklen sahen `abs(0 - 0) = 0 < 1` → **kein Write**. `_ramp_current`
+  lief weiter herunter (35, 30, 25...A), aber nie wieder an den Modbus.
+  Ergebnis: Setpoint blieb auf 40A statt 0A (oder min_charge_current).
+
+  Beobachtet im Log (2026-06-13 22:03 ff.):
+  ```
+  [IDLE] 40A | Nacht: kein Laden (SOC 61.0%)
+  [IDLE] 40A | Nacht: kein Laden (SOC 61.0%) (Hysterese) [KEIN WRITE]
+  ...
+  [IDLE] 40A | Nacht: kein Laden (SOC 52.0%) (Hysterese) [KEIN WRITE]
+  ```
+
+  Fix: Kombinierte Hysterese:
+  - **Optimal-Fenster** (`mode="charging"` + `"Optimal-Fenster" in reason`):
+    Hysterese auf `target_a` (wie v3.0.10.6), aber mit **sofortigem Rampen**
+    (`ramped = target_a`, `_ramp_current = target_a`). Verhindert, dass
+    ein gerampeter Zwischenwert geschrieben und eingefroren wird.
+  - **Alle anderen Modi** (Idle, Nachmittag, Morgen-Notladung, Trickle,
+    Full-Charge): Hysterese auf **gerampetem Wert** (wie vor v3.0.10.6).
+    Schrittweises Herunter-/Hochrampen funktioniert korrekt.
+
+  Alt (v3.0.10.6, defekt):
+  ```python
+  if target_a >= 0:
+      ramped = self._ramp(target_a)
+      if abs(target_a - self._last_quantized_target_a) >= write_threshold:
+          ...
+  ```
+  Neu (v3.0.10.7):
+  ```python
+  is_optimal = mode == "charging" and "Optimal-Fenster" in reason
+  if is_optimal:
+      ramped = target_a          # sofortiges Rampen
+      self._ramp_current = target_a
+  else:
+      ramped = self._ramp(target_a)  # schrittweises Rampen
+
+  if is_optimal:
+      should_write = abs(target_a - self._last_quantized_target_a) >= threshold
+  else:
+      should_write = abs(ramped - self._last_written_ramped_a) >= threshold
+  ```
+
+Changed:
+- `version.py`: VERSION auf 3.0.10.7 aktualisiert.
+
+---
+
+## v3.0.10.6 — Optimal-Fenster Write-Stabilisierung (2026-06-13)
+
+Fixed:
+- `controller.py` (Fix 1 — Kimi): `run_cycle()`: Schreib-Hysterese prüfte den
+  **gerampten** Wert (`ramped`) statt des **quantisierten Sollwerts** (`target_a`).
+
+  `_ramp()` steigert den Strom in Schritten pro Zyklus. Wenn `decide()` zwischen
+  10A und 15A oszillierte, durchlief `_ramp_current` bei jedem Wechsel die
+  Zwischenstufen. Die Hysterese `abs(ramped - last_written) >= 3` löste bei
+  **jedem Ramp-Schritt** einen Write aus — statt nur wenn sich die quantisierte
+  Stufe ändert.
+
+  Neu: Variable `_last_quantized_target_a` trackt den quantisierten Sollwert.
+  Hysterese prüft jetzt `abs(target_a - self._last_quantized_target_a)`.
+  Der gerampte Wert wird weiterhin an `set_max_charge_current()` übergeben
+  (sanftes Rampen bleibt erhalten).
+
+  Alt:
+  ```python
+  if abs(ramped - self._last_written_ramped_a) >= write_threshold:
+      if self.victron.set_max_charge_current(ramped):
+          self._last_written_ramped_a = self.state.charge_current_setpoint
+  ```
+  Neu:
+  ```python
+  if abs(target_a - self._last_quantized_target_a) >= write_threshold:
+      self._last_quantized_target_a = target_a
+      if self.victron.set_max_charge_current(ramped):
+          self._last_written_ramped_a = self.state.charge_current_setpoint
+  ```
+
+- `controller.py` (Fix 2): `decide()`: `hours_left` im Optimal-Fenster
+  änderte sich jede Minute minimal (z.B. 4.53h → 4.52h), was `required_a`
+  langsam driften ließ. An Quantisierungsgrenzen (z.B. `round(12.4/5)*5=10`
+  vs. `round(12.6/5)*5=15`) kippte die Stromstufe und löste einen Write aus.
+  Dieses Kippen wiederholte sich alle 6–8 Minuten (beobachtetes Muster
+  10A↔15A im Log vom 2026-06-13).
+
+  `_smooth_required_a` (v3.0.9.26) war hier kontraproduktiv: er mischte
+  Werte aus verschiedenen `hours_left`-Perioden und verzögerte das Kippen
+  um 3 Zyklen, erzeugte es aber nicht weniger oft.
+
+  Fix: `hours_left` auf 0.5h-Stufen quantisieren. Änderung nur 2× pro
+  Stunde → `required_a` ist 30 Minuten stabil → kein Stufenwechsel durch
+  Minutendrift. `_smooth_required_a` bleibt als Absicherung gegen
+  SOC-Messrauschen erhalten.
+
+  Alt:
+  ```python
+  hours_left = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
+  ```
+  Neu:
+  ```python
+  hours_left_raw = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
+  hours_left = max(round(hours_left_raw * 2) / 2, 0.5)
+  ```
+
+  Erwartetes Verhalten: Stufenwechsel im Optimal-Fenster maximal 2× pro
+  Stunde (bei echtem SOC-Fortschritt), statt alle 6–8 Minuten.
+
+Changed:
+- `version.py` neu eingeführt: `VERSION`-Konstante ausgelagert.
+  `battery_manager.py` importiert `from version import VERSION`.
+  Zukünftige Releases erfordern nur noch eine Änderung in `version.py` —
+  `battery_manager.py` bleibt unverändert.
+
+- `battery_manager.py`: Dateistruktur-Kommentar auf v3.0.10.6 aktualisiert
+  (9 Module inkl. `version.py`).
+
+---
+
 ## v3.0.10.5 — Code-Review Cleanup (2026-06-12)
 
 Changed:
