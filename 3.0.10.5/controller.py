@@ -1049,8 +1049,13 @@ class ChargeController:
             last_entry.action = self.state.charge_mode
             last_entry.bat_energy_wh = round(bat_wh_hour, 1)
             # Laufender Mittelwert: elapsed = aktuelle Minute / 60
+            # v3.0.11.1: Unter 5 Minuten ist elapsed_h so klein, dass bat_wh/elapsed
+            # einen riesigen Phantomstrom ergibt (z.B. -69 A bei 00:00+30s).
+            # Anzeige in den ersten 5 Minuten ist ohnehin nicht aussagekraeftig -> 0.0.
             elapsed_h = now.minute / 60.0 + now.second / 3600.0
-            last_entry.charge_current_a = _bat_current_a(bat_wh_hour, max(elapsed_h, 1/60))
+            last_entry.charge_current_a = (
+                _bat_current_a(bat_wh_hour, elapsed_h) if elapsed_h >= 5 / 60 else 0.0
+            )
             last_entry.soc_end = round(self.state.soc, 1)
             # Aktuelle Kumulativwerte fuer naechsten Update speichern
             last_entry._raw_pv_total   = pv_total

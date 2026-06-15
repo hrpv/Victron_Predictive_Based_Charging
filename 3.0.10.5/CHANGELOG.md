@@ -4,6 +4,25 @@ Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 
 ---
 
+## v3.0.11.1 — Bugfix: Phantomstrom bei Stundenbeginn (2026-06-15)
+
+Fixed:
+- `controller.py` (`_update_history`): In den ersten Minuten einer neuen
+  Stunde wurde `charge_current_a` durch ein winziges `elapsed_h` dividiert,
+  was Phantomwerte erzeugte (z.B. **-69.3 A** bei 00:00 statt der erwarteten
+  ~6 A). Ursache: `elapsed_h = minute/60 + second/3600` ist bei xx:00:30
+  ca. 0.0083 h; der frühere Schutz `max(elapsed_h, 1/60)` klemmte nur auf
+  1 Minute, was den Fehler noch um Faktor 5 magnifizierte.
+
+  Fix: Unter 5 Minuten (`elapsed_h < 5/60`) wird `charge_current_a = 0.0`
+  gesetzt. In diesem Zeitraum ist die Anzeige ohnehin nicht aussagekräftig;
+  ab Minute 5 greift die normale Berechnung. Die abgeschlossene Stunde
+  (Stundenabschluss-Pfad, `elapsed_h = 1.0`) ist nicht betroffen.
+
+- `version.py`: VERSION auf 3.0.11.1 aktualisiert.
+
+---
+
 ## v3.0.11 — Optimal-Fenster: Prognose-basierte Stundensteuerung (2026-06-14)
 
 Changed:
