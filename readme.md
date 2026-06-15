@@ -7,7 +7,7 @@
 
 1. [Systemübersicht](#1-systemübersicht)
 2. [Hardware & Voraussetzungen](#2-hardware--voraussetzungen)
-3. [Ladelogik & Strategie](#3-ladelogik--strategie-v30)
+3. [Ladelogik & Strategie](#3-ladelogik--strategie-v30-11-ff)
 4. [Modbus-Register Referenz](#4-modbus-register-referenz)
 5. [evcc Koordination](#5-evcc-koordination)
 6. [PV-Prognose](#6-pv-prognose)
