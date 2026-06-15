@@ -90,101 +90,154 @@ Multiplus II / ESS:
 
 ---
 
-## 3. Ladelogik & Strategie (v3.0)
+## 3. Ladelogik & Strategie (v3.0.11 ff.)
 
 ### Ziele
-- **LFP-Schonung**: Bevorzugt SOC zwischen 20–80% halten
+- **LFP-Schonung**: SOC bevorzugt zwischen 20–80% halten
 - **Sommer-Optimierung**: Morgens nicht unnötig laden, auf PV-Überschuss warten
 - **Zellbalancing**: Spätestens alle 10 Tage Vollladung auf 98%
-- **Dynamisch**: Täglich neues Ziel-SOC basierend auf Nachtverbrauch
-- **Sonnenhöchststand-Optimierung**: Ladung konzentriert sich um 13:00 ± 2h
+- **Dynamisch**: Täglich neues Ziel-SOC basierend auf prognostiziertem Nachtverbrauch
+- **Optimal-Fenster**: Ladung konzentriert im Sonnenhöchststand-Fenster (Standard 11:00–15:00), Strom prognosebasiert — kein fester Reduzierstrom mehr
 
 ### Entscheidungsbaum (60-Sekunden-Zyklus)
 
 ```
-┌─ ESS State 11 oder 12 (Victron Entladesperre / Zwangsladung)?
+┌─ SOC <= emergency_charge_soc (Notfall)?
 │   └─ JA → Sofort mit max_charge_current laden
 │
-├─ Morgen-Notladung: SOC < max(min_soc, emergency_charge_soc) im Morgenfenster?
-│   └─ JA → Sofort mit max_charge_current laden
+├─ Vollladung faellig (>= full_charge_interval_days)?
+│   └─ JA → target_soc = 98% (Zellbalancing), mit max_charge_current laden
 │
-├─ SOC ≤ emergency_charge_soc (Notfall)?
-│   └─ JA → Sofort mit max_charge_current laden
+├─ Nacht (dynamisches Fenster, ca. 20:00–06:00)?
+│   └─ JA → Kein Laden (idle, min_charge_current als Reg-2705-Untergrenze)
 │
-├─ Vollladung fällig (dyn_target ≥ 98%) und SOC < max_soc − Hysterese?
-│   └─ JA → Laden mit max_charge_current (full_charge)
-│       └─ Ziel erreicht (SOC ≥ max_soc): Trickle für Cellbalancing-Haltezeit
+├─ Morgenfenster (vor Optimal-Fenster-Start)?
+│   ├─ PV im Optimal-Fenster ausreichend fuer Ziel-SOC UND SOC >= min_required?
+│   │   └─ JA → Warten (idle)
+│   └─ NEIN → Fruehzeitig laden (Ueberschuss-proportional, max max_charge_current)
 │
-├─ Nacht (dynamisch: Sonnenuntergang – Sonnenaufgang)?
-│   └─ JA → Kein Laden (idle)
+├─ Im Optimal-Fenster (z.B. 11:00–15:00)?
+│   └─ Prognosebasierter Strom (siehe unten): bleibt stundenlang konstant
 │
-├─ Ziel-SOC bereits erreicht (SOC ≥ dyn_target)?
-│   └─ JA → Kein Laden (idle)
+├─ Ausserhalb Optimal-Fenster, PV-Ueberschuss vorhanden, SOC < Ziel?
+│   └─ Laden mit max_charge_current
 │
-├─ evcc MinSoc-Sperre aktiv (Reg 2901 > 25%)?
-│   └─ JA → effektiver Min-SOC auf Reg-2901-Wert angehoben (kein eigener Return)
+├─ SOC >= Ziel-SOC?
+│   └─ idle (Victron ESS/DVCC regelt physikalisch)
 │
-├─ Morgenfenster (Sonnenaufgang + morning_delay_h, mind. bis Optimal-Fenster-Start)?
-│   ├─ Genug PV im Optimal-Fenster und SOC ≥ min_required? → Warten (idle)
-│   ├─ Im Optimal-Fenster und genug PV? → Reduzierter Ladestrom
-│   └─ Sonst → Laden mit max_charge_current (frühes Laden)
-│
-├─ Im Optimal-Fenster (solar_noon ± offset) und Überschuss > 200W?
-│   └─ JA → Dynamischer Ladestrom (abhängig von fehlendem kWh, Restzeit, Überschuss)
-│       gecappt durch reduced_charge_current_a und actual_surplus / V
-│
-├─ PV-Überschuss > 200W (außerhalb Optimal-Fenster)?
-│   └─ JA → Laden mit min(surplus_w / V, max_charge_current)
-│
-├─ SOC > 10% unter Ziel UND raw_surplus < 200W?
-│   └─ JA → Trickle (min_charge_current)
-│
-└─ Sonst → Warten auf PV-Überschuss (idle)
+└─ Ziel-SOC fast erreicht (innerhalb Hysterese)?
+    └─ idle oder discharging (Entladesperre bei SOC <= floor_soc)
 ```
 
-### Dynamisches Ziel-SOC (v3.0)
+### Dynamisches Ziel-SOC
 
-Das Ziel-SOC wird jeden Morgen neu berechnet – nicht mehr fest 80%:
+Das Ziel-SOC wird bei jedem Zyklus neu berechnet — nicht mehr fest konfiguriert:
 
 ```
-target_soc = max(min_soc, emergency_charge_soc) + (night_consumption_kWh / capacity_kWh) × 100%
+target_soc = min_soc + (night_consumption_kWh / capacity_kWh) x 100%
 
-Wenn target_soc > 98%: target_soc = 98%
-Wenn days_since_full_charge ≥ 10: target_soc = 98% (Vollladung)
+Grenzen:
+  target_soc < min_soc              → target_soc = min_soc
+  target_soc > max_soc              → target_soc = max_soc
+  days_since_full_charge >= 10      → target_soc = 98% (Vollladung erzwingen)
 ```
 
 Beispiel:
-- min_soc = 25%, emergency_charge_soc = 20%
-- Nachtverbrauch (21:00–06:00) = 4.7 kWh (aus VRM-Prognose)
-- Kapazität = 14 kWh
-- target_soc = 25 + (4.7 / 14) × 100 = **58.6%**
+- `min_soc = 25%`, Nachtverbrauch (VRM-Prognose) = 5.8 kWh, Kapazitaet = 14 kWh
+- `target_soc = 25 + (5.8 / 14) × 100 = 66%`
 
-Das Ziel liegt also zwischen **25% und 98%** – je nach erwartetem Nachtverbrauch.
+Nachtverbrauch kommt bevorzugt aus der VRM-Verbrauchsprognose (`vrm_consumption_fc`);
+`avg_daily_consumption_kwh` aus `config.yaml` dient nur als Fallback.
 
-### Adaptive Ladezeitfenster (v3.0)
+### Prognosebasierte Steuerung im Optimal-Fenster (v3.0.11)
 
-| PV-Überschuss | Verhalten |
-|---------------|-----------|
-| Gering | Laden beginnt so früh wie nötig – auch vor `morning_delay_end_hour` |
-| Mittel | Ladefenster verschiebt sich Richtung Sonnenhöchststand (11:00–15:00) |
-| Hoch | Hauptladung im Optimal-Fenster mit reduziertem Strom (z.B. 20A statt 50A) |
+Das Optimal-Fenster (Standard 11:00–15:00 Uhr, konfigurierbar via `solar_noon_offset_hours`)
+ist das Herzstuck der Ladestrategie. Seit v3.0.11 wird der Ladestrom nicht mehr aus dem
+Momentan-Ueberschuss (Grid-Messung) abgeleitet, sondern **einmal pro Stunde** aus der
+Prognose und dem verbleibenden Bedarf berechnet.
 
-**Sonnenhöchststand-Optimierung:**
-- Optimal-Fenster: 13:00 ± `solar_noon_offset_hours` (Default: 2h = 11:00–15:00)
-- Bei genug PV im Fenster wird der Ladestrom auf `reduced_charge_current_a` (Default: 20A) reduziert
-- Das verhindert, dass die Ladung zu früh beendet ist und PV-Energie später ins Netz geht
+**Stundenbeginn — neuer Plan:**
+```
+missing_wh       = (dyn_target - soc) / 100 * capacity_wh
+needed_wh_per_h  = missing_wh / hours_left         # gleichmaessig verteilen
+planned_wh       = min(forecast_surplus_wh,         # nie mehr als PV liefert
+                       needed_wh_per_h + deficit_share_wh)
+charge_a         = planned_wh / battery_voltage     # clamp: min_a..max_a
+```
 
-### Ladestrom-Regelung
-- Sanftes Rampen: ±5A pro Regelzyklus (kein abrupter Sprung)
-- Bei PV-Überschuss: `Strom = PV-Überschuss [W] / 48V`
-- Minimum: 0A (kein Laden), Maximum: 50A (konfigurierbar)
-- Trickle-Laden: 5A (konfigurierbar)
-- Reduzierter Strom im Optimal-Fenster: 20A (konfigurierbar)
+- `dyn_target`: aktuelles Ziel-SOC (steigt bei wenig Reststunden, faellt bei Ziel fast erreicht)
+- `deficit_share_wh`: kumulierter Rueckstand aus Vorjahr-Stunden, auf restliche Stunden verteilt
+- `charge_a` bleibt **innerhalb der Stunde konstant** — kein Modbus-Write ausser beim Stundenstart
+
+**Defizit-Ausgleich zwischen Stunden:**
+```
+deficit_wh   = planned_wh - actual_wh     # signed (Entladung zaehlt mit)
+carried_wh  += deficit_wh
+→ naechste Stunde: deficit_share = carried_wh / hours_left
+```
+
+**SOC-Guard:**  
+Wenn `soc > dyn_target`, wird sofort auf `min_charge_current` gedrosselt und der Plan
+zurueckgesetzt. Verhindert Ueberladen bei unerwartet hohem PV-Ertrag.
+
+**Vorteile gegenueber v3.0.10.x:**
+- Kein Rauschen durch Grid-Messung (±2000W Schwankung hatte kuenstliche Glaettung erfordert)
+- Konfigurationskeys `optimal_window_write_deadband_a`, `optimal_window_current_step_a`,
+  `required_a_smooth_window`, `optimal_window_min_current_a` werden nicht mehr benoetigt
+  (koennen in `config.yaml` stehen bleiben, werden stillschweigend ignoriert)
+
+**Log-Beispiel (Normalbetrieb):**
+```
+Optimal-Fenster H11 neuer Plan: Prognose=5336Wh, Bedarf=924Wh/h (4620Wh/5h), Defizitanteil=+0Wh, Plan=924Wh -> 19.2A
+[CHARGING] 19A | Optimal-Fenster H11: 19A (Plan 924Wh, Uebertrag +0Wh, SOC 46.0%->79%)
+Optimal-Fenster H11 abgeschlossen: Plan=924Wh, Ist=900Wh, Defizit=+24Wh, Uebertrag=+24Wh
+Optimal-Fenster H12 neuer Plan: Prognose=5571Wh, Bedarf=924Wh/h (3696Wh/4h), Defizitanteil=+6Wh, Plan=930Wh -> 19.4A
+```
+
+### Dynamisches Nachtfenster
+
+Das Nachtfenster wird astronomisch berechnet (Sonnenauf-/untergang fuer den konfigurierten
+Standort) statt als feste Uhrzeiten:
+
+```
+Nacht-Start: floor(sunset_hour + 0.5)     # ca. 30 min nach Sonnenuntergang
+Nacht-Ende:  floor(sunrise_hour - 0.5)    # ca. 30 min vor Sonnenaufgang
+```
+
+`night_start_hour` / `night_end_hour` in `config.yaml` dienen als Fallback wenn keine
+astronomische Berechnung moeglich ist.
+
+### Stromregelung & Rampe
+
+- **Rampe**: ±`current_ramp_step` A/Zyklus (Default 10A), gilt fuer alle Modi inkl. Optimal-Fenster
+- **Hysterese**: kein Modbus-Write wenn gerampetem Strom sich weniger als 1A vom zuletzt
+  geschriebenen Wert unterscheidet
+- **Minimum**: `min_charge_current` (Default 3A) — Reg. 2705 wird nie unter diesen Wert gesetzt;
+  Victron ESS fliesst diesen Strom auch im Idle-Zustand
+- **Maximum**: `max_charge_current` (Default 50A)
+- Im Optimal-Fenster aendert sich der Sollwert nur stundlich (neuer Plan) oder bei SOC-Guard —
+  zwischen diesen Ereignissen faellt die Hysterese keine weiteren Writes aus
 
 ### Vollladungs-Tracking
-- Datum der letzten Vollladung wird in `state.json` gespeichert und überlebt Neustarts
-- **Auto-Reset (v3.0):** Wenn SOC ≥ 98% für mindestens 1 Stunde erreicht wurde, wird `days_since_full_charge` sofort auf 0 gesetzt – auch ohne explizit geplanten `full_charge_cycle`
-- Morgen-Notladung: Wenn SOC < Minimum am Morgen, wird sofort mit vollem Strom geladen bis das Minimum erreicht ist
+
+- Datum der letzten Vollladung in `state.json` gespeichert (ueberlebt Neustarts)
+- **Auto-Reset**: SOC >= 98% fuer >= 1 Stunde → `days_since_full_charge = 0`
+- **Balancing-Haltezeit**: Nach Erreichen von 98% wird der volle Strom fuer
+  `balancing_hold_hours` (Default 5h) aufrechterhalten, damit alle Zellen ausbalancieren
+- **Mitternachts-Reset**: Balancing-Timer, Glaettungspuffer und Optimal-Fenster-Plan
+  werden taeglich um Mitternacht zurueckgesetzt
+
+### Zusammenspiel mit Victron ESS / DVCC
+
+Der battery_manager schreibt ausschliesslich Reg. 2705 (DVCC MaxChargeCurrent).
+Victron ESS/DVCC klemmt den tatsaechlichen Ladestrom physikalisch — der Setpoint ist
+eine Obergrenze, keine Zielgroesse. Entladung und Grid-Bezug werden von ESS autonom geregelt.
+
+| Victron ESS State | Bedeutung | battery_manager-Verhalten |
+|---|---|---|
+| 10 (Self-consumption) | SOC >= MinSOC, normaler Betrieb | Steuert Reg. 2705 |
+| 11 (SOC < MinSOC) | Entladung gesperrt, Netz speist Last | Reg. 2705 bleibt, SOC-Simulation friert ein |
+| 12 (Minimal-Laden) | Minimale Netzladung um MinSOC zu halten | Simulation ignoriert diesen Strom |
 
 ---
 
