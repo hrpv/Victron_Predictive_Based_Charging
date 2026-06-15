@@ -120,7 +120,7 @@ Multiplus II / ESS:
 │   └─ Prognosebasierter Strom (siehe unten): bleibt stundenlang konstant
 │
 ├─ Ausserhalb Optimal-Fenster, PV-Ueberschuss vorhanden, SOC < Ziel?
-│   └─ Laden mit max_charge_current
+│   └─ Laden mit max_charge_current (Akku nimmt was er kriegen kann)
 │
 ├─ SOC >= Ziel-SOC?
 │   └─ idle (Victron ESS/DVCC regelt physikalisch)
