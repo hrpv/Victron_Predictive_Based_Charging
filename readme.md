@@ -385,7 +385,28 @@ python3 -m venv --help || sudo apt install python3-venv
 mkdir -p /home/pi/solar_battery
 # Dateien kopieren: battery_manager.py, config.yaml,
 # requirements.txt, solar-battery.service, install.sh
+
+# config.yaml         – Konfiguration (ANPASSEN vor dem Start)
+# requirements.txt    – Python-Abhängigkeiten
+# solar-battery.service – Systemd-Service
+# install.sh          – Installationsskript
 ```
+
+### ab Version 3.0.10.5 ff: alle *.py Dateien aus dem Verzeichnis 3.0.10.5/ des Repos kopieren:
+
+```bash
+# battery_manager.py  – Einstiegspunkt / Hauptskript
+# controller.py       – Ladesteuerungs-Engine
+# dashboard.py        – Web-Dashboard (Flask)
+# forecast.py         – PV-Prognose (VRM / Solcast / Open-Meteo)
+# modbus_victron.py   – Modbus TCP Kommunikation mit Cerbo GX
+# evcc.py             – evcc REST-API Anbindung
+# models.py           – Datenklassen (SystemState, HourlyForecast, ...)
+# logging_setup.py    – Log-Deduplizierung
+# version.py          – Versionstring
+```
+
+Alle Dateien liegen flach in `/home/pi/solar_battery/` — keine Paketstruktur, kein Unterverzeichnis.
 
 ### Schritt 3: Konfiguration anpassen
 ```bash
