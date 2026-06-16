@@ -536,82 +536,88 @@ class ChargeController:
         min_charge_a_opt = float(self.bat.get("min_charge_current", 3.0))
 
         if opt_start <= h_now <= opt_end:
-            # SOC-Schutz: Ziel überschritten -> sofort Strom reduzieren
-            if soc > dyn_target:
-                self._opt_plan_hour = -1  # Plan zurücksetzen, Ziel erreicht
-                return min_charge_a_opt, "trickle", (
-                    f"Optimal-Fenster: SOC {soc:.1f}% > Ziel {dyn_target:.0f}% "
-                    f"-> reduziere auf {min_charge_a_opt:.0f}A")
+            # v3.0.11.4: Bei needs_full (Vollladung fällig) Optimal-Fenster komplett
+            # ueberspringen -> decide() steuert den Volllade-Strom (max_a) und den
+            # Trickle-Pfad direkt. Das Optimal-Fenster wuerde sonst den Strom auf
+            # einen niedrigeren Plan-Wert reduzieren (z.B. 50A->15A) und danach
+            # muss Trickle wieder hoch rampen (15A->20A).
+            if not needs_full:
+                # SOC-Schutz: Ziel überschritten -> sofort Strom reduzieren
+                if soc > dyn_target:
+                    self._opt_plan_hour = -1  # Plan zurücksetzen, Ziel erreicht
+                    return min_charge_a_opt, "trickle", (
+                        f"Optimal-Fenster: SOC {soc:.1f}% > Ziel {dyn_target:.0f}% "
+                        f"-> reduziere auf {min_charge_a_opt:.0f}A")
 
-            fc_list = self.forecast.get_forecast()
-            fc_by_hour_opt = {f.hour: f for f in fc_list}
+                fc_list = self.forecast.get_forecast()
+                fc_by_hour_opt = {f.hour: f for f in fc_list}
 
-            # Verbleibende Stunden im Fenster (inkl. aktueller Stunde)
-            hours_left = max(1, opt_end - h_now + 1)
+                # Verbleibende Stunden im Fenster (inkl. aktueller Stunde)
+                hours_left = max(1, opt_end - h_now + 1)
 
-            # Bat-Wh-Total für Ist-Messung: EnergyAccumulator + Neustart-Basis
-            bat_wh_total_now = self.state.bat_energy_today_wh + self._energy_base_bat
+                # Bat-Wh-Total für Ist-Messung: EnergyAccumulator + Neustart-Basis
+                bat_wh_total_now = self.state.bat_energy_today_wh + self._energy_base_bat
 
-            # Neue Stunde? Neu planen wenn Stunde gewechselt oder noch kein Plan
-            new_hour = (self._opt_plan_hour != h_now)
+                # Neue Stunde? Neu planen wenn Stunde gewechselt oder noch kein Plan
+                new_hour = (self._opt_plan_hour != h_now)
 
-            if new_hour:
-                # Defizit der abgeschlossenen Vorjahr-Stunde berechnen
-                if self._opt_plan_hour >= 0:
-                    # Tatsächlich geladene/entladene Wh seit Stundenbeginn (signed)
-                    actual_wh = bat_wh_total_now - self._opt_bat_wh_snapshot
-                    deficit_wh = self._opt_planned_wh - actual_wh
-                    self._opt_carried_wh += deficit_wh
+                if new_hour:
+                    # Defizit der abgeschlossenen Vorjahr-Stunde berechnen
+                    if self._opt_plan_hour >= 0:
+                        # Tatsächlich geladene/entladene Wh seit Stundenbeginn (signed)
+                        actual_wh = bat_wh_total_now - self._opt_bat_wh_snapshot
+                        deficit_wh = self._opt_planned_wh - actual_wh
+                        self._opt_carried_wh += deficit_wh
+                        self.logger.info(
+                            f"Optimal-Fenster H{self._opt_plan_hour:02d} abgeschlossen: "
+                            f"Plan={self._opt_planned_wh:.0f}Wh, "
+                            f"Ist={actual_wh:.0f}Wh, "
+                            f"Defizit={deficit_wh:+.0f}Wh, "
+                            f"Übertrag={self._opt_carried_wh:+.0f}Wh")
+
+                    # Prognose-Netto-Überschuss der aktuellen Stunde [Wh]
+                    fc_now = fc_by_hour_opt.get(h_now)
+                    forecast_surplus_wh = max(0.0, fc_now.net_kwh * 1000.0) if fc_now else 0.0
+
+                    # Fehlende Energie bis Ziel-SOC, gleichmäßig auf Reststunden verteilt.
+                    # Begrenzt durch den Prognose-Überschuss dieser Stunde:
+                    # Nie mehr anfordern als PV liefert, nie weniger als nötig.
+                    missing_wh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"] * 1000.0)
+                    needed_wh = missing_wh / max(hours_left, 1)
+
+                    # Defizit-Anteil aus Vorjahr-Stunden gleichmäßig verteilen
+                    deficit_share_wh = self._opt_carried_wh / max(hours_left, 1)
+
+                    # Geplante Ladeenergie: benötigte Energie + Defizit-Ausgleich,
+                    # nach oben begrenzt durch Prognose-Überschuss.
+                    planned_wh = min(forecast_surplus_wh, needed_wh + deficit_share_wh)
+                    # Sicherheit: nie weniger als Defizit-Anteil allein (Aufholen sicherstellen)
+                    planned_wh = max(planned_wh, min(deficit_share_wh, forecast_surplus_wh))
+
+                    # Ladestrom: E[Wh] / t[1h] / U[V] = I[A]
+                    planned_a = planned_wh / actual_v
+                    charge_a = max(min_charge_a_opt, min(max_a_opt, planned_a))
+
+                    # Plan für diese Stunde speichern
+                    self._opt_plan_hour = h_now
+                    self._opt_planned_wh = planned_wh
+                    self._opt_bat_wh_snapshot = bat_wh_total_now
+                    self._opt_setpoint_a = charge_a
+
                     self.logger.info(
-                        f"Optimal-Fenster H{self._opt_plan_hour:02d} abgeschlossen: "
-                        f"Plan={self._opt_planned_wh:.0f}Wh, "
-                        f"Ist={actual_wh:.0f}Wh, "
-                        f"Defizit={deficit_wh:+.0f}Wh, "
-                        f"Übertrag={self._opt_carried_wh:+.0f}Wh")
+                        f"Optimal-Fenster H{h_now:02d} neuer Plan: "
+                        f"Prognose={forecast_surplus_wh:.0f}Wh, "
+                        f"Bedarf={needed_wh:.0f}Wh/h ({missing_wh:.0f}Wh/{hours_left}h), "
+                        f"Defizitanteil={deficit_share_wh:+.0f}Wh, "
+                        f"Plan={planned_wh:.0f}Wh -> {charge_a:.1f}A")
+                else:
+                    charge_a = self._opt_setpoint_a
 
-                # Prognose-Netto-Überschuss der aktuellen Stunde [Wh]
-                fc_now = fc_by_hour_opt.get(h_now)
-                forecast_surplus_wh = max(0.0, fc_now.net_kwh * 1000.0) if fc_now else 0.0
-
-                # Fehlende Energie bis Ziel-SOC, gleichmäßig auf Reststunden verteilt.
-                # Begrenzt durch den Prognose-Überschuss dieser Stunde:
-                # Nie mehr anfordern als PV liefert, nie weniger als nötig.
-                missing_wh = max(0.0, (dyn_target - soc) / 100.0 * self.bat["capacity_kwh"] * 1000.0)
-                needed_wh = missing_wh / max(hours_left, 1)
-
-                # Defizit-Anteil aus Vorjahr-Stunden gleichmäßig verteilen
-                deficit_share_wh = self._opt_carried_wh / max(hours_left, 1)
-
-                # Geplante Ladeenergie: benötigte Energie + Defizit-Ausgleich,
-                # nach oben begrenzt durch Prognose-Überschuss.
-                planned_wh = min(forecast_surplus_wh, needed_wh + deficit_share_wh)
-                # Sicherheit: nie weniger als Defizit-Anteil allein (Aufholen sicherstellen)
-                planned_wh = max(planned_wh, min(deficit_share_wh, forecast_surplus_wh))
-
-                # Ladestrom: E[Wh] / t[1h] / U[V] = I[A]
-                planned_a = planned_wh / actual_v
-                charge_a = max(min_charge_a_opt, min(max_a_opt, planned_a))
-
-                # Plan für diese Stunde speichern
-                self._opt_plan_hour = h_now
-                self._opt_planned_wh = planned_wh
-                self._opt_bat_wh_snapshot = bat_wh_total_now
-                self._opt_setpoint_a = charge_a
-
-                self.logger.info(
-                    f"Optimal-Fenster H{h_now:02d} neuer Plan: "
-                    f"Prognose={forecast_surplus_wh:.0f}Wh, "
-                    f"Bedarf={needed_wh:.0f}Wh/h ({missing_wh:.0f}Wh/{hours_left}h), "
-                    f"Defizitanteil={deficit_share_wh:+.0f}Wh, "
-                    f"Plan={planned_wh:.0f}Wh -> {charge_a:.1f}A")
-            else:
-                charge_a = self._opt_setpoint_a
-
-            return charge_a, "charging", (
-                f"Optimal-Fenster H{h_now:02d}: {charge_a:.0f}A "
-                f"(Plan {self._opt_planned_wh:.0f}Wh, "
-                f"Übertrag {self._opt_carried_wh:+.0f}Wh, "
-                f"SOC {soc:.1f}%→{dyn_target:.0f}%)")
+                return charge_a, "charging", (
+                    f"Optimal-Fenster H{h_now:02d}: {charge_a:.0f}A "
+                    f"(Plan {self._opt_planned_wh:.0f}Wh, "
+                    f"Übertrag {self._opt_carried_wh:+.0f}Wh, "
+                    f"SOC {soc:.1f}%→{dyn_target:.0f}%)")
 
         # ── 6. Nachmittag außerhalb Optimal-Fenster: SOC < Ziel -> max laden ──
         # Keine surplus-Abhängigkeit außerhalb des Optimal-Fensters.
@@ -718,6 +724,18 @@ class ChargeController:
                     soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)
                 # soc_sim <= floor_soc: SOC eingefroren
             return action, current_a, soc_sim
+
+        if needs_full and soc_sim >= max_soc - hyst:
+            # v3.0.11.4: Balancing-Haltezeit simulieren (Trickle-Pfad).
+            # decide() haelt trickle_current fuer balancing_hold_hours; die Simulation
+            # kennt _balancing_hold_until nicht, modelliert es vereinfacht als:
+            # sobald soc_sim >= max_soc - hyst -> trickle_current fuer diese Stunde.
+            trickle_a = float(self.bat.get("trickle_current", 5))
+            trickle_kwh = trickle_a * nom_v / 1000.0
+            deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
+            new_soc = soc_sim + ((trickle_kwh - deficit) / cap) * 100
+            new_soc = max(floor_soc, min(max_soc, new_soc))
+            return "full_charge", trickle_a, new_soc
 
         if needs_full and soc_sim < max_soc - hyst:
             if fc.net_kwh > 0:

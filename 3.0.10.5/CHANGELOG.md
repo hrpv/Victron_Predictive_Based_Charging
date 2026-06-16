@@ -1,6 +1,33 @@
 # Changelog — Solar Batterie Manager
 
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
+---
+
+## v3.0.11.4 — Bugfix: Unnötige Stromrampe beim Übergang FULL_CHARGE→TRICKLE (2026-06-16)
+
+Fixed:
+- `controller.py` (`run_cycle`): Beim Übergang von VOLLLADUNG (50A) zu TRICKLE
+  (20A) wurde das Optimal-Fenster fälschlicherweise noch aktiv, obwohl
+  `needs_full=True` und `soc >= max_soc - hyst` (≥97%). Das führte zur
+  Modbus-Sequenz 50A→40A→30A→20A→10A (Optimal-Fenster-Plan) gefolgt von
+  sofortigem 10A→20A (Trickle-Rampe hoch).
+
+  Fix: Am Eingang des Optimal-Fenster-Blocks prüfen ob `needs_full`.
+  Bei aktiver Vollladung überspringt der Block komplett (`if not needs_full:`),
+  sodass `decide()` den Volllade-Strom (max_a) und den Trickle-Pfad direkt
+  steuert. Die ursprüngliche Bedingung `soc >= max_soc - hyst` war zu eng
+  — das Optimal-Fenster hätte schon bei z.B. 90% SOC störend auf 15A
+  reduziert, bevor dann Trickle wieder auf 20A hochrampt.
+
+- `controller.py` (`_simulate_hour`): Simulation modellierte den Trickle-/
+  Balancing-Haltezeit-Pfad nicht. Bei `needs_full and soc_sim >= max_soc - hyst`
+  wurde `_apply_deficit()` aufgerufen (3A `min_charge_current`), statt
+  `trickle_current` (20A). Fix: Neuer Pfad vor dem bestehenden `needs_full`-Block:
+  wenn `soc_sim >= max_soc - hyst` → `trickle_current` für diese Stunde simulieren,
+  SOC geclampt auf `[floor_soc, max_soc]`. Vereinfachung gegenüber realem
+  `_balancing_hold_until` (Laufzeit-State), aber korrekt für Anzeigezwecke.
+
+- `version.py`: VERSION auf 3.0.11.4 aktualisiert.
 
 ---
 
