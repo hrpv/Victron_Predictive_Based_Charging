@@ -110,14 +110,17 @@ class DeduplicatingFilter(logging.Filter):
         with self._lock:
             if not self._last_msg:
                 return
+            # v3.0.11.3: Nur fuer HTTP_ACCESS feuern. Fuer alle anderen
+            # Nachrichten ist filter() zustaendig (schreibt "(Heartbeat)"
+            # direkt ins record.msg). Beide Pfade gleichzeitig auszuloesen
+            # erzeugte Doppel-Heartbeats im Journal (Race Condition).
+            if self._last_msg != "HTTP_ACCESS":
+                return
             if (now - self._last_ts) < self._heartbeat_s:
                 return
             self._last_ts = now
             last_msg = self._last_msg
-        if last_msg == "HTTP_ACCESS":
-            text = "- (Heartbeat: kein Browser-Request seit 20min)"
-        else:
-            text = last_msg + " (Heartbeat)"
+        text = "- (Heartbeat: kein Browser-Request seit 20min)"
         r = logging.LogRecord(
             name="heartbeat", level=logging.INFO,
             pathname="", lineno=0, msg=text, args=None, exc_info=None)

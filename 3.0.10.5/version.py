@@ -13,4 +13,4 @@ Versionsschema: MAJOR.MINOR.PATCH.BUILD
   BUILD : Inkrementell innerhalb eines Releases (Iterations-Suffix)
 """
 
-VERSION = "3.0.11.1"
+VERSION = "3.0.11.3"

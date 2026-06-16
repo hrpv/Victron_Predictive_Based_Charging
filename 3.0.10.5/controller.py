@@ -762,6 +762,7 @@ class ChargeController:
                 trickle_kwh = min_charge_a * nom_v / 1000.0
                 new_soc = soc + ((trickle_kwh - deficit) / cap) * 100
                 new_soc = max(floor_soc, new_soc)
+                new_soc = min(max_soc, new_soc)  # v3.0.11.2: SOC nie ueber max_soc (Simulation)
                 return act, min_charge_a, new_soc
             else:
                 # SOC <= floor_soc: Entladesperre aktiv, SOC eingefroren
@@ -798,6 +799,8 @@ class ChargeController:
                 soc_sim = max(soc_sim, dyn_target - hyst)
             # v3.0.3: Nie unter floor_soc fallen
             soc_sim = max(soc_sim, floor_soc)
+            # v3.0.11.2: Nie ueber max_soc steigen (Simulation)
+            soc_sim = min(soc_sim, max_soc)
             return action, current_a, soc_sim
 
         # Morgen-Verzoegerung / Adaptive Fenster (v3.0.0)

@@ -4,6 +4,53 @@ Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 
 ---
 
+## v3.0.11.3 — Bugfix: Doppel-Heartbeat im Journal (2026-06-16)
+
+Fixed:
+- `logging_setup.py` (`DeduplicatingFilter.emit_heartbeat_if_due`): Bei
+  nicht-HTTP-Nachrichten (z.B. `[FULL_CHARGE] ... [KEIN WRITE]`) wurden
+  Heartbeats doppelt geschrieben — einmal durch `filter()` (appended
+  `(Heartbeat)` an `record.msg`) und gleichzeitig durch den
+  Hintergrund-Thread via `emit_heartbeat_if_due()` (schreibt
+  `- (Heartbeat: kein Browser-Request seit 20min)`). Ursache: Race
+  Condition — beide Pfade pruefen `_last_ts` fast gleichzeitig und
+  sehen es als faellig.
+
+  Fix: `emit_heartbeat_if_due()` feuert nur noch fuer `HTTP_ACCESS`-
+  Nachrichten. Fuer alle anderen Nachrichten ist `filter()` allein
+  zustaendig. Das `else`-Branch (`text = last_msg + " (Heartbeat)"`)
+  in `emit_heartbeat_if_due()` ist damit entfallen.
+
+  Beobachtetes Symptom im Journal (vor Fix):
+  ```
+  [FULL_CHARGE] 50A | ... [KEIN WRITE] (Heartbeat)
+  - (Heartbeat: kein Browser-Request seit 20min)
+  ```
+
+- `version.py`: VERSION auf 3.0.11.3 aktualisiert.
+
+---
+
+## v3.0.11.2 — Bugfix: Simulations-SOC ueber 100% (2026-06-16)
+
+Fixed:
+- `controller.py` (`_simulate_hour`): Der projizierte SOC im Ladeplan konnte
+  im PAUSE-Zustand (nach Erreichen von `dyn_target`) ueber 100% bzw. ueber
+  `max_soc` (98%) ansteigen. Ursache: `_apply_deficit()` kappte `new_soc`
+  zwar nach unten auf `floor_soc`, aber nicht nach oben. Bei positivem
+  PV-Ueberschuss (`deficit = 0`) addierte der Trickle-Strom (`min_charge_a`)
+  den SOC jede Stunde leicht — unkontrolliert bis >105%.
+
+  Fix an zwei Stellen:
+  1. `_apply_deficit()`: `new_soc = min(max_soc, new_soc)` nach dem
+     `floor_soc`-Clamp.
+  2. `soc_sim >= dyn_target`-Block: `soc_sim = min(soc_sim, max_soc)` nach
+     dem `floor_soc`-Clamp, vor dem `return`.
+
+- `version.py`: VERSION auf 3.0.11.2 aktualisiert.
+
+---
+
 ## v3.0.11.1 — Bugfix: Phantomstrom bei Stundenbeginn (2026-06-15)
 
 Fixed:
