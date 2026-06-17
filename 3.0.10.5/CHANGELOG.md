@@ -3,6 +3,35 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.11.5 — Bugfix: Phantomstrom ~148 A bei H00 (Mitternachts-Reset-Reihenfolge) (2026-06-17)
+
+Fixed:
+- `controller.py` (`run_cycle`): Mitternachts-Reset wurde **nach** `_update_history()`
+  ausgefuehrt. `_update_history()` legt um 00:00 den ersten H00-Eintrag an und
+  speichert dabei `_hour_start_bat_wh = bat_wh_total` — zu diesem Zeitpunkt noch
+  mit der alten kumulierten Tagesbasis (z.B. -7844 Wh bei SOC 80%). Erst danach
+  setzte der Reset `_energy_base_bat = 0.0` und der `EnergyAccumulator` startete
+  neu ab 0. Alle Folge-Updates in H00 berechneten dann:
+
+  ```
+  bat_wh_hour = bat_wh_total_neu - _hour_start_bat_wh_alt
+              = -4 Wh - (-7844 Wh) = +7840 Wh -> +148 A
+  ```
+
+  Fix: Mitternachts-Reset vor `_update_history()` verschieben. Beim Anlegen des
+  H00-Eintrags ist `bat_wh_total = 0 + 0 = 0` korrekt, alle Folge-Updates
+  rechnen ab dem richtigen Ursprung.
+
+  Beobachtetes Symptom (Screenshot v3.0.11.4, 04:09):
+  ```
+  00:00  PAUSE  -148.0 A  80.0%   <- war +7840 Wh / 53V = 147.9 A
+  01:00  PAUSE    -5.3 A  78.0%   <- korrekt
+  ```
+
+- `version.py`: VERSION auf 3.0.11.5 aktualisiert.
+
+---
+
 ## v3.0.11.4 — Bugfix: Unnötige Stromrampe beim Übergang FULL_CHARGE→TRICKLE (2026-06-16)
 
 Fixed:

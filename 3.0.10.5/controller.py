@@ -1164,12 +1164,15 @@ class ChargeController:
 
     def run_cycle(self):
         """Fuehrt einen Regelzyklus aus (v3.0.0)."""
-        self._update_history()
 
         # ── Mitternachts-Reset Balancing-Timer (v3.0.2) ───────────────────────
-        # Unabhaengig von Vorgeschichte (SOC-Schwankungen, Mehrfach-Resets):
-        # Jeden Tag um Mitternacht werden Balancing-Timer zurueckgesetzt.
-        # So beginnt jeder Tag sauber ohne Altlasten vom Vortag.
+        # MUSS vor _update_history() laufen (v3.0.11.5):
+        # _update_history() legt um 00:00 den ersten H00-Eintrag an und setzt
+        # _hour_start_bat_wh = bat_wh_total. Wenn _energy_base_bat erst danach
+        # zurueckgesetzt wird, traegt H00 die alte kumulative Tagesbasis als
+        # Startwert — alle Folge-Updates subtrahieren dann von einem falschen
+        # Ursprung und erzeugen Phantomstroeme (~148 A bei SOC 80%).
+        # Reihenfolge: Reset -> _update_history() -> bat_wh_total = 0 + 0 = 0 korrekt.
         _today_iso = date.today().isoformat()
         if _today_iso != self._balancing_reset_date:
             self._balancing_hold_until = 0.0
@@ -1184,6 +1187,8 @@ class ChargeController:
             self._opt_carried_wh = 0.0
             self._opt_setpoint_a = 0.0
             self.logger.info("Mitternachts-Reset: Balancing-Timer und Glättung zurueckgesetzt")
+
+        self._update_history()
 
         # ── days_since_full_charge immer aktuell aus Datum berechnen ──────────
         if self.state.last_full_charge_date:
