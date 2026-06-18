@@ -202,6 +202,11 @@ class ChargeController:
         self._opt_carried_wh: float = 0.0
         self._opt_setpoint_a: float = 0.0
 
+        # Winterpause: Flag ob der einmalige Modbus-Write fuer den aktuellen
+        # Winterpause-Zeitraum bereits erfolgt ist. Reset beim Verlassen des
+        # Zeitraums, damit im naechsten Winter wieder einmalig geschrieben wird.
+        self._winter_pause_write_done: bool = False
+
     def _load_energy_base(self):
         """Laedt letzten bekannten Energie-Akkumulatorstand aus state.json."""
         try:
@@ -283,6 +288,23 @@ class ChargeController:
     def _needs_full_charge(self) -> bool:
         return self.state.days_since_full_charge >= self.bat.get(
             "full_charge_interval_days", 10)
+
+    def _in_winter_pause(self) -> bool:
+        """Prueft ob heutiges Datum im konfigurierten Winterpause-Zeitraum liegt.
+
+        winter_pause_start/-end sind MM-DD-Strings, jahresunabhaengig.
+        Liegt start > end (z.B. 11-01 .. 02-28), wird der Jahreswechsel
+        ueberbrueckt.
+        """
+        if not self.cc.get("winter_pause_enabled", False):
+            return False
+        start_m, start_d = (int(x) for x in self.cc.get("winter_pause_start", "11-01").split("-"))
+        end_m, end_d = (int(x) for x in self.cc.get("winter_pause_end", "02-28").split("-"))
+        start, end = (start_m, start_d), (end_m, end_d)
+        today_md = (date.today().month, date.today().day)
+        if start <= end:
+            return start <= today_md <= end
+        return today_md >= start or today_md <= end
 
     def _is_morning_window(self) -> bool:
         h = datetime.now().hour
@@ -407,6 +429,22 @@ class ChargeController:
                 f"evcc MinSoc-Sperre aktiv: effektiver Min-SOC = "
                 f"{effective_min_soc:.0f}% (Reg 2901={self.evcc.evcc_min_soc:.0f}%)")
 
+        # ── 0. Winterpause: Regelung komplett aussetzen ───────
+        # Hoechste Prioritaet, explizit auch vor ESS-Notfallzustaenden -
+        # Nutzer-Vorgabe: ausserhalb des Winterpause-Zeitraums voll automatisch,
+        # waehrend der Winterpause kein Management mehr. Beim Eintritt wird
+        # einmalig max_a geschrieben, danach nur noch -1 (kein Write).
+        if self._in_winter_pause():
+            if not self._winter_pause_write_done:
+                self.victron.set_max_charge_current(max_a)
+                self._winter_pause_write_done = True
+                self.logger.info(
+                    f"Winterpause: einmaliger Write {max_a:.0f}A, Regelung pausiert")
+            return -1, "winter_pause", (
+                f"Winterpause aktiv ({self.cc.get('winter_pause_start')} - "
+                f"{self.cc.get('winter_pause_end')}), keine Regelung")
+        else:
+            self._winter_pause_write_done = False
 
         # ── 1. ESS State 11/12: Entladen gesperrt oder Netzladung erzwungen ──
         # HOECHSTE PRIORITAET: Hardware-Eingriff durch Victron ESS.

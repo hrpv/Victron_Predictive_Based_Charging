@@ -3,6 +3,36 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.12 — Neues Feature: Winterpause (2026-06-18)
+
+Added:
+- `controller.py` (`_in_winter_pause`): Prüft, ob das heutige Datum im
+  konfigurierten Winterpause-Zeitraum liegt. `winter_pause_start`/`winter_pause_end`
+  sind MM-DD-Strings (jahresunabhängig), ein Zeitraum über den Jahreswechsel
+  hinweg (z.B. `11-01` → `02-28`) wird korrekt überbrückt.
+- `controller.py` (`decide`): Neuer Prioritäts-Block **0** — höchste Priorität,
+  läuft explizit vor ESS State 11/12 und allen anderen Entscheidungspfaden.
+  Solange die Winterpause aktiv ist, übernimmt `decide()` keine Regelung mehr:
+  beim Eintritt in den Zeitraum wird einmalig `max_charge_current` per Modbus
+  geschrieben (`victron.set_max_charge_current`), danach liefert `decide()`
+  durchgehend `(-1, "winter_pause", ...)` zurück — `run_cycle()` überspringt
+  damit den Write-Block komplett (analog zur evcc-Schnelllade-Priorität).
+  Verlässt das Datum den Zeitraum, wird das interne Write-Flag
+  (`_winter_pause_write_done`) zurückgesetzt, damit im nächsten Winter wieder
+  einmalig geschrieben wird.
+- `config.yaml`: neue Keys `winter_pause_enabled` (Default `false`),
+  `winter_pause_start` (Default `"11-01"`), `winter_pause_end`
+  (Default `"02-28"`).
+
+  Sandbox-Testlauf (Konsole + eigenständiges Test-Dashboard auf Port 5001,
+  parallel zum echten Service auf Port 5000) bestätigt: genau 1 Modbus-Write
+  beim Eintritt, 0 weitere Writes über mehrere Zyklen, `state.charge_mode`/
+  `state.charge_reason` zeigen `winter_pause` korrekt im Dashboard an.
+
+- `version.py`: VERSION auf 3.0.12 aktualisiert.
+
+---
+
 ## v3.0.11.5 — Bugfix: Phantomstrom ~148 A bei H00 (Mitternachts-Reset-Reihenfolge) (2026-06-17)
 
 Fixed:
