@@ -29,6 +29,25 @@ Added:
   beim Eintritt, 0 weitere Writes über mehrere Zyklen, `state.charge_mode`/
   `state.charge_reason` zeigen `winter_pause` korrekt im Dashboard an.
 
+Fixed:
+- `controller.py` (`decide`): `NameError: name 'needs_full' is not defined`
+  beim Eintritt ins Optimal-Fenster (Block 6). Die in v3.0.11.4 eingefuehrte
+  Bedingung `if not needs_full:` referenzierte eine lokale Variable, die in
+  `decide()` nie zugewiesen wird — `needs_full` existiert nur als lokale
+  Variable innerhalb von `build_schedule()` (dort via
+  `needs_full = self._needs_full_charge()`). Der Crash betraf ausschliesslich
+  Zyklen innerhalb des Optimal-Fensters (rund um Sonnenhoechststand) und
+  fuehrte zu einer Restart-Schleife des systemd-Service (`status=1/FAILURE`,
+  `Scheduled restart job`), sobald `decide()` diesen Codepfad erreichte.
+
+  Fix: `if not needs_full:` → `if not self._needs_full_charge():`, also
+  Aufruf der bereits vorhandenen Helper-Methode statt Referenz auf eine
+  nicht existierende lokale Variable.
+
+  Bestaetigt im Live-Betrieb (2026-06-19, H11): Optimal-Fenster-Plan laeuft
+  fehlerfrei durch, Modbus-Write erfolgreich (13 A), Dashboard zeigt
+  `Optimal-Fenster H11: 13A (Plan 702Wh, Übertrag +0Wh, SOC 47.0%→71%)`.
+
 - `version.py`: VERSION auf 3.0.12 aktualisiert.
 
 ---

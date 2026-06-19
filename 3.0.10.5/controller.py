@@ -579,7 +579,7 @@ class ChargeController:
             # Trickle-Pfad direkt. Das Optimal-Fenster wuerde sonst den Strom auf
             # einen niedrigeren Plan-Wert reduzieren (z.B. 50A->15A) und danach
             # muss Trickle wieder hoch rampen (15A->20A).
-            if not needs_full:
+            if not self._needs_full_charge():
                 # SOC-Schutz: Ziel überschritten -> sofort Strom reduzieren
                 if soc > dyn_target:
                     self._opt_plan_hour = -1  # Plan zurücksetzen, Ziel erreicht
