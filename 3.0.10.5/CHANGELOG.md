@@ -3,6 +3,71 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.12.2 — Fix: Unnötige Rampe statt Direktsprung nach Sonnenuntergang (2026-06-20)
+
+Korrektur zu v3.0.12.1: die dortige Notiz ging davon aus, dass `controller.py`
+(`_ramp`) die Nacht-Ausnahme bereits enthält. Beim Abgleich mit der tatsächlich
+auf dem Pi laufenden Datei (Quelle des analysierten Journals) zeigte sich:
+die Ausnahme fehlte dort komplett — `_ramp()` rampte unabhängig von Tag/Nacht
+immer in `current_ramp_step`-Schritten. Log-Beleg (2026-06-19, nach
+Sonnenuntergang 21:26):
+
+```
+22:07:58  Modbus WRITE MaxChargeCurrent = 40 A   [IDLE] Nacht: kein Laden
+22:08:59  Modbus WRITE MaxChargeCurrent = 30 A
+22:09:59  Modbus WRITE MaxChargeCurrent = 20 A
+22:11:00  Modbus WRITE MaxChargeCurrent = 10 A
+22:12:01  Modbus WRITE MaxChargeCurrent = 3 A
+```
+
+5 Writes über 4 Minuten, obwohl PV zu diesem Zeitpunkt bereits bei 0 liegt
+und der reale Ladestrom ohnehin durch DVCC/ESS auf das begrenzt wird, was
+PV liefert — ein Direktsprung 50A→3A hätte am tatsächlich fließenden Strom
+nichts geändert.
+
+Fixed:
+- `controller.py` (`_ramp`): Nacht-Ausnahme ergänzt. Vor Sonnenaufgang bzw.
+  nach Sonnenuntergang (`h_now < sunrise or h_now > sunset`, astronomisch
+  über `forecast._calculate_sun_times()`) wird `target_a` direkt gesetzt
+  (`_ramp_current = target_a`) statt schrittweise anzunähern. Reduziert
+  Modbus-Writes beim Übergang in/aus FULL_CHARGE in der Dunkelphase von
+  bis zu 5 auf 1, ohne die Rampen-Dämpfung tagsüber (PV-Schwankungen) zu
+  beeinflussen — die Bedingung greift ausschließlich außerhalb des
+  Sonnenauf-/untergangsfensters.
+
+  Simulation mit den geloggten Zeitstempeln und echten Config-Koordinaten
+  (Aichwald, 48.7594/9.3775) bestätigt: erster Zyklus nach Sonnenuntergang
+  springt jetzt direkt von 50A auf 3A (Clamp durch `min_charge_current`),
+  alle Folgezyklen schreiben nicht erneut (Hysterese).
+
+- `version.py`: VERSION auf 3.0.12.2 aktualisiert.
+
+---
+
+## v3.0.12.1 — Klarstellung: Rampe an Sonnenauf-/untergang (2026-06-20)
+
+Notiz (keine Code-Änderung):
+- Frage geprüft: ob beim Übergang in/aus der Dunkelphase ein zusätzlicher
+  Zeitpuffer vor Sonnenaufgang bzw. nach Sonnenuntergang sinnvoll wäre, um
+  unnötige Modbus-Writes beim Herunter-/Hochrampen (z.B. 50A→3A) zu vermeiden.
+  Begründung des Vorschlags: die PV-Leistung ist in diesen Randstunden so
+  gering, dass ohnehin nur wenige A Ladestrom fließen können — selbst bei
+  einem direkten Sprung 3A→50A oder 50A→3A ändert sich am tatsächlich
+  fließenden Strom nichts, da DVCC/ESS den Strom automatisch auf das
+  begrenzen, was PV liefert.
+- Ergebnis: kein zusätzlicher Puffer nötig. `controller.py` (`_ramp`)
+  enthält bereits genau dieses Verhalten (seit der Modularisierung,
+  v3.0.10.x): `is_night = h_now < sunrise or h_now > sunset` springt bei
+  Nacht direkt auf den Zielwert, ganz ohne Zwischenschritte — kein
+  zusätzlicher Zeitpuffer vor/nach der reinen Sonnenauf-/untergangsgrenze.
+  Sichtbare Rampen-Sequenzen außerhalb der Nachtphase (z.B. gegen 16 Uhr,
+  deutlich vor Sonnenuntergang) sind reguläre Tageslicht-Übergänge
+  (FULL_CHARGE → Trickle), keine Dämmerungsfälle, und dort ist das Rampen
+  weiterhin korrekt und gewollt (PV schwankt zu dieser Zeit noch spürbar).
+- `version.py`: VERSION auf 3.0.12.1 aktualisiert.
+
+---
+
 ## v3.0.12 — Neues Feature: Winterpause (2026-06-18)
 
 Added:

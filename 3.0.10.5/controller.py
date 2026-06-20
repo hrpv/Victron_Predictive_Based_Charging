@@ -674,7 +674,19 @@ class ChargeController:
             f"Warte auf PV-Ueberschuss "
             f"(SOC {soc:.1f}%, PV {pv_w:.0f} W [glatt], Last {load_w:.0f} W [glatt])")
     def _ramp(self, target_a: float) -> float:
-        """Sanftes Rampen des Ladestroms (+/- ramp_step A pro Zyklus)."""
+        """Sanftes Rampen des Ladestroms (+/- ramp_step A pro Zyklus).
+
+        Ausnahme Nacht (vor Sonnenaufgang / nach Sonnenuntergang): kein PV-Fluss,
+        daher kein Rampen notwendig -> Zielwert wird direkt gesetzt. Spart
+        Modbus-Writes beim Uebergang in/aus FULL_CHARGE in der Dunkelphase, ohne
+        die Rampen-Daempfung tagsueber (PV-Schwankungen) zu beeinflussen.
+        """
+        sunrise, sunset, _ = self.forecast._calculate_sun_times(date.today())
+        h_now = datetime.now().hour + datetime.now().minute / 60.0
+        is_night = h_now < sunrise or h_now > sunset
+        if is_night:
+            self._ramp_current = target_a
+            return self._ramp_current
         step = self.cc.get("current_ramp_step", 5)
         if target_a > self._ramp_current:
             self._ramp_current = min(self._ramp_current + step, target_a)
