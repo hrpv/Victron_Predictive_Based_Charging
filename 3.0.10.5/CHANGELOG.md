@@ -35,10 +35,10 @@ Fixed:
   beeinflussen — die Bedingung greift ausschließlich außerhalb des
   Sonnenauf-/untergangsfensters.
 
-  Simulation mit den geloggten Zeitstempeln und echten Config-Koordinaten
-  (Aichwald, 48.7594/9.3775) bestätigt: erster Zyklus nach Sonnenuntergang
-  springt jetzt direkt von 50A auf 3A (Clamp durch `min_charge_current`),
-  alle Folgezyklen schreiben nicht erneut (Hysterese).
+  Simulation mit den geloggten Zeitstempeln und den realen Standort-Koordinaten
+  aus `config.yaml` bestätigt: erster Zyklus nach Sonnenuntergang springt
+  jetzt direkt von 50A auf 3A (Clamp durch `min_charge_current`), alle
+  Folgezyklen schreiben nicht erneut (Hysterese).
 
 - `version.py`: VERSION auf 3.0.12.2 aktualisiert.
 
