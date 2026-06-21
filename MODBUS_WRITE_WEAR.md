@@ -147,4 +147,4 @@ einen messbaren Nutzen für den tatsächlich fließenden Ladestrom hatten.
 Auseinandersetzung mit dem Thema Flash-Verschleiß nachvollziehbar zu machen.
 Es stellt keine Garantie und keine Haftungsübernahme dar. Nutzung dieses
 Projekts erfolgt wie bei privater Open-Source-Software üblich auf eigene
-Verantwortung; siehe LICENSE.*
+Verantwortung *
