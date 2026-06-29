@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pylint: disable=logging-fstring-interpolation,protected-access,line-too-long
 """
 logging_setup.py — Logging-Infrastruktur für Solar Batterie Manager
 =====================================================================
@@ -92,9 +93,8 @@ class DeduplicatingFilter(logging.Filter):
                     record.args = None
                     return True
                 return False
-            else:
-                self._last_msg = msg
-                return True
+            self._last_msg = msg
+            return True
 
     def emit_heartbeat_if_due(self) -> None:
         """
@@ -119,7 +119,6 @@ class DeduplicatingFilter(logging.Filter):
             if (now - self._last_ts) < self._heartbeat_s:
                 return
             self._last_ts = now
-            last_msg = self._last_msg
         text = "- (Heartbeat: kein Browser-Request seit 20min)"
         r = logging.LogRecord(
             name="heartbeat", level=logging.INFO,
@@ -132,6 +131,7 @@ class DeduplicatingFilter(logging.Filter):
 # ─────────────────────────────────────────────
 
 def setup_logging(cfg: dict) -> tuple[logging.Logger, DeduplicatingFilter, DeduplicatingFilter]:
+    """Konfiguriert Logger mit RotatingFileHandler und StreamHandler inkl. Deduplizierung."""
     log_cfg = cfg.get("logging", {})
     log_file = log_cfg.get("file", "battery_manager.log")
     log_level = getattr(logging, log_cfg.get("level", "INFO"))

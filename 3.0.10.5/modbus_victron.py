@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pylint: disable=logging-fstring-interpolation,broad-exception-caught
+# pylint: disable=too-many-locals,multiple-statements
 """
 modbus_victron.py — Victron Modbus-TCP Interface
 =================================================

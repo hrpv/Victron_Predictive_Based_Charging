@@ -42,7 +42,7 @@ forecast.night_consumption_kwh.return_value = 2.0
 forecast.pv_remaining_kwh.return_value = 3.0
 forecast.pv_total_kwh.return_value = 6.0
 forecast.get_forecast.return_value = []
-forecast._calculate_sun_times.return_value = (7.0, 18.0, 12.5)
+forecast._calculate_sun_times.return_value = (7.0, 18.0, 12.5)  # pylint: disable=protected-access
 
 victron = MagicMock()
 victron.set_max_charge_current.return_value = True

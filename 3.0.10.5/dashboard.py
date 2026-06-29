@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pylint: disable=logging-fstring-interpolation,duplicate-code
+# pylint: disable=too-many-locals,import-outside-toplevel
 """
 dashboard.py — Web-Dashboard für Solar Batterie Manager
 ========================================================
@@ -56,6 +58,7 @@ class _HeartbeatThread(threading.Thread):
                 f.emit_heartbeat_if_due()
 
     def stop(self):
+        """Stoppt den Heartbeat-Thread."""
         self._stop.set()
 
 
@@ -389,7 +392,7 @@ def start_dashboard(cfg: dict, state, logger: logging.Logger,
     # Import hier um zirkulären Top-Level-Import zu vermeiden
     # DeduplicatingFilter-Klasse aus dem aufrufenden Modul holen
     # (wird als Instanz übergeben, Klasse für neues Objekt nötig)
-    DeduplicatingFilter = type(dedup_stream)
+    DeduplicatingFilter = type(dedup_stream)  # pylint: disable=invalid-name
 
     werkzeug_log = logging.getLogger('werkzeug')
     if hasattr(werkzeug_log, 'handlers') and werkzeug_log.handlers:
@@ -403,7 +406,7 @@ def start_dashboard(cfg: dict, state, logger: logging.Logger,
     ch_werkzeug  = logging.StreamHandler()
     ch_werkzeug.setFormatter(fmt_werkzeug)
     ch_werkzeug.addFilter(dedup_werkzeug)
-    dedup_werkzeug._handler = ch_werkzeug
+    dedup_werkzeug._handler = ch_werkzeug  # pylint: disable=protected-access
     werkzeug_log.addHandler(ch_werkzeug)
 
     if dedup_enabled:

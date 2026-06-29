@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pylint: disable=logging-fstring-interpolation,too-many-instance-attributes
+# pylint: disable=too-many-locals,too-many-branches,too-many-statements
+# pylint: disable=too-few-public-methods,broad-exception-caught
 """
 forecast.py — PV-Prognose für Solar Batterie Manager
 =====================================================
@@ -17,7 +20,7 @@ Importiert von: battery_manager.py (Instanziierung in main()),
 import math
 import logging
 import time
-from datetime import datetime, timedelta, date, timezone
+from datetime import datetime, date, timezone
 from typing import Optional
 
 import requests
@@ -59,6 +62,7 @@ class VrmForecastManager:
         self.timeout      = vrm.get("timeout_seconds", 10)
         self._cache: Optional[list] = None
         self._cache_ts: float = 0.0
+        self._cache_day: Optional[date] = None
 
     def _headers(self) -> dict:
         return {"x-authorization": f"Token {self.token}",
@@ -162,9 +166,9 @@ class VrmForecastManager:
                     continue
                 cons_by_hour[dt.hour] = cons_by_hour.get(dt.hour, 0.0) + float(wh)
 
-            # PV-Prognose in HourlyForecast umwandeln  -  alle 24h, nicht nur PV-Stunden.
-            # VRM liefert PV-Daten nur fuer Tagesstunden; Nachtstunden fehlen in pv_by_hour.
-            # Ohne range(24) wuerden Nachtstunden in night_consumption_kwh() fehlen -> zu niedriger Wert.
+            # PV-Prognose in HourlyForecast umwandeln – alle 24h, nicht nur PV-Stunden.
+            # VRM liefert nur Tagesstunden; ohne range(24) fehlten Nachtstunden
+            # in night_consumption_kwh().
             out = []
             total_pv_kwh = 0.0
             for h in range(24):
@@ -221,12 +225,14 @@ class ForecastManager:
         self.fc_cfg = cfg["forecast"]
         self._cache: Optional[list] = None
         self._cache_ts: float = 0.0
+        self._cache_day: Optional[date] = None
         # VRM als primäre Prognose-Quelle
         self.vrm = VrmForecastManager(cfg, logger)
         # (-1, -1) erzwingt Log beim ersten Aufruf nach Programmstart
         self._last_night_window: tuple = (-1, -1)
 
     def get_forecast(self, force: bool = False) -> list:
+        """Gibt gecachte oder frisch abgerufene stündliche PV-Prognose zurück."""
         interval_s = self.fc_cfg.get("update_interval_minutes", 60) * 60
         # Cache bei Tageswechsel immer verwerfen
         cache_day = getattr(self, "_cache_day", None)
@@ -331,10 +337,12 @@ class ForecastManager:
         return out
 
     def pv_remaining_kwh(self) -> float:
+        """Summiert PV-Prognose ab der aktuellen Stunde bis Tagesende."""
         now_h = datetime.now().hour
         return sum(f.pv_kwh for f in self.get_forecast() if f.hour >= now_h)
 
     def pv_total_kwh(self) -> float:
+        """Summiert die gesamte PV-Tagesprognose aller Stunden."""
         return sum(f.pv_kwh for f in self.get_forecast())
 
     def night_consumption_kwh(self) -> float:
@@ -367,7 +375,7 @@ class ForecastManager:
 
         # UTC-Offset für das konkrete Datum (Sommerzeit!)
         try:
-            from zoneinfo import ZoneInfo
+            from zoneinfo import ZoneInfo  # pylint: disable=import-outside-toplevel
             tz = ZoneInfo(tz_name)
             noon_local = datetime(dt.year, dt.month, dt.day, 12, 0, tzinfo=tz)
             utc_offset_h = noon_local.utcoffset().total_seconds() / 3600.0
@@ -380,8 +388,10 @@ class ForecastManager:
         decl = math.radians(-23.44 * math.cos(math.radians((360.0 / 365.0) * (n + 10))))
 
         # Zeitgleichung (Equation of Time) in Stunden
-        B = math.radians((360.0 / 365.0) * (n - 81))
-        eot = (9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)) / 60.0
+        b_angle = math.radians((360.0 / 365.0) * (n - 81))
+        eot = (9.87 * math.sin(2 * b_angle)
+               - 7.53 * math.cos(b_angle)
+               - 1.5 * math.sin(b_angle)) / 60.0
 
         # Stundenwinkel: 90.833° = 90° + 50' (Sonnenradius 16' + Refraktion 34')
         lat_rad = math.radians(lat)
@@ -408,7 +418,7 @@ class ForecastManager:
         Fallback (kein Forecast oder unplausible Werte): astronomische
         Dämmerungszeiten aus GPS + Datum. Keine statischen Config-Werte nötig.
         """
-        sunrise, sunset, solar_noon = self._calculate_sun_times(date.today())
+        sunrise, sunset, _ = self._calculate_sun_times(date.today())
         ns_fallback = max(12, min(23, math.ceil(sunset)))
         ne_fallback = max(0,  min(11, math.floor(sunrise)))
 

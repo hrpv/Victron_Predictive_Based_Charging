@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pylint: disable=logging-fstring-interpolation,broad-exception-caught
+# pylint: disable=too-many-branches,too-many-statements,too-many-locals
+# pylint: disable=protected-access
 """
 =============================================================
 Prognosebasiertes Laden - Batterielebensdauer optimieren
@@ -74,14 +77,11 @@ Victron Modbus-TCP Register (Cerbo GX, Unit-ID 100):
 """
 
 import logging
-import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-import requests
 import yaml
 
 from version import VERSION
@@ -95,10 +95,11 @@ from dashboard import start_dashboard
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
+    """Lädt die YAML-Konfiguration; sucht zuerst im übergebenen Pfad, dann neben der Skriptdatei."""
     path = Path(config_path)
     if not path.exists():
         path = Path(__file__).parent / "config.yaml"
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -196,9 +197,10 @@ def _forecast_source(forecast: "ForecastManager") -> str:
     return "dummy"
 
 def main():
+    """Einstiegspunkt: Config laden, alle Subsysteme initialisieren, Hauptschleife starten."""
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
     cfg    = load_config(config_path)
-    logger, dedup_file, dedup_stream = setup_logging(cfg)
+    logger, _, dedup_stream = setup_logging(cfg)
 
     logger.info("=" * 60)
     logger.info(f"Solar Batterie Manager v{VERSION}  (Modbus TCP) - Predictive Charging")
@@ -323,4 +325,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pylint: disable=logging-fstring-interpolation,protected-access
+# pylint: disable=too-many-locals,too-many-branches,too-many-statements
+# pylint: disable=too-many-instance-attributes,attribute-defined-outside-init
+# pylint: disable=too-many-return-statements,too-many-arguments,too-many-positional-arguments
+# pylint: disable=no-else-return,too-few-public-methods,broad-exception-caught
+# pylint: disable=missing-module-docstring,too-many-lines,wrong-import-position
+# pylint: disable=unused-argument,line-too-long,pointless-string-statement
 # PEP 563: alle Typ-Annotationen werden lazy ausgewertet (Strings).
 # Verhindert NameError bei TYPE_CHECKING-only Imports (VictronModbus, EvccMonitor)
 # zur Laufzeit auf Python 3.10+.
@@ -23,9 +30,9 @@ import json
 import logging
 import math
 import os
+import tempfile
 import time
 from collections import deque
-from dataclasses import asdict
 from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
@@ -37,8 +44,8 @@ if TYPE_CHECKING:
     from forecast import ForecastManager
 
 # Zur Laufzeit gebraucht (nicht nur TYPE_CHECKING)
-from models import SystemState, HourlyForecast, HourlyHistory
-from forecast import ForecastManager
+from models import SystemState, HourlyForecast, HourlyHistory  # pylint: disable=ungrouped-imports
+from forecast import ForecastManager  # pylint: disable=ungrouped-imports
 
 
 class EnergyAccumulator:
@@ -60,6 +67,7 @@ class EnergyAccumulator:
         self.bat_wh:   float = 0.0   # signed Wh: + = Laden, - = Entladen
 
     def update(self, pv_w: float, load_w: float, bat_w: float = 0.0):
+        """Integriert Leistungsmesswerte trapezförmig; setzt Zähler bei Tageswechsel zurück."""
         now_ts = time.monotonic()
         today  = date.today()
         if self._day and self._day != today:   # Tageswechsel
@@ -225,12 +233,15 @@ class ChargeController:
         # Winterpause-Zeitraum bereits erfolgt ist. Reset beim Verlassen des
         # Zeitraums, damit im naechsten Winter wieder einmalig geschrieben wird.
         self._winter_pause_write_done: bool = False
+        # Tracking-Felder die bedingt gesetzt werden (hier initialisiert um W0201 zu vermeiden)
+        self._min_soc_force_ts: float = 0.0
+        self._last_evcc_active: bool = False
 
     def _load_energy_base(self):
         """Laedt letzten bekannten Energie-Akkumulatorstand aus state.json."""
         try:
             if self._state_file.exists():
-                data = json.loads(self._state_file.read_text())
+                data = json.loads(self._state_file.read_text(encoding="utf-8"))
                 saved_date = data.get("energy_date", "")
                 today = date.today().isoformat()
                 if saved_date == today:
@@ -252,7 +263,7 @@ class ChargeController:
         if not self._state_file.exists():
             return
         try:
-            data = json.loads(self._state_file.read_text())
+            data = json.loads(self._state_file.read_text(encoding="utf-8"))
             last = data.get("last_full_charge_date", "")
             self.state.last_full_charge_date = last
             if last:
@@ -266,7 +277,6 @@ class ChargeController:
 
     def _save_persistent(self):
         try:
-            import tempfile, os
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
             # Aktuellen Gesamtenergie-Stand = Akkumulator + Basis aus letztem Neustart
             pv_total   = self.state.pv_energy_today_kwh   + self._energy_base_pv
@@ -290,7 +300,7 @@ class ChargeController:
             fd, tmp_path = tempfile.mkstemp(
                 dir=self._state_file.parent, suffix=".tmp")
             try:
-                with os.fdopen(fd, "w") as f:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(payload)
                     f.flush()
                     os.fsync(f.fileno())   # sicherstellen, dass Daten auf SD sind
@@ -336,7 +346,7 @@ class ChargeController:
     def _is_night(self) -> bool:
         h = datetime.now().hour
         # Astronomische Zeiten aus GPS + Datum (v3.0.9)
-        sunrise, sunset, solar_noon = self.forecast._calculate_sun_times(date.today())
+        sunrise, sunset, _ = self.forecast._calculate_sun_times(date.today())
         night_start = max(12, min(23, math.ceil(sunset)))
         night_end   = max(0, min(11, math.floor(sunrise)))
         return (h >= night_start or h < night_end)
@@ -522,14 +532,6 @@ class ChargeController:
         if self._is_night():
             return 0, "idle", f"Nacht: kein Laden (SOC {soc:.1f}%)"
 
-        # ── Prognose-Daten ────────────────────────────────────
-        pv_rem     = self.forecast.pv_remaining_kwh()
-        pv_total   = self.forecast.pv_total_kwh()
-        night_cons = self.forecast.night_consumption_kwh()
-
-        # Projizierter Abend-SOC (aktueller SOC + restliche PV-Erzeugung)
-        proj_eve = min(max_soc, soc + self._soc_for_kwh(pv_rem))
-
         # Ziel bereits erreicht?
         # v3.0.9.10: Asymmetrische Hysterese – Abschalten erst bei soc >= dyn_target
         # (nicht bei dyn_target - hyst). Nachladen weiter unten bei soc < dyn_target - hyst.
@@ -684,7 +686,7 @@ class ChargeController:
                 bat_wh_total_now = self.state.bat_energy_today_wh + self._energy_base_bat
 
                 # Neue Stunde? Neu planen wenn Stunde gewechselt oder noch kein Plan
-                new_hour = (self._opt_plan_hour != h_now)
+                new_hour = self._opt_plan_hour != h_now
 
                 if new_hour:
                     # Defizit der abgeschlossenen Vorjahr-Stunde berechnen
@@ -883,7 +885,7 @@ class ChargeController:
                 soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             else:
                 # Kein PV-Ueberschuss und SOC >= floor_soc:
-                # Victron ESS sperrt Batterieentladung unter floor_soc (Reg 2901)  - 
+                # Victron ESS sperrt Batterieentladung unter floor_soc (Reg 2901) —
                 # Verbraucher werden aus dem Netz gespeist, Batterie weder geladen
                 # noch entladen. SOC friert bei floor_soc ein.
                 # Vollladung wird naechsten Tag / bei ausreichend PV nachgeholt.
@@ -1179,7 +1181,7 @@ class ChargeController:
 
         # Letzten Eintrag suchen (gleiche Stunde oder vorherige)
         last_entry = None
-        for i, h in enumerate(self.state.history_buffer):
+        for _, h in enumerate(self.state.history_buffer):
             if h.date_iso == today_iso and h.hour <= current_hour:
                 last_entry = h
 
@@ -1291,7 +1293,7 @@ class ChargeController:
         # Alte Eintraege entfernen (nur heute und gestern behalten)
         cutoff = (now.date() - timedelta(days=1)).isoformat()
         self.state.history_buffer = [
-            h for h in self.state.history_buffer 
+            h for h in self.state.history_buffer
             if h.date_iso >= cutoff
         ]
 
@@ -1455,8 +1457,6 @@ class ChargeController:
         # Außerhalb des Optimal-Fensters: identisches Verhalten.
         write_performed = False
         if target_a >= 0:
-            is_optimal = mode == "charging" and "Optimal-Fenster" in reason
-
             # v3.0.11: Im Optimal-Fenster wird der Strom genau wie alle anderen
             # Modi gerampet. Der Zielstrom ändert sich nur stündlich (neuer Plan)
             # oder beim SOC-Guard — die Rampe dämpft den Sprung sanft.

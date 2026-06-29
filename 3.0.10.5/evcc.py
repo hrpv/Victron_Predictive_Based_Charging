@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pylint: disable=logging-fstring-interpolation,too-many-instance-attributes
+# pylint: disable=too-few-public-methods,broad-exception-caught
 """
 evcc.py — evcc Koordination für Solar Batterie Manager
 =======================================================

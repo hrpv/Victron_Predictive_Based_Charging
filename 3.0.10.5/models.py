@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pylint: disable=too-many-instance-attributes
 """
 models.py — Datenklassen für Solar Batterie Manager
 =====================================================
@@ -67,6 +68,7 @@ class SystemState:
 
 @dataclass
 class HourlyForecast:
+    """Stündliche PV-Prognose mit Verbrauch und Netto-Überschuss."""
     hour: int
     pv_kwh: float
     consumption_kwh: float
