@@ -3,6 +3,198 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.13.3 — Fix: Mehrfacher Cellbalancing-Hold am selben Tag (2026-06-28)
+
+Symptom: Nach einem vollständig durchlaufenen Cellbalancing-Hold (10:54–12:53,
+119 Minuten, Auto-Reset bereits um 11:55 erfolgt) startete die Anlage am
+Nachmittag mehrfach einen kompletten neuen 119-Minuten-Hold (14:55, 14:58,
+15:30 — jeweils erneut "halte 20A noch 119 min"), obwohl
+`days_since_full_charge` bereits auf 0 stand und keine Vollladung mehr fällig
+war.
+
+Root Cause: `dyn_target` blieb den ganzen Tag bei 98.0, weil dieser Wert hier
+nicht aus dem 10-Tage-Zellbalancing-Intervall stammte, sondern aus dem
+regulären Nachtverbrauchspfad (`night_cons / capacity`, gecappt auf 98%) —
+ein an diesem Tag durchgehend gültiger Normalzustand, nicht nur ein
+einmaliges Morgen-Ereignis. `battery_voltage` schwankte am Nachmittag durch
+PV-/Lastwechsel knapp um die 55V-Trigger-Schwelle (54.7V–55.2V). Jedes Mal,
+wenn `soc >= 98% UND U >= 55.0V` erneut gleichzeitig zutraf, sah
+`run_cycle()` `_soc_98_reached_at is None` (durch den vorherigen
+Hysterese-Abbruch in `decide()` zurückgesetzt) und startete einen
+**komplett neuen** Hold mit voller Dauer — unabhängig davon, dass an diesem
+Tag bereits ein vollständiger Zyklus gelaufen war.
+
+Fixed:
+- Neue Instanzvariable `_balancing_completed_today` (bool, Reset bei
+  Mitternacht zusammen mit den übrigen Balancing-Trackern).
+- `controller.py` (`decide`, Trickle-Block): Läuft die Haltezeit natürlich ab
+  (`hold_active` wird `False`, weil `_balancing_hold_until` erreicht ist —
+  nicht weil SOC/Spannung vorzeitig unter die Hysterese-Schwelle fielen),
+  wird `_balancing_completed_today = True` gesetzt. Diese Unterscheidung
+  zwischen „natürlich abgelaufen" und „vorzeitig abgebrochen" ist wichtig:
+  ein vorzeitiger Abbruch (Spannung/SOC bricht ein) bedeutet weiterhin
+  „Vollladung bleibt fällig" und darf erneut versucht werden; ein
+  natürliches Ende bedeutet „heute bereits erfolgreich abgeschlossen".
+- `controller.py` (`run_cycle`, Auto-Reset-Block): Ein neuer Hold startet nur
+  noch, wenn `_soc_98_reached_at is None AND not _balancing_completed_today`.
+  Spätere kurze Überschreitungen der 55V-Schwelle am selben Tag lösen damit
+  keinen weiteren vollen Hold mehr aus.
+
+Nicht geändert: Auto-Reset-Logik für `days_since_full_charge` selbst, sowie
+der vorzeitige Hysterese-Abbruch (führt weiterhin zu „Vollladung bleibt
+fällig", kann bei echtem SOC-Abfall erneut in Block 3 münden) bleiben
+unverändert.
+
+---
+
+## v3.0.13.2 — trickle_current: keine Reduktion bei bereits höherem Ladestrom (2026-06-28)
+
+Umsetzung einer zuvor dokumentierten, aber noch nicht implementierten Idee
+(siehe Notizen zu „trickle_current logic — avoid unnecessary reduction at
+SOC ≥ 98%"): Bisher reduzierte der Übergang von Block 3 (Vollladung fällig,
+`max_a`/50A) in den Cellbalancing-Hold den Ladestrom unconditional auf
+`trickle_current` (20A) — auch dann, wenn SOC und Spannung die
+Vollladungs-Schwelle bereits erfüllt hatten und der höhere Strom technisch
+unproblematisch weiterlaufen könnte. Das erzeugte einen unnötigen
+Modbus-Write (50A → 20A) ohne Vorteil fürs Cellbalancing.
+
+Fixed:
+- `controller.py` (`decide`, Trickle/Hold-Block): Beim Eintritt in die
+  Haltezeit wird jetzt `max(trickle_current, _ramp_current)` verwendet statt
+  pauschal `trickle_current`. `_ramp_current` spiegelt den tatsächlich
+  aktiven, gerampten Ladestrom des Vorzyklus wider (also z.B. 50A direkt aus
+  Block 3) — der Strom wird nur dann auf `trickle_current` reduziert, wenn er
+  vorher bereits niedriger war. Kommt der Hold aus Block 3, bleibt der Strom
+  unverändert auf dem zuvor aktiven Wert (z.B. 50A), `_ramp()` erkennt
+  `target_a == _ramp_current` und löst keinen weiteren Write aus.
+
+Abgeglichen gegen den aktuellen Codepfad (Stand v3.0.13.1): bestätigt, dass
+`self.state.charge_current_setpoint`/`self._ramp_current` zum Zeitpunkt des
+`decide()`-Aufrufs noch den Wert des *vorherigen* Zyklus enthalten (Update
+erfolgt erst danach in `run_cycle()`), und dass der Spezialfall
+„`mode == 'trickle'` und Hold läuft → `decide()` wird jeden Zyklus neu
+aufgerufen" (verhindert eingefrorenen Countdown) den ersten Übergang
+full_charge→trickle nicht verzögert.
+
+Nicht geändert: `_needs_full_charge()`, Trigger-/Abbruchbedingung des Holds
+(v3.0.13.0/.1) bleiben unverändert — betroffen ist ausschließlich die Höhe
+des beim Übergang gesetzten Stroms.
+
+---
+
+## v3.0.13.1 — Fix: Lücke zwischen Vollladung und Trickle ließ Strom auf 3A einbrechen (2026-06-28)
+
+Symptom: Nach Einführung des Spannungskriteriums (v3.0.13.0) wurde beobachtet,
+dass der Ladestrom während einer fälligen Vollladung abrupt von 50A auf 3A
+sprang, statt durchgehend bei 50A zu bleiben bis Trickle einsetzt.
+
+Log-Beleg (Pi-Journal, v3.0.13.0 produktiv, 28.06., `state.json`:
+`days_since_full_charge: 1` zu Tagesbeginn → `dyn_target` korrekt 98.0 wegen
+`full_charge_interval_days: 10` Defizit von Vortagen):
+
+```
+09:01:56  [FULL_CHARGE] 50A | Vollladung faellig (1 Tage) -> ... (aktuell 95.0%) [KEIN WRITE]
+09:12:01  Modbus WRITE MaxChargeCurrent = 30 A
+09:12:01  [IDLE] 30A | Morgen: PV im Optimal-Fenster ... warte
+09:13:02  Modbus WRITE MaxChargeCurrent = 10 A
+09:14:03  Modbus WRITE MaxChargeCurrent = 3 A
+10:07:33  [IDLE] 3A | Ziel 98% erreicht (SOC 98.0%)
+```
+
+Dashboard zu diesem Zeitpunkt (10:30): SOC 98.0%, aber `battery_voltage`
+**53.80 V** — deutlich unter der mit v3.0.13.0 geforderten Schwelle von
+55.0V. Die Anlage zeigte "Ziel 98% erreicht" und pausierte mit 3A, obwohl
+die Zellspannung das Vollladungs-Kriterium nie erreicht hatte.
+
+Root Cause: Block 3 (`Vollladung fällig`) in `decide()` beendete sich bereits
+bei `soc >= max_soc - hyst` (typ. 96%, mit `hyst=2`), während der
+Trickle/Hold-Block weiter unten erst bei `soc >= dyn_target` (98%) und seit
+v3.0.13.0 zusätzlich `battery_voltage >= full_charge_min_voltage` einsetzt.
+Im Bereich 96–98% SOC — oder bei SOC 98% ohne bereits ausreichende
+Zellspannung — griff **keiner** der beiden Blöcke. Die Steuerung fiel durch
+in die Optimal-Fenster-/Idle-Logik weiter unten, die den Strom unabhängig
+von der laufenden Vollladung auf einen niedrigen Wert (z.B.
+`min_charge_current`, sichtbar als 3A) reduzierte. Diese Lücke existierte
+bereits vor v3.0.13.0 (`max_soc - hyst` vs. `dyn_target` war schon vorher
+keine identische Schwelle), wurde aber durch das zusätzliche
+Spannungskriterium häufiger sichtbar, da SOC nun öfter kurz bei 98% liegt,
+ohne dass die Spannungsbedingung schon erfüllt ist.
+
+Fixed:
+- `controller.py` (`decide`, Block 3 „Vollladung fällig“): Bedingung von
+  `soc < max_soc - hyst` auf `not (soc >= 98.0 and battery_voltage >=
+  full_charge_min_voltage)` geändert — identisch zur Freigabebedingung des
+  Trickle-Blocks. Block 3 bleibt damit lückenlos bei `max_a` (50A) aktiv,
+  bis exakt die Bedingung erfüllt ist, die den Trickle-Block übernimmt.
+  Die Übergabe 50A → Trickle erfolgt dadurch ohne Zwischenstufe.
+
+Nicht geändert: Trickle-/Hold-Logik (v3.0.13.0) und Auto-Reset-Timer
+bleiben unverändert — betroffen war ausschließlich die Abbruchbedingung
+von Block 3.
+
+---
+
+## v3.0.13.0 — Vollladungs-Kriterium verschärft: SOC + Spannung statt SOC allein (2026-06-28)
+
+Symptom: Im Journal vom 27./28.06. erreichte SOC um 19:51 Uhr 98%, der
+Cellbalancing-Hold startete (geplant 119 min bei `balancing_hold_hours`).
+Um 20:51 griff der Auto-Reset (`SOC >= 98% für 61 Minuten`) und setzte
+`days_since_full_charge` auf 0 — obwohl der Hold bereits um 21:11, nach nur
+80 statt 119 Minuten, abbrach (SOC war zu diesem Zeitpunkt bereits wieder
+auf 97% gefallen). Die als abgeschlossen verbuchte Vollladung war also nie
+stabil erreicht. Folge: in der Nacht zum 28.06. (03:25 Uhr, kein PV) löste
+`_needs_full_charge()` erneut aus, 50A wurden geschrieben, SOC blieb aber
+über Stunden bei 84–87% hängen statt zu steigen — ein zweiter erfolgloser
+Versuch, weil ohne PV-Überschuss kein nennenswerter Ladestrom fließt.
+
+Root Cause: Der Auto-Reset und der Cellbalancing-Hold basierten ausschließlich
+auf `SOC >= 98%`. Bei LiFePO4 ist die Spannungskurve um 98% SOC sehr flach —
+ein kurzer SOC-Peak (z.B. durch Lastschwankung oder Mess-Ungenauigkeit der
+SOC-Schätzung) erreicht leicht 98%, ohne dass die Zellen tatsächlich auf
+Vollladespannung sind. SOC allein ist damit kein verlässliches Kriterium für
+"Batterie ist wirklich voll" — und genau das braucht eine Zellbalancing-Phase.
+
+Fixed:
+- `controller.py` (`run_cycle`, Auto-Reset-Block): Trigger für den 60-Minuten-
+  Reset-Timer (`_soc_98_reached_at`) erfordert jetzt `soc >= 98.0` UND
+  `battery_voltage >= full_charge_min_voltage` (neuer Konfig-Parameter,
+  Default 55.0 V) gleichzeitig. Fällt eine der beiden Bedingungen wieder
+  unter die Schwelle, bricht der Timer sofort ab (kein Hysterese-
+  Gnadenintervall) — ein instabiler Peak darf den Reset nicht auslösen.
+- `controller.py` (`decide`, Cellbalancing-Hold): Während der laufenden
+  Haltezeit (`balancing_hold_hours`) muss `soc >= 98.0` UND
+  `battery_voltage >= full_charge_min_voltage - full_charge_voltage_hysteresis`
+  (neuer Konfig-Parameter, Default 0.1 V) erfüllt bleiben. Unterschreitet
+  SOC oder Spannung die Schwelle, bricht der Hold sofort ab
+  (`_balancing_hold_until = 0`, `_soc_98_reached_at = None`) und
+  `days_since_full_charge` bleibt unverändert — die Vollladung gilt als
+  nicht erfolgreich und wird beim nächsten PV-Überschuss erneut versucht,
+  statt nachts wirkungslos mit 50A gegen fehlenden Überschuss anzulaufen.
+- Neue Konfig-Parameter in `config.yaml` unter `battery:`:
+  - `full_charge_min_voltage` (Default 55.0): Spannungsschwelle für den
+    Trigger, passend zur 16S-LiFePO4-Konfiguration (Vollladung ca. 54,4–56V
+    je nach Zellchemie/Toleranz).
+  - `full_charge_voltage_hysteresis` (Default 0.1): Hysterese-Abstand für
+    das Halten der Trickle-Phase (Trigger-Schwelle minus Hysterese =
+    Abbruch-Schwelle, z.B. 55.0V Trigger → 54.9V Abbruch).
+
+Nicht geändert: `_needs_full_charge()` selbst (reine Tageszähler-Logik) und
+der Vollladungs-Pfad (`dyn_target >= 98.0`, max_a-Laden) bleiben unverändert —
+betroffen ist ausschließlich die Frage, *wann eine begonnene Vollladung als
+abgeschlossen gilt*.
+
+Risiko/Rollback: Bei fehlender oder nicht kalibrierter `battery_voltage`-
+Messung (z.B. Defaultwert 0 oder unplausibler Wert) würde der Auto-Reset nie
+mehr greifen und `days_since_full_charge` ständig hochzählen → tägliche
+Vollladeversuche. Vor dem Deploy battery_voltage-Plausibilität im aktuellen
+state.json/Log prüfen (im vorliegenden Journal werden Werte nicht geloggt,
+aber `actual_v` wird in `decide()` bereits seit v3.0.x aus `state.battery_voltage`
+mit Fallback auf `nom_v * 0.875` gebildet — die Messung existiert also bereits
+und wird hier erstmals für eine Entscheidung statt nur für `_simulate_hour()`
+verwendet).
+
+---
+
 ## v3.0.12.2 — Fix: Unnötige Rampe statt Direktsprung nach Sonnenuntergang (2026-06-20)
 
 Korrektur zu v3.0.12.1: die dortige Notiz ging davon aus, dass `controller.py`

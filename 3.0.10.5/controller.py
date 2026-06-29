@@ -174,9 +174,28 @@ class ChargeController:
         # v3.0.0: Morgen-Notladung Tracking
         self._morning_emergency_done: bool = False
         # v3.0.0: Auto-Reset Vollladung Tracking
+        # v3.0.13: Kriterium verschaerft - Trigger erst bei SOC >= 98% UND
+        # battery_voltage >= full_charge_min_voltage (Default 55V). Reiner
+        # SOC-Wert ist bei LiFePO4 in der flachen Spannungskurve kein
+        # verlaessliches Vollladungs-Signal (siehe CHANGELOG 2026-06-28:
+        # Auto-Reset erfolgte bei SOC 98% trotz nicht erreichter Zellspannung,
+        # Balancing brach vorzeitig ab, Folgenacht-Vollladung blieb wirkungslos).
         self._soc_98_reached_at: Optional[datetime] = None
         # v3.0.1: Cellbalancing-Haltezeit: SOC >= max_soc fuer min. N Stunden halten
         self._balancing_hold_until: float = 0.0
+        # v3.0.13.3: Sperre gegen mehrfaches Hold-Neustarten am selben Tag.
+        # dyn_target bleibt oft den ganzen Tag >= 98.0 (z.B. weil der reguläre
+        # Nachtverbrauchspfad das verlangt, nicht nur das 10-Tage-Zellbalancing-
+        # Intervall), waehrend battery_voltage nachmittags um die 55V-Schwelle
+        # pendelt (PV-/Lastschwankung). Ohne Sperre wuerde jedes erneute kurze
+        # Ueberschreiten von U>=55V einen kompletten neuen 119-Minuten-Hold
+        # auslösen, obwohl bereits ein vollstaendiger Zyklus gelaufen ist und
+        # days_since_full_charge laengst auf 0 zurueckgesetzt wurde (Symptom:
+        # wiederholte TRICKLE-Neustarts am Nachmittag, siehe CHANGELOG 2026-06-28).
+        # Wird bei vollstaendig durchlaufenem Hold (Ende der Haltezeit erreicht,
+        # NICHT bei vorzeitigem Abbruch) gesetzt und beim Mitternachts-Reset
+        # zusammen mit _balancing_reset_date wieder freigegeben.
+        self._balancing_completed_today: bool = False
         # v3.0.9.3: Leistungsglättung (3 Zyklen gleitender Durchschnitt)
         smooth_window = self.cc.get("power_smooth_window_cycles", 3)
         self._power_smoother = PowerSmoother(window_cycles=smooth_window)
@@ -478,10 +497,26 @@ class ChargeController:
 
         # ── 3. Vollladung faellig (Zellbalancing) ─────────────
         # Wird durch dyn_target >= 98.0 abgedeckt (v3.0.0)
-        if dyn_target >= 98.0 and soc < max_soc - hyst:
+        # v3.0.13.1: Luecke geschlossen. Vorher endete dieser Block bereits bei
+        # soc >= max_soc - hyst (typ. 96%), waehrend der Trickle/Hold-Block
+        # unten erst ab soc >= dyn_target (98%) UND (seit v3.0.13.0) zusaetzlich
+        # battery_voltage >= full_charge_min_voltage greift. Im Bereich
+        # 96-98% SOC (oder bei 98% SOC ohne ausreichende Spannung) griff somit
+        # WEDER dieser Block NOCH der Trickle-Block - die Steuerung fiel durch
+        # in Optimal-Fenster/Idle-Logik, die den Strom abrupt auf wenige A
+        # (z.B. min_charge_current) reduzierte, obwohl die Vollladung noch
+        # nicht abgeschlossen war (Symptom: 50A -> 3A Sprung trotz "Vollladung
+        # faellig"). Fix: dieser Block bleibt jetzt aktiv, bis SOC UND Spannung
+        # gemeinsam die Vollladungs-Schwelle erreichen - exakt die Bedingung,
+        # die den Trickle-Block weiter unten freischaltet. Dadurch ist die
+        # Uebergabe 50A -> Trickle nahtlos, ohne Luecke.
+        full_min_v = self.bat.get("full_charge_min_voltage", 55.0)
+        full_charge_complete = soc >= 98.0 and self.state.battery_voltage >= full_min_v
+        if dyn_target >= 98.0 and not full_charge_complete:
             return max_a, "full_charge", (
                 f"Vollladung faellig ({self.state.days_since_full_charge} Tage) "
-                f"-> lade auf {max_soc}% (aktuell {soc:.1f}%)")
+                f"-> lade auf {max_soc}% (aktuell {soc:.1f}%, "
+                f"U={self.state.battery_voltage:.1f}V, Ziel U>={full_min_v:.1f}V)")
 
         # ── 4. Nacht -> kein Laden ────────────────────────────
         if self._is_night():
@@ -501,11 +536,63 @@ class ChargeController:
         # Verhindert systematischen 2%-Unterschuss durch symmetrische Hysterese.
         if soc >= dyn_target:
             # v3.0.1: Cellbalancing-Haltezeit: bei max_soc mindestens N Stunden trickle halten
-            if soc >= max_soc - hyst and time.monotonic() < self._balancing_hold_until:
-                remaining_min = int((self._balancing_hold_until - time.monotonic()) / 60)
-                return trickle_a, "trickle", (
-                    f"Cellbalancing: SOC {soc:.1f}% >= {max_soc}%, "
-                    f"halte {trickle_a} A noch {remaining_min} min")
+            # v3.0.13: Haltezeit bricht sofort ab, wenn SOC oder Spannung unter die
+            # Hysterese-Schwelle fallen. Ein zwischenzeitlicher Abfall bedeutet,
+            # dass die Vollladung NICHT stabil erreicht war -> kein gueltiger
+            # Balancing-Zyklus. _balancing_hold_until wird auf 0 gesetzt, damit
+            # run_cycle() bei erneutem Erreichen von SOC>=98% & Spannung>=Trigger
+            # einen frischen Hold mit voller Dauer startet (siehe run_cycle()).
+            # full_min_v bereits oben (Block 3) berechnet.
+            full_v_hyst = self.bat.get("full_charge_voltage_hysteresis", 0.1)
+            hold_active = time.monotonic() < self._balancing_hold_until
+            if hold_active:
+                # v3.0.13: Waehrend der Haltezeit muss SOC >= 98% bleiben (nicht nur
+                # >= max_soc - hyst) - das war die urspruengliche Trigger-Schwelle und
+                # soll auch fuer das Halten gelten. Spannung mit 0.1V-Hysterese.
+                soc_ok = soc >= 98.0
+                v_ok = self.state.battery_voltage >= (full_min_v - full_v_hyst)
+                if soc_ok and v_ok:
+                    remaining_min = int((self._balancing_hold_until - time.monotonic()) / 60)
+                    # v3.0.13.2 (Pending-Idee aus Notizen): Keine unnoetige
+                    # Stromreduktion beim Eintritt in die Trickle-Phase. Kommt der
+                    # Hold direkt aus Block 3 (Vollladung faellig, max_a/50A), ist
+                    # eine Reduktion auf trickle_a (20A) technisch nicht begruendet -
+                    # SOC/Spannung sind bereits erreicht, der hoehere Strom richtet
+                    # keinen Schaden an und erzwingt nur einen unnoetigen Modbus-Write
+                    # (50A -> 20A) ohne Vorteil fuers Cellbalancing. _ramp_current
+                    # spiegelt den aktuell tatsaechlich aktiven (gerampten) Strom des
+                    # Vorzyklus wider, noch bevor _ramp() fuer DIESEN Zyklus laeuft.
+                    hold_current_a = max(trickle_a, self._ramp_current)
+                    return hold_current_a, "trickle", (
+                        f"Cellbalancing: SOC {soc:.1f}% >= 98%, "
+                        f"U={self.state.battery_voltage:.1f}V >= {full_min_v - full_v_hyst:.1f}V, "
+                        f"halte {hold_current_a:.0f} A noch {remaining_min} min")
+                else:
+                    # Abbruchgrund fuer Log/Diagnose
+                    abort_reason = []
+                    if not soc_ok:
+                        abort_reason.append(f"SOC {soc:.1f}% < 98%")
+                    if not v_ok:
+                        abort_reason.append(
+                            f"U {self.state.battery_voltage:.1f}V < {full_min_v - full_v_hyst:.1f}V")
+                    self.logger.info(
+                        f"Cellbalancing abgebrochen ({', '.join(abort_reason)}) "
+                        f"-> Vollladung bleibt faellig")
+                    self._balancing_hold_until = 0.0
+                    self._soc_98_reached_at = None
+            elif self._balancing_hold_until > 0.0:
+                # v3.0.13.3: hold_active ist False, aber _balancing_hold_until war
+                # gesetzt (>0) -> der Countdown ist NATUERLICH abgelaufen (nicht durch
+                # vorzeitigen Abbruch oben, der _balancing_hold_until bereits auf 0.0
+                # gesetzt haette). Das markiert einen erfolgreich abgeschlossenen
+                # Cellbalancing-Zyklus fuer heute. _balancing_completed_today sperrt
+                # run_cycle() davor, spaeter am selben Tag bei einem kurzen erneuten
+                # Ueberschreiten von battery_voltage>=full_charge_min_voltage (z.B.
+                # PV-Schwankung) einen weiteren vollen 119-Minuten-Hold zu starten
+                # (Symptom vor diesem Fix: wiederholte TRICKLE-Neustarts am
+                # Nachmittag trotz laengst erfolgtem Auto-Reset, CHANGELOG 2026-06-28).
+                self._balancing_completed_today = True
+                self._balancing_hold_until = 0.0
             return 0, "idle", (
                 f"Ziel {dyn_target:.0f}% erreicht (SOC {soc:.1f}%)")
 
@@ -1227,6 +1314,7 @@ class ChargeController:
         if _today_iso != self._balancing_reset_date:
             self._balancing_hold_until = 0.0
             self._soc_98_reached_at    = None
+            self._balancing_completed_today = False  # v3.0.13.3: neue Sperre, neuer Tag
             self._balancing_reset_date = _today_iso
             self._power_smoother.reset()  # Glättungspuffer bei Tageswechsel leeren
             self._energy_base_bat = 0.0  # Wh-Basis zurücksetzen
@@ -1248,10 +1336,20 @@ class ChargeController:
             except ValueError:
                 pass
 
-        # ── Auto-Reset Vollladung (v3.0.0) ────────────────────────────────────
-        # Wenn SOC >= 98% fuer mindestens eine Stunde -> days_since_full_charge zuruecksetzen
-        if self.state.soc >= 98.0:
-            if self._soc_98_reached_at is None:
+        # ── Auto-Reset Vollladung (v3.0.0, verschaerft v3.0.13) ────────────────
+        # Wenn SOC >= 98% UND battery_voltage >= full_charge_min_voltage (Default
+        # 55V) gemeinsam fuer mindestens eine Stunde anliegen -> days_since_full_charge
+        # zuruecksetzen. Reiner SOC-Trigger reicht nicht: bei LiFePO4 ist die
+        # Spannungskurve um 98% SOC sehr flach, ein knapper SOC-Peak ohne erreichte
+        # Zellspannung ist kein abgeschlossener Balancing-Zyklus (CHANGELOG 2026-06-28).
+        # Sofortiger Abbruch (kein Hysterese-Gnadenintervall) bei Unterschreiten
+        # einer der beiden Bedingungen: Ziel ist hier "stabil erreicht", nicht
+        # "einmal erreicht und knapp drunter geblieben".
+        full_min_v = self.bat.get("full_charge_min_voltage", 55.0)
+        soc_at_full = self.state.soc >= 98.0
+        voltage_at_full = self.state.battery_voltage >= full_min_v
+        if soc_at_full and voltage_at_full:
+            if self._soc_98_reached_at is None and not self._balancing_completed_today:
                 self._soc_98_reached_at = datetime.now()
                 # v3.0.1: Cellbalancing-Haltezeit starten.
                 # Nur starten wenn kein laufender Timer existiert (Zukunft).
@@ -1265,15 +1363,34 @@ class ChargeController:
                 elapsed = (datetime.now() - self._soc_98_reached_at).total_seconds()
                 if elapsed >= 3600 and self.state.days_since_full_charge > 0:
                     self.logger.info(
-                        f"Auto-Reset Vollladung: SOC >= 98% fuer {elapsed/60:.0f} Minuten "
+                        f"Auto-Reset Vollladung: SOC >= 98% & U >= {full_min_v:.1f}V "
+                        f"fuer {elapsed/60:.0f} Minuten "
                         f"-> days_since_full_charge auf 0 zurueckgesetzt")
                     self.state.last_full_charge_date = date.today().isoformat()
                     self.state.days_since_full_charge = 0
                     self._save_persistent()
                     self._soc_98_reached_at = None
         else:
+            # v3.0.13: SOC ODER Spannung unter Trigger-Schwelle. Fuer den
+            # 60-Min-Auto-Reset-Timer (_soc_98_reached_at) gilt sofortiger
+            # Abbruch ohne Hysterese - ein Reset auf Basis eines instabilen
+            # Peaks ist nicht erwuenscht.
+            #
+            # WICHTIG: _balancing_hold_until wird hier NICHT pauschal auf 0
+            # gesetzt, sonst wuerde run_cycle() den laufenden Cellbalancing-Hold
+            # noch vor decide() abwuergen, sobald SOC/U nur knapp unter die
+            # 98%/55V-Trigger-Schwelle (statt unter die 0,1V-Hysterese-Schwelle)
+            # fallen - decide() wuerde die Hysterese dann nie zu Gesicht
+            # bekommen. Der eigentliche Hold-Abbruch inkl. Hysterese-Pruefung
+            # geschieht zentral in decide() (siehe dort), das auch
+            # _balancing_hold_until = 0.0 setzt, wenn die Hysterese-Schwelle
+            # tatsaechlich unterschritten wird.
+            if self._soc_98_reached_at is not None:
+                self.logger.info(
+                    f"Vollladung-Timer abgebrochen: SOC {self.state.soc:.1f}% "
+                    f"(>=98% ben.) / U {self.state.battery_voltage:.1f}V "
+                    f"(>={full_min_v:.1f}V ben.) nicht mehr gemeinsam erfuellt")
             self._soc_98_reached_at = None
-            self._balancing_hold_until = 0.0  # v3.0.1: Reset wenn SOC unter max_soc faellt
 
         now = time.monotonic()
         min_dur = self._min_charge_duration_s
