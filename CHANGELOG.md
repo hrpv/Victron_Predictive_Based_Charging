@@ -1,1133 +1,913 @@
-# Changelog — battery_manager.py
+# Changelog — Solar Batterie Manager
 
+Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
+---
 
-## CHANGELOG v3.0.9.28 (2026-06-12)
+## v3.0.13.3 — Fix: Mehrfacher Cellbalancing-Hold am selben Tag (2026-06-28)
+
+Symptom: Nach einem vollständig durchlaufenen Cellbalancing-Hold (10:54–12:53,
+119 Minuten, Auto-Reset bereits um 11:55 erfolgt) startete die Anlage am
+Nachmittag mehrfach einen kompletten neuen 119-Minuten-Hold (14:55, 14:58,
+15:30 — jeweils erneut "halte 20A noch 119 min"), obwohl
+`days_since_full_charge` bereits auf 0 stand und keine Vollladung mehr fällig
+war.
+
+Root Cause: `dyn_target` blieb den ganzen Tag bei 98.0, weil dieser Wert hier
+nicht aus dem 10-Tage-Zellbalancing-Intervall stammte, sondern aus dem
+regulären Nachtverbrauchspfad (`night_cons / capacity`, gecappt auf 98%) —
+ein an diesem Tag durchgehend gültiger Normalzustand, nicht nur ein
+einmaliges Morgen-Ereignis. `battery_voltage` schwankte am Nachmittag durch
+PV-/Lastwechsel knapp um die 55V-Trigger-Schwelle (54.7V–55.2V). Jedes Mal,
+wenn `soc >= 98% UND U >= 55.0V` erneut gleichzeitig zutraf, sah
+`run_cycle()` `_soc_98_reached_at is None` (durch den vorherigen
+Hysterese-Abbruch in `decide()` zurückgesetzt) und startete einen
+**komplett neuen** Hold mit voller Dauer — unabhängig davon, dass an diesem
+Tag bereits ein vollständiger Zyklus gelaufen war.
 
 Fixed:
-- run_cycle(): "(Hysterese)" wurde an alle gecachten Entscheidungen
-  angehaengt, nicht nur an Warte-Entscheidungen (mode="idle").
+- Neue Instanzvariable `_balancing_completed_today` (bool, Reset bei
+  Mitternacht zusammen mit den übrigen Balancing-Trackern).
+- `controller.py` (`decide`, Trickle-Block): Läuft die Haltezeit natürlich ab
+  (`hold_active` wird `False`, weil `_balancing_hold_until` erreicht ist —
+  nicht weil SOC/Spannung vorzeitig unter die Hysterese-Schwelle fielen),
+  wird `_balancing_completed_today = True` gesetzt. Diese Unterscheidung
+  zwischen „natürlich abgelaufen" und „vorzeitig abgebrochen" ist wichtig:
+  ein vorzeitiger Abbruch (Spannung/SOC bricht ein) bedeutet weiterhin
+  „Vollladung bleibt fällig" und darf erneut versucht werden; ein
+  natürliches Ende bedeutet „heute bereits erfolgreich abgeschlossen".
+- `controller.py` (`run_cycle`, Auto-Reset-Block): Ein neuer Hold startet nur
+  noch, wenn `_soc_98_reached_at is None AND not _balancing_completed_today`.
+  Spätere kurze Überschreitungen der 55V-Schwelle am selben Tag lösen damit
+  keinen weiteren vollen Hold mehr aus.
 
-  Alt:
-    elif not reason.endswith("(Hysterese)"):
-        reason = reason + " (Hysterese)"
+Nicht geändert: Auto-Reset-Logik für `days_since_full_charge` selbst, sowie
+der vorzeitige Hysterese-Abbruch (führt weiterhin zu „Vollladung bleibt
+fällig", kann bei echtem SOC-Abfall erneut in Block 3 münden) bleiben
+unverändert.
 
-  Neu:
-    elif mode == "idle" and not reason.endswith("(Hysterese)"):
-        reason = reason + " (Hysterese)"
+---
 
-  Begruendung: Das Suffix "(Hysterese)" signalisiert dem Nutzer dass die
-  Entscheidung aus dem Cache stammt (kein neuer decide()-Aufruf wegen
-  min_decision_interval). Bei mode="charging" oder "full_charge" ist
-  der Zusatz semantisch falsch und suggeriert faelschlicherweise einen
-  SOC-Hysterese-Wartemodus. Beispiel vorher:
-    "Netto-Ueberschuss nicht ausreichend ... fruehes Laden noetig (Hysterese)"
-  Beispiel nachher:
-    "Netto-Ueberschuss nicht ausreichend ... fruehes Laden noetig"
+## v3.0.13.2 — trickle_current: keine Reduktion bei bereits höherem Ladestrom (2026-06-28)
 
-- Versionsstring in GUI-Titel, h1, logger.info und Datei-Header
-  auf 3.0.9.28 aktualisiert.
+Umsetzung einer zuvor dokumentierten, aber noch nicht implementierten Idee
+(siehe Notizen zu „trickle_current logic — avoid unnecessary reduction at
+SOC ≥ 98%"): Bisher reduzierte der Übergang von Block 3 (Vollladung fällig,
+`max_a`/50A) in den Cellbalancing-Hold den Ladestrom unconditional auf
+`trickle_current` (20A) — auch dann, wenn SOC und Spannung die
+Vollladungs-Schwelle bereits erfüllt hatten und der höhere Strom technisch
+unproblematisch weiterlaufen könnte. Das erzeugte einen unnötigen
+Modbus-Write (50A → 20A) ohne Vorteil fürs Cellbalancing.
 
+Fixed:
+- `controller.py` (`decide`, Trickle/Hold-Block): Beim Eintritt in die
+  Haltezeit wird jetzt `max(trickle_current, _ramp_current)` verwendet statt
+  pauschal `trickle_current`. `_ramp_current` spiegelt den tatsächlich
+  aktiven, gerampten Ladestrom des Vorzyklus wider (also z.B. 50A direkt aus
+  Block 3) — der Strom wird nur dann auf `trickle_current` reduziert, wenn er
+  vorher bereits niedriger war. Kommt der Hold aus Block 3, bleibt der Strom
+  unverändert auf dem zuvor aktiven Wert (z.B. 50A), `_ramp()` erkennt
+  `target_a == _ramp_current` und löst keinen weiteren Write aus.
 
-## CHANGELOG v3.0.9.27 (2026-06-12)
+Abgeglichen gegen den aktuellen Codepfad (Stand v3.0.13.1): bestätigt, dass
+`self.state.charge_current_setpoint`/`self._ramp_current` zum Zeitpunkt des
+`decide()`-Aufrufs noch den Wert des *vorherigen* Zyklus enthalten (Update
+erfolgt erst danach in `run_cycle()`), und dass der Spezialfall
+„`mode == 'trickle'` und Hold läuft → `decide()` wird jeden Zyklus neu
+aufgerufen" (verhindert eingefrorenen Countdown) den ersten Übergang
+full_charge→trickle nicht verzögert.
 
-### Fixed:
-- decide(): pv_in_optimal verwendete f.pv_kwh (Brutto-PV) statt
-  Netto-Ueberschuss (PV - Verbrauch). Dadurch wurde die Warteentscheidung
-  "PV im Optimal-Fenster ausreichend" gegenueber dem tatsaechlich in den
-  Akku fliessenden Strom zu optimistisch.
+Nicht geändert: `_needs_full_charge()`, Trigger-/Abbruchbedingung des Holds
+(v3.0.13.0/.1) bleiben unverändert — betroffen ist ausschließlich die Höhe
+des beim Übergang gesetzten Stroms.
 
-  Alt:
-    pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
-    if pv_in_optimal >= needed_kwh and soc >= min_required:
-        return 0, "idle", "... warte"
+---
 
-  Neu:
-    net_in_optimal = sum(max(0.0, f.net_kwh) for f in fc_list
-                         if opt_start <= f.hour <= opt_end)
-    if net_in_optimal >= needed_kwh and soc >= min_required:
-        return 0, "idle", "... warte"
+## v3.0.13.1 — Fix: Lücke zwischen Vollladung und Trickle ließ Strom auf 3A einbrechen (2026-06-28)
 
-  Begruendung: needed_kwh ist die Netto-Energie die der Akku benoetigt
-  (SOC-Delta * Kapazitaet). Der Vergleichswert muss ebenfalls Netto sein.
-  Beispiel: PV 11-15 Uhr = 6.5 kWh, Verbrauch = 3.8 kWh -> netto 2.7 kWh.
-  Ziel-Energie: 5.9 kWh. Vorher: 6.5 >= 5.9 -> warte (falsch).
-  Nachher: 2.7 < 5.9 -> fruehes Laden noetig (korrekt).
+Symptom: Nach Einführung des Spannungskriteriums (v3.0.13.0) wurde beobachtet,
+dass der Ladestrom während einer fälligen Vollladung abrupt von 50A auf 3A
+sprang, statt durchgehend bei 50A zu bleiben bis Trickle einsetzt.
 
-  Gleiches Fix auch im Optimal-Fenster-Block (Zeile ~1838) wo
-  pv_in_optimal >= needed_kwh * 1.5 als Eintrittsbedingung fuer den
-  adaptiven Ladestrom-Block genutzt wird.
+Log-Beleg (Pi-Journal, v3.0.13.0 produktiv, 28.06., `state.json`:
+`days_since_full_charge: 1` zu Tagesbeginn → `dyn_target` korrekt 98.0 wegen
+`full_charge_interval_days: 10` Defizit von Vortagen):
 
-- _simulate_hour(): Morgen-Fenster (h < opt_start, soc >= min_required)
-  wartete immer ohne zu pruefen ob das Optimal-Fenster die benoetigte
-  Netto-Energie tatsaechlich liefert. Inkonsistenz zu decide().
-
-  Alt:
-    if h < opt_start:
-        if soc_sim >= min_required:
-            action, current_a, soc_sim = _apply_deficit(soc_sim)
-            return action, current_a, soc_sim
-
-  Neu:
-    if h < opt_start:
-        net_in_opt = sum(max(0.0, f2.net_kwh) for f2 in
-                         self.forecast.get_forecast()
-                         if opt_start <= f2.hour <= opt_end)
-        needed = max(0.0, (dyn_target - soc_sim) / 100.0 * cap)
-        if net_in_opt >= needed and soc_sim >= min_required:
-            action, current_a, soc_sim = _apply_deficit(soc_sim)
-            return action, current_a, soc_sim
-
-  Begruendung: Die Simulation muss dieselbe Warteentscheidung treffen
-  wie decide(). Ohne den Netto-Check zeigte der Ladeplan PAUSE fuer
-  Stunden mit positivem Ueberschuss (z.B. 09:00 PAUSE bei +0.20 kWh),
-  und der projizierte SOC erreichte das Ziel nie  -  obwohl decide()
-  "warte" sagt. Nach dem Fix stimmen Entscheidung und Ladeplan ueberein.
-
-- Versionsstring in GUI-Titel, h1, logger.info und Datei-Header
-  auf 3.0.9.27 aktualisiert.
-
-
-## [3.0.9.26] – 2026-06-11
-
-### Changed
-
-- **`decide()`: Sollwert im Optimal-Fenster stabilisiert — drei kombinierte Maßnahmen (A + C + Glättung)**
-
-  **Problem:** Im Optimal-Fenster oszillierte `charge_a` fast jede Minute zwischen 18/19/20 A,
-  obwohl physikalisch kein Unterschied bestand. Zwei unabhängige Ursachen:
-
-  1. `surplus_w` (aus Grid-Leistung Reg. 820–822) rauscht selbst bei ruhigem Wetter um ±2000 W
-     → `max_from_surplus` springt im Minutentakt (19 A → 110 A → 47 A → 156 A).
-  2. `required_a = (missing_kwh × 1.15) / hours_left / V` driftet langsam durch `hours_left`-
-     Abnahme (~0.02 A/min). Am Ende des Fensters kann dieser Drift eine Quantisierungsgrenze
-     überqueren und einen unnötigen Stufenwechsel auslösen.
-
-  Beide Ursachen wurden kombiniert behandelt:
-
-  **Alt:**
-  ```python
-  charge_a = min(max_from_surplus, required_a, reduced_a)
-  charge_a = max(optimal_min_a, charge_a)
-  # → z.B. 18, 19, 20, 19, 18, 20 A im Minutentakt → ~6–8 Writes/h
-  ```
-
-  **Neu (Reihenfolge ist semantisch wichtig):**
-  ```python
-  # 1. Glättung: required_a über N Zyklen mitteln (Ursache 2)
-  smoothed_required = self._smooth_required_a(required_a)
-  charge_a = min(max_from_surplus, smoothed_required, reduced_a)
-
-  # 2. reduced_a-Cap + Untergrenze explizit VOR Quantisierung
-  charge_a = max(optimal_min_a, min(reduced_a, charge_a))
-
-  # 3. Quantisierung auf Stromstufen (Ursache 1)
-  step = cc.get("optimal_window_current_step_a", 5)
-  if step > 0:
-      charge_a = round(charge_a / step) * step
-      charge_a = max(optimal_min_a, min(int(reduced_a), int(charge_a)))
-  ```
-
-  Der `reduced_a`-Cap wird **zweifach** angewendet — als `float` vor und als `int` nach
-  der Quantisierung. Das verhindert, dass `round()` einen Wert genau auf der Bandgrenze
-  (z.B. `20.0 → 30A` bei Bands `[…, 20, 30, …]`) über `reduced_a` hinausschiebt.
-
-- **`run_cycle()`: Write-Deadband im Optimal-Fenster erhöht (Option A)**
-
-  Selbst nach Quantisierung kann `_ramp_current` während des Hochlaufens intermediäre Werte
-  zwischen zwei Stufen annehmen (z.B. 17 A auf dem Weg von 15 → 20 A) und dabei eine
-  1-A-Differenz zu `_last_written_ramped_a` erzeugen.
-
-  **Alt:** `if abs(ramped - self._last_written_ramped_a) >= 1.0`
-
-  **Neu:**
-  ```python
-  write_threshold = 1.0
-  if mode == "charging" and "Optimal-Fenster" in reason:
-      write_threshold = cc.get("optimal_window_write_deadband_a", 3.0)
-  if abs(ramped - self._last_written_ramped_a) >= write_threshold:
-  ```
-
-  Für alle anderen Modi (Nacht, Notfall, Vollladung, Nachmittag) bleibt 1 A erhalten.
-
-  **Netto-Effekt A + C + Glättung:** Flash-Schreibrate im Optimal-Fenster sinkt von
-  ~6–8 Writes/Stunde auf < 2 Writes/Stunde. Im Log vom 2026-06-11 (14:42–15:24,
-  42 Minuten) wurden 12 Writes erzeugt; mit diesen Maßnahmen wären ≤ 2 nötig gewesen.
-
-- Versionsstring in GUI-Titel, h1-Überschrift, `logger.info` und Datei-Header
-  auf `3.0.9.26` aktualisiert.
-
-### Added
-  **config.yaml optionen
-```yaml
- charging:
-  optimal_window_current_step_a: 5     # Quantisierung → 10/15/20 A
-  optimal_window_write_deadband_a: 3   # Deadband Ramp-Artefakte
-  required_a_smooth_window: 3          # Glättung ~3 Minuten
+```
+09:01:56  [FULL_CHARGE] 50A | Vollladung faellig (1 Tage) -> ... (aktuell 95.0%) [KEIN WRITE]
+09:12:01  Modbus WRITE MaxChargeCurrent = 30 A
+09:12:01  [IDLE] 30A | Morgen: PV im Optimal-Fenster ... warte
+09:13:02  Modbus WRITE MaxChargeCurrent = 10 A
+09:14:03  Modbus WRITE MaxChargeCurrent = 3 A
+10:07:33  [IDLE] 3A | Ziel 98% erreicht (SOC 98.0%)
 ```
 
-- **`ChargeController._smooth_required_a(required_a)`**: Gleitender Mittelwert über
-  `required_a_smooth_window` Zyklen (Default: 3). Stabilisiert den Zielstrom gegen
-  langsamen `hours_left`-Drift am Ende des Optimal-Fensters.
+Dashboard zu diesem Zeitpunkt (10:30): SOC 98.0%, aber `battery_voltage`
+**53.80 V** — deutlich unter der mit v3.0.13.0 geforderten Schwelle von
+55.0V. Die Anlage zeigte "Ziel 98% erreicht" und pausierte mit 3A, obwohl
+die Zellspannung das Vollladungs-Kriterium nie erreicht hatte.
 
-- **Config-Option `charging.optimal_window_current_step_a`** (optional, Default `5`):
-  Quantisierungsschrittweite im Optimal-Fenster [A].
-  Bei `reduced_charge_current_a: 20` und `optimal_window_min_current_a: 10`
-  ergeben sich die Stufen 10 / 15 / 20 A. `0` deaktiviert die Quantisierung.
+Root Cause: Block 3 (`Vollladung fällig`) in `decide()` beendete sich bereits
+bei `soc >= max_soc - hyst` (typ. 96%, mit `hyst=2`), während der
+Trickle/Hold-Block weiter unten erst bei `soc >= dyn_target` (98%) und seit
+v3.0.13.0 zusätzlich `battery_voltage >= full_charge_min_voltage` einsetzt.
+Im Bereich 96–98% SOC — oder bei SOC 98% ohne bereits ausreichende
+Zellspannung — griff **keiner** der beiden Blöcke. Die Steuerung fiel durch
+in die Optimal-Fenster-/Idle-Logik weiter unten, die den Strom unabhängig
+von der laufenden Vollladung auf einen niedrigen Wert (z.B.
+`min_charge_current`, sichtbar als 3A) reduzierte. Diese Lücke existierte
+bereits vor v3.0.13.0 (`max_soc - hyst` vs. `dyn_target` war schon vorher
+keine identische Schwelle), wurde aber durch das zusätzliche
+Spannungskriterium häufiger sichtbar, da SOC nun öfter kurz bei 98% liegt,
+ohne dass die Spannungsbedingung schon erfüllt ist.
 
-- **Config-Option `charging.optimal_window_write_deadband_a`** (optional, Default `3.0`):
-  Mindest-Änderung des gerampten Sollwerts [A] für einen Modbus-Write im Optimal-Fenster.
-  Außerhalb des Optimal-Fensters gilt weiterhin 1 A.
+Fixed:
+- `controller.py` (`decide`, Block 3 „Vollladung fällig“): Bedingung von
+  `soc < max_soc - hyst` auf `not (soc >= 98.0 and battery_voltage >=
+  full_charge_min_voltage)` geändert — identisch zur Freigabebedingung des
+  Trickle-Blocks. Block 3 bleibt damit lückenlos bei `max_a` (50A) aktiv,
+  bis exakt die Bedingung erfüllt ist, die den Trickle-Block übernimmt.
+  Die Übergabe 50A → Trickle erfolgt dadurch ohne Zwischenstufe.
 
-- **Config-Option `charging.required_a_smooth_window`** (optional, Default `3`):
-  Anzahl Zyklen für die `required_a`-Glättung. 1 = keine Glättung, 3 = empfohlen (~3 min),
-  5 = sehr träge. Muss ≥ 1 sein (wird in `validate_config()` geprüft).
-
----
-
-## [3.0.9.25] – 2026-06-11
-
-### Changed
-
-- **`decide()`: Pfade 6 (PV-Überschuss außerhalb Optimal-Fenster) und 7 (Trickle) durch einfachen Nachmittags-Block ersetzt**
-
-  **Problem:** Die 200 W-Schwelle in Pfad 6 verursachte ständiges Flackern des `MaxChargeCurrent`
-  im 10-Minuten-Takt (z.B. 3 A → 10 A → 3 A → 10 A …), wenn die PV-Leistung durch Bewölkung
-  um die Schwelle schwankte. Pfad 7 (Trickle) sprang bei `raw_surplus_w < 200 W` auf 3 A,
-  Pfad 6 bei `surplus_w > 200 W` zurück auf den berechneten Überschussstrom — ein klassischer
-  Oszillator bei grenzwertiger Einstrahlung.
-
-  **Alt:**
-  ```
-  surplus_w > 200 W  →  charge_a = min(surplus / V, max_a)       [Pfad 6]
-  soc < dyn_target − 10 AND raw_surplus_w < 200 W  →  trickle_a  [Pfad 7]
-  ```
-
-  **Neu:**
-  ```
-  soc < dyn_target  →  charge_a = max_a, mode = "charging"        [Pfad 6]
-  ```
-
-  **Begründung:** Victron ESS im Selbstverbrauchsmodus lädt nie aus dem Netz ohne PV-Überschuss —
-  DVCC und ESS begrenzen den tatsächlichen Ladestrom automatisch auf das, was PV über den
-  Eigenverbrauch hinaus liefert. Der `surplus_w`-Guard in `decide()` war physikalisch redundant
-  und verursachte nur Instabilität. Mit `max_a` auf Reg. 2705 bleibt der Setpoint konstant;
-  der reale Stromfluss folgt dem PV-Angebot.
-
-  `surplus_w`, `raw_surplus_w`, `surplus_source`, `max_from_surplus` bleiben erhalten —
-  sie werden weiterhin im Optimal-Fenster-Block (Pfad 5) verwendet.
-
-- Versionsstring in GUI-Titel, h1-Überschrift, `logger.info` und Datei-Header
-  auf `3.0.9.25` aktualisiert.
+Nicht geändert: Trickle-/Hold-Logik (v3.0.13.0) und Auto-Reset-Timer
+bleiben unverändert — betroffen war ausschließlich die Abbruchbedingung
+von Block 3.
 
 ---
 
-## [3.0.9.24] – 2026-06-10
+## v3.0.13.0 — Vollladungs-Kriterium verschärft: SOC + Spannung statt SOC allein (2026-06-28)
 
-### Changed
+Symptom: Im Journal vom 27./28.06. erreichte SOC um 19:51 Uhr 98%, der
+Cellbalancing-Hold startete (geplant 119 min bei `balancing_hold_hours`).
+Um 20:51 griff der Auto-Reset (`SOC >= 98% für 61 Minuten`) und setzte
+`days_since_full_charge` auf 0 — obwohl der Hold bereits um 21:11, nach nur
+80 statt 119 Minuten, abbrach (SOC war zu diesem Zeitpunkt bereits wieder
+auf 97% gefallen). Die als abgeschlossen verbuchte Vollladung war also nie
+stabil erreicht. Folge: in der Nacht zum 28.06. (03:25 Uhr, kein PV) löste
+`_needs_full_charge()` erneut aus, 50A wurden geschrieben, SOC blieb aber
+über Stunden bei 84–87% hängen statt zu steigen — ein zweiter erfolgloser
+Versuch, weil ohne PV-Überschuss kein nennenswerter Ladestrom fließt.
 
-- **`_simulate_hour()`: `current_a = min_charge_current` statt `0.0` bei `action=idle` und SOC > `floor_soc`**
+Root Cause: Der Auto-Reset und der Cellbalancing-Hold basierten ausschließlich
+auf `SOC >= 98%`. Bei LiFePO4 ist die Spannungskurve um 98% SOC sehr flach —
+ein kurzer SOC-Peak (z.B. durch Lastschwankung oder Mess-Ungenauigkeit der
+SOC-Schätzung) erreicht leicht 98%, ohne dass die Zellen tatsächlich auf
+Vollladespannung sind. SOC allein ist damit kein verlässliches Kriterium für
+"Batterie ist wirklich voll" — und genau das braucht eine Zellbalancing-Phase.
 
-  Bisher lieferte `_simulate_hour()` für idle-Stunden `current_a = 0.0` zurück, obwohl
-  Reg. 2705 physikalisch immer auf mindestens `min_charge_current` (z.B. 3 A) steht
-  (`write_charge_current()` clampt entsprechend). Der Strom fließt also tatsächlich.
+Fixed:
+- `controller.py` (`run_cycle`, Auto-Reset-Block): Trigger für den 60-Minuten-
+  Reset-Timer (`_soc_98_reached_at`) erfordert jetzt `soc >= 98.0` UND
+  `battery_voltage >= full_charge_min_voltage` (neuer Konfig-Parameter,
+  Default 55.0 V) gleichzeitig. Fällt eine der beiden Bedingungen wieder
+  unter die Schwelle, bricht der Timer sofort ab (kein Hysterese-
+  Gnadenintervall) — ein instabiler Peak darf den Reset nicht auslösen.
+- `controller.py` (`decide`, Cellbalancing-Hold): Während der laufenden
+  Haltezeit (`balancing_hold_hours`) muss `soc >= 98.0` UND
+  `battery_voltage >= full_charge_min_voltage - full_charge_voltage_hysteresis`
+  (neuer Konfig-Parameter, Default 0.1 V) erfüllt bleiben. Unterschreitet
+  SOC oder Spannung die Schwelle, bricht der Hold sofort ab
+  (`_balancing_hold_until = 0`, `_soc_98_reached_at = None`) und
+  `days_since_full_charge` bleibt unverändert — die Vollladung gilt als
+  nicht erfolgreich und wird beim nächsten PV-Überschuss erneut versucht,
+  statt nachts wirkungslos mit 50A gegen fehlenden Überschuss anzulaufen.
+- Neue Konfig-Parameter in `config.yaml` unter `battery:`:
+  - `full_charge_min_voltage` (Default 55.0): Spannungsschwelle für den
+    Trigger, passend zur 16S-LiFePO4-Konfiguration (Vollladung ca. 54,4–56V
+    je nach Zellchemie/Toleranz).
+  - `full_charge_voltage_hysteresis` (Default 0.1): Hysterese-Abstand für
+    das Halten der Trickle-Phase (Trigger-Schwelle minus Hysterese =
+    Abbruch-Schwelle, z.B. 55.0V Trigger → 54.9V Abbruch).
 
-  Neue Logik in `_apply_deficit()`:
-  - `soc > floor_soc` → `current_a = min_charge_a`, SOC steigt netto um
-    `(trickle_kwh − deficit_kwh) / cap * 100` pro Stunde (bei 3 A, 48 V, 100 Ah
-    und typischem nächtlichem Verbrauch ca. +0.5–1 %/h).
-  - `soc ≤ floor_soc` → `current_a = 0.0`, SOC eingefroren (Entladesperre
-    Victron ESS State 11/12, Verbraucher aus Netz). Ausnahme unverändert.
+Nicht geändert: `_needs_full_charge()` selbst (reine Tageszähler-Logik) und
+der Vollladungs-Pfad (`dyn_target >= 98.0`, max_a-Laden) bleiben unverändert —
+betroffen ist ausschließlich die Frage, *wann eine begonnene Vollladung als
+abgeschlossen gilt*.
 
-  Folge für Dashboard-Tabelle: idle-Stunden zeigen jetzt `+3 A` statt `0 A` und
-  einen leicht steigenden projizierten SOC anstelle eines konstanten Wertes.
-
-- **`_apply_deficit()` gibt 3-Tupel `(action, current_a, new_soc)` zurück**
-  (vorher `(action, new_soc)`). Alle internen Aufrufe angepasst.
-
-- Versionsstring in GUI-Titel, h1-Überschrift, `logger.info` und Datei-Header
-  auf `3.0.9.24` aktualisiert.
-
----
-
-## [3.0.9.23] – 2026-06-10
-
-### Fixed
-
-- **`build_schedule()`: `planned_current_a` für idle/PAUSE-Stunden mit positivem Überschuss falsch (zu hoch)**
-
-  In v3.0.9.22 wurde bei `action = idle` (Dashboard: PAUSE) der Überschussstrom ungecappt angezeigt, z.B. `+28 A` statt physikalisch korrekter `+3 A`. Ursache: der Action-Guard cappte nur bei `charging/full_charge/trickle` an `current_a`, ließ aber `idle` vollständig durch.
-
-  Physikalische Ursache: `write_charge_current()` clampt Reg. 2705 immer auf mindestens `min_charge_current` (Zeile 584). Im PAUSE/idle-Modus steht Reg. 2705 also auf z.B. 3 A — DVCC begrenzt den Ladestrom entsprechend, unabhängig vom PV-Überschuss.
-
-  **Neue universelle Formel (gilt für alle Stunden):**
-  ```
-  effective_setpoint_a = 0.0  falls current_a == 0.0  (Entladesperre)
-                       = max(current_a, min_charge_current)  sonst
-  planned_current_a = min(surplus_current_a, effective_setpoint_a)  falls surplus >= 0
-                    = surplus_current_a                               falls surplus < 0
-  ```
-
-  Der Sonderfall `current_a == 0.0` (von `_simulate_hour()` bei SOC ≤ `floor_soc`, Victron ESS Entladesperre) wird explizit durchgereicht — `effective_setpoint_a` bleibt 0, kein ungewolltes Anheben auf `min_charge_current`.
-
-  Ergebnisvergleich (Beispiel aus Livetest-Screenshot):
-
-  | Stunde | Surplus | Action | v3.0.9.22 | v3.0.9.23 |
-  |--------|---------|--------|-----------|-----------|
-  | 07:00 | +0.16 kWh | PAUSE | +3.2 A ✗ | +3.0 A ✓ |
-  | 08:00 | +0.68 kWh | PAUSE | +14.1 A ✗ | +3.0 A ✓ |
-  | 09:00 | +1.35 kWh | PAUSE | +28.2 A ✗ | +3.0 A ✓ |
-  | 11:00 | +1.79 kWh | LADEN | +20.0 A ✓ | +20.0 A ✓ |
-  | 20:00 | −0.53 kWh | ENTLADEN | −11.0 A ✓ | −11.0 A ✓ |
-
----
-
-## [3.0.9.22] – 2026-06-09
-
-### Changed
-
-- **Ladeplanung: `charge_current_a` zeigt tatsächlichen Stromfluss statt Reg-2705-Setpoint**
-
-  Bisher zeigte die Spalte „Strom" im Ladeplan den konfigurierten Setpoint (Reg. 2705, z.B. 50 A bei Vollladung). Dieser Wert sagt nichts über den tatsächlichen Energiefluss aus — nachts steht Reg. 2705 auf 50 A, der Akku wird aber mit ca. −8 A entladen.
-
-  Ab v3.0.9.22 wird der physikalisch zu erwartende bzw. tatsächlich geflossene Strom angezeigt:
-
-  | Stunden | Berechnung |
-  |---------|-----------|
-  | Zukunft (Prognose) | `min(net_kwh × 1000 / V_nom, setpoint_a)` bei Ladung; direkt `net_kwh × 1000 / V_nom` bei Entladung |
-  | Vergangenheit (Ist) | Integration von Reg. 842 (`battery_power_w`) über die Stunde → Wh / V_nom = mittlerer Strom [A] |
-
-  Vorzeichen: **+ = Laden, − = Entladung** (konsistent mit Victron Reg. 841/842).
-
-  Beispiel Nacht: `net_kwh = −0.4 kWh`, `V_nom = 48 V` → `−0.4 × 1000 / 48 = −8.3 A`. `min(−8.3, 50) = −8.3 A`.
-
-### Added
-
-- **`EnergyAccumulator.bat_wh`**: Neues Feld, integriert `state.battery_power_w` (Reg. 842) analog zu `pv_kwh`/`load_kwh`. Signed Wh, + = Laden, − = Entladen. `update()` erhält neuen Parameter `bat_w` (Default 0.0, rückwärtskompatibel).
-
-- **`SystemState.bat_energy_today_wh`**: Brückenfeld zwischen `EnergyAccumulator` (main-Scope) und `_update_history()` (ChargeController-Scope).
-
-- **`ChargeController._energy_base_bat`**: Neustart-Persistenz für `bat_wh`, analog zu `_energy_base_pv`/`_energy_base_load`. Wird in `_load_persistent` wiederhergestellt und in `_save_persistent` gespeichert. Verhindert, dass nach einem Neustart mid-day die Stundenbilanz nur den Post-Neustart-Anteil integriert. Tageswechsel-Reset auf 0.0 analog zu den anderen Basen.
-
-- **`HourlyHistory.bat_energy_wh`**: Integrierter Batterieenergiefluss der Stunde [Wh], signed. Interne Felder `_hour_start_bat_wh` und `_raw_bat_wh` analog zu den bestehenden PV/Last-Kumulativen.
-
-### Changed (Details)
-
-- **`_update_history()`**: `charge_current_a` wird nicht mehr aus `charge_current_setpoint` gesetzt, sondern aus dem Wh-Integral berechnet:
-  - Laufende Stunde: `bat_wh_hour / (V_nom × elapsed_h)` — laufend aktualisiert, `elapsed_h` minimum 1/60 h
-  - Stundenabschluss: `bat_wh_hour / (V_nom × 1.0)` — Mittelwert über volle Stunde eingefroren
-  - `bat_wh_total` = `state.bat_energy_today_wh + _energy_base_bat` (mit Neustart-Basis)
-  - Debug-Log ergänzt: `BatStrom=+X.X A`
-
-- **`build_schedule()`**: `planned_current_a` wird nur bei aktiven Lade-Actions (`charging`, `full_charge`, `trickle`) an den Setpoint (`current_a`) gecappt. Bei `idle`/`discharging` kommt der Wert ausschließlich aus der Energiebilanz (`net_kwh × 1000 / V_nom`). Verhindert, dass ein leicht positiver Überschuss bei `action=idle` fälschlich auf 0 A gecappt wird (`current_a = 0` in diesem Zustand).
-
-- **Dashboard-Tabelle**: Spalte „Strom" zeigt Vorzeichen (`+`/`−`), grün für Ladung (`> +0.5 A`), rot für Entladung (`< −0.5 A`), grau für ~0 A. Prognosestunden auf `opacity: 0.6` gedimmt, Istwerte auf `1.0`.
+Risiko/Rollback: Bei fehlender oder nicht kalibrierter `battery_voltage`-
+Messung (z.B. Defaultwert 0 oder unplausibler Wert) würde der Auto-Reset nie
+mehr greifen und `days_since_full_charge` ständig hochzählen → tägliche
+Vollladeversuche. Vor dem Deploy battery_voltage-Plausibilität im aktuellen
+state.json/Log prüfen (im vorliegenden Journal werden Werte nicht geloggt,
+aber `actual_v` wird in `decide()` bereits seit v3.0.x aus `state.battery_voltage`
+mit Fallback auf `nom_v * 0.875` gebildet — die Messung existiert also bereits
+und wird hier erstmals für eine Entscheidung statt nur für `_simulate_hour()`
+verwendet).
 
 ---
 
-## [3.0.9.21] – 2026-06-09
+## v3.0.12.2 — Fix: Unnötige Rampe statt Direktsprung nach Sonnenuntergang (2026-06-20)
 
-### Fixed
+Korrektur zu v3.0.12.1: die dortige Notiz ging davon aus, dass `controller.py`
+(`_ramp`) die Nacht-Ausnahme bereits enthält. Beim Abgleich mit der tatsächlich
+auf dem Pi laufenden Datei (Quelle des analysierten Journals) zeigte sich:
+die Ausnahme fehlte dort komplett — `_ramp()` rampte unabhängig von Tag/Nacht
+immer in `current_ramp_step`-Schritten. Log-Beleg (2026-06-19, nach
+Sonnenuntergang 21:26):
 
-- **Simulation unterschritt ESS MinimumSocLimit (Reg 2901) im Notfall-Pfad und fehlerhafte Kommentare zur ESS-Entladesperre**
+```
+22:07:58  Modbus WRITE MaxChargeCurrent = 40 A   [IDLE] Nacht: kein Laden
+22:08:59  Modbus WRITE MaxChargeCurrent = 30 A
+22:09:59  Modbus WRITE MaxChargeCurrent = 20 A
+22:11:00  Modbus WRITE MaxChargeCurrent = 10 A
+22:12:01  Modbus WRITE MaxChargeCurrent = 3 A
+```
 
-  `_simulate_hour()` verwendete im `emergency_charge_soc`-Block bei negativem PV-Überschuss `max(0.0, ...)` statt `max(floor_soc, ...)`. Da `emergency_charge_soc` (config) identisch mit Reg 2901 (20%) ist, sank der projizierte SOC im Ladeplan fälschlicherweise unter 20% — Dashboard zeigte z.B. 15.5%, 17.0% für frühe Nachtstunden.
+5 Writes über 4 Minuten, obwohl PV zu diesem Zeitpunkt bereits bei 0 liegt
+und der reale Ladestrom ohnehin durch DVCC/ESS auf das begrenzt wird, was
+PV liefert — ein Direktsprung 50A→3A hätte am tatsächlich fließenden Strom
+nichts geändert.
 
-  **Physikalisches Verhalten Victron ESS bei SOC ≤ Reg 2901:**
-  - Die Batterie wird **nicht entladen** — Verbraucher werden aus dem Netz gespeist
-  - Die Batterie wird **nicht aus dem Netz geladen** — der SOC bleibt konstant
-  - State 11 (`SOC < MinSOC`): Entladesperre aktiv
-  - State 12 (Minimal-Ladung aus Netz): erhöht den SOC nicht nennenswert, wird in der Simulation nicht modelliert
-  - → **SOC friert bei `floor_soc` ein**, solange kein PV-Überschuss vorhanden ist
+Fixed:
+- `controller.py` (`_ramp`): Nacht-Ausnahme ergänzt. Vor Sonnenaufgang bzw.
+  nach Sonnenuntergang (`h_now < sunrise or h_now > sunset`, astronomisch
+  über `forecast._calculate_sun_times()`) wird `target_a` direkt gesetzt
+  (`_ramp_current = target_a`) statt schrittweise anzunähern. Reduziert
+  Modbus-Writes beim Übergang in/aus FULL_CHARGE in der Dunkelphase von
+  bis zu 5 auf 1, ohne die Rampen-Dämpfung tagsüber (PV-Schwankungen) zu
+  beeinflussen — die Bedingung greift ausschließlich außerhalb des
+  Sonnenauf-/untergangsfensters.
 
-  Betroffene Stellen in `_simulate_hour()`, alle korrigiert:
+  Simulation mit den geloggten Zeitstempeln und den realen Standort-Koordinaten
+  aus `config.yaml` bestätigt: erster Zyklus nach Sonnenuntergang springt
+  jetzt direkt von 50A auf 3A (Clamp durch `min_charge_current`), alle
+  Folgezyklen schreiben nicht erneut (Hysterese).
 
-  | Pfad | Vorher | Nachher |
-  |------|--------|---------|
-  | Notfall-SOC (kein PV) | `max(0.0, soc - deficit)` | Guard: nur Deficit abziehen wenn `soc > floor_soc`, sonst einfrieren |
-  | `full_charge` (kein PV) | `max(floor_soc, soc - deficit)` immer | Guard analog: nur wenn `soc > floor_soc` |
-  | `_apply_deficit()` | `max(floor_soc, ...)` ohne Guard | Logik korrekt, Kommentar präzisiert |
-  | Morning-Branch (kein PV) | Kommentar falsch | Kommentar korrigiert |
-
-  `floor_soc` wird von `build_schedule()` aus `state.evcc_min_soc` (= Reg 2901, aktuell 20%) abgeleitet und an `_simulate_hour()` übergeben.
-
-  **Hinweis:** `emergency_charge_soc` in `config.yaml` ist rein informativer Fallback für den Fall dass Reg 2901 nicht ausgelesen werden kann. Der maßgebliche Wert ist immer Reg 2901.
-
-- **`setup_logging()` Guard gibt falschen Rückgabetyp (Backlog-Fix)**
-
-  `if logger.handlers: return logger` gab nur den Logger zurück statt des erwarteten Tuples `(logger, dedup_file, dedup_stream)`. Bei erneutem Aufruf (z.B. im Test oder nach Code-Reload) hätte `main()` mit `TypeError: cannot unpack non-iterable Logger object` gecrashed. In Produktion unkritisch (einzelner Aufruf), aber inkonsistente API.
-
-  ```python
-  # Vorher:
-  if logger.handlers:
-      return logger
-
-  # Nachher:
-  if logger.handlers:
-      return logger, None, None
-  ```
-
-- **HTML-Versionsstring nicht aktualisiert**
-
-  `<title>` im Dashboard-HTML zeigte noch `v3.0.9.20` statt `v3.0.9.21`.
+- `version.py`: VERSION auf 3.0.12.2 aktualisiert.
 
 ---
 
-## [3.0.9.20] – 2026-06-08
+## v3.0.12.1 — Klarstellung: Rampe an Sonnenauf-/untergang (2026-06-20)
 
-### Fixed
+Notiz (keine Code-Änderung):
+- Frage geprüft: ob beim Übergang in/aus der Dunkelphase ein zusätzlicher
+  Zeitpuffer vor Sonnenaufgang bzw. nach Sonnenuntergang sinnvoll wäre, um
+  unnötige Modbus-Writes beim Herunter-/Hochrampen (z.B. 50A→3A) zu vermeiden.
+  Begründung des Vorschlags: die PV-Leistung ist in diesen Randstunden so
+  gering, dass ohnehin nur wenige A Ladestrom fließen können — selbst bei
+  einem direkten Sprung 3A→50A oder 50A→3A ändert sich am tatsächlich
+  fließenden Strom nichts, da DVCC/ESS den Strom automatisch auf das
+  begrenzen, was PV liefert.
+- Ergebnis: kein zusätzlicher Puffer nötig. `controller.py` (`_ramp`)
+  enthält bereits genau dieses Verhalten (seit der Modularisierung,
+  v3.0.10.x): `is_night = h_now < sunrise or h_now > sunset` springt bei
+  Nacht direkt auf den Zielwert, ganz ohne Zwischenschritte — kein
+  zusätzlicher Zeitpuffer vor/nach der reinen Sonnenauf-/untergangsgrenze.
+  Sichtbare Rampen-Sequenzen außerhalb der Nachtphase (z.B. gegen 16 Uhr,
+  deutlich vor Sonnenuntergang) sind reguläre Tageslicht-Übergänge
+  (FULL_CHARGE → Trickle), keine Dämmerungsfälle, und dort ist das Rampen
+  weiterhin korrekt und gewollt (PV schwankt zu dieser Zeit noch spürbar).
+- `version.py`: VERSION auf 3.0.12.1 aktualisiert.
 
-- **Trickle-Pfad ignorierte vorhandenen PV-Überschuss (Bug #2)**
+---
 
-  `decide()` Pfad 7 (Trickle) prüfte nur `soc < dyn_target - 10`, aber nicht ob tatsächlich Überschuss vorhanden war. Wenn `grid_w` kurzzeitig nahe 0 lag (z.B. unmittelbar nach evcc-Stop oder durch Messrauschen) ergab `surplus_w` fälschlicherweise 0 — obwohl PV − Last z.B. 1200 W Überschuss lieferte. Der Trickle-Pfad griff dann mit 3 A, obwohl Laden mit vollem Überschuss-Strom korrekt gewesen wäre.
+## v3.0.12 — Neues Feature: Winterpause (2026-06-18)
 
-  → Fix: Neue Variable `raw_surplus_w = max(0, pv_w - load_w)` als Guard:
-  ```python
-  # Vorher:
-  if soc < dyn_target - 10:
-      return gentle_a, "trickle", ...
+Added:
+- `controller.py` (`_in_winter_pause`): Prüft, ob das heutige Datum im
+  konfigurierten Winterpause-Zeitraum liegt. `winter_pause_start`/`winter_pause_end`
+  sind MM-DD-Strings (jahresunabhängig), ein Zeitraum über den Jahreswechsel
+  hinweg (z.B. `11-01` → `02-28`) wird korrekt überbrückt.
+- `controller.py` (`decide`): Neuer Prioritäts-Block **0** — höchste Priorität,
+  läuft explizit vor ESS State 11/12 und allen anderen Entscheidungspfaden.
+  Solange die Winterpause aktiv ist, übernimmt `decide()` keine Regelung mehr:
+  beim Eintritt in den Zeitraum wird einmalig `max_charge_current` per Modbus
+  geschrieben (`victron.set_max_charge_current`), danach liefert `decide()`
+  durchgehend `(-1, "winter_pause", ...)` zurück — `run_cycle()` überspringt
+  damit den Write-Block komplett (analog zur evcc-Schnelllade-Priorität).
+  Verlässt das Datum den Zeitraum, wird das interne Write-Flag
+  (`_winter_pause_write_done`) zurückgesetzt, damit im nächsten Winter wieder
+  einmalig geschrieben wird.
+- `config.yaml`: neue Keys `winter_pause_enabled` (Default `false`),
+  `winter_pause_start` (Default `"11-01"`), `winter_pause_end`
+  (Default `"02-28"`).
 
-  # Nachher:
-  if soc < dyn_target - 10 and raw_surplus_w < 200:
-      return gentle_a, "trickle", ...
+  Sandbox-Testlauf (Konsole + eigenständiges Test-Dashboard auf Port 5001,
+  parallel zum echten Service auf Port 5000) bestätigt: genau 1 Modbus-Write
+  beim Eintritt, 0 weitere Writes über mehrere Zyklen, `state.charge_mode`/
+  `state.charge_reason` zeigen `winter_pause` korrekt im Dashboard an.
+
+Fixed:
+- `controller.py` (`decide`): `NameError: name 'needs_full' is not defined`
+  beim Eintritt ins Optimal-Fenster (Block 6). Die in v3.0.11.4 eingefuehrte
+  Bedingung `if not needs_full:` referenzierte eine lokale Variable, die in
+  `decide()` nie zugewiesen wird — `needs_full` existiert nur als lokale
+  Variable innerhalb von `build_schedule()` (dort via
+  `needs_full = self._needs_full_charge()`). Der Crash betraf ausschliesslich
+  Zyklen innerhalb des Optimal-Fensters (rund um Sonnenhoechststand) und
+  fuehrte zu einer Restart-Schleife des systemd-Service (`status=1/FAILURE`,
+  `Scheduled restart job`), sobald `decide()` diesen Codepfad erreichte.
+
+  Fix: `if not needs_full:` → `if not self._needs_full_charge():`, also
+  Aufruf der bereits vorhandenen Helper-Methode statt Referenz auf eine
+  nicht existierende lokale Variable.
+
+  Bestaetigt im Live-Betrieb (2026-06-19, H11): Optimal-Fenster-Plan laeuft
+  fehlerfrei durch, Modbus-Write erfolgreich (13 A), Dashboard zeigt
+  `Optimal-Fenster H11: 13A (Plan 702Wh, Übertrag +0Wh, SOC 47.0%→71%)`.
+
+- `version.py`: VERSION auf 3.0.12 aktualisiert.
+
+---
+
+## v3.0.11.5 — Bugfix: Phantomstrom ~148 A bei H00 (Mitternachts-Reset-Reihenfolge) (2026-06-17)
+
+Fixed:
+- `controller.py` (`run_cycle`): Mitternachts-Reset wurde **nach** `_update_history()`
+  ausgefuehrt. `_update_history()` legt um 00:00 den ersten H00-Eintrag an und
+  speichert dabei `_hour_start_bat_wh = bat_wh_total` — zu diesem Zeitpunkt noch
+  mit der alten kumulierten Tagesbasis (z.B. -7844 Wh bei SOC 80%). Erst danach
+  setzte der Reset `_energy_base_bat = 0.0` und der `EnergyAccumulator` startete
+  neu ab 0. Alle Folge-Updates in H00 berechneten dann:
+
   ```
-  Trickle greift jetzt nur noch wenn wirklich kein PV-Überschuss vorhanden ist (z.B. abends bei PV 300 W, Last 800 W).
+  bat_wh_hour = bat_wh_total_neu - _hour_start_bat_wh_alt
+              = -4 Wh - (-7844 Wh) = +7840 Wh -> +148 A
+  ```
 
-- **Surplus-Fallback zog Batterie-Ladestrom fälschlicherweise doppelt ab (Bug #1)**
+  Fix: Mitternachts-Reset vor `_update_history()` verschieben. Beim Anlegen des
+  H00-Eintrags ist `bat_wh_total = 0 + 0 = 0` korrekt, alle Folge-Updates
+  rechnen ab dem richtigen Ursprung.
 
-  Im PV-Fallback-Pfad (wenn `abs(grid_w) ≤ 50`) wurde `surplus_from_pv = pv_w - load_w - battery_charge_w` berechnet. Da `load_w` AC-seitig gemessen wird und den Batterie-Ladestrom **nicht** enthält, war der Abzug von `battery_charge_w` eine Doppelkorrektur. Bei laufendem Laden (z.B. 21 A × 53 V ≈ 1100 W) wurde der verfügbare Überschuss um ~1100 W zu niedrig angesetzt → fälschlich kein Überschuss erkannt → Trickle statt Laden.
+  Beobachtetes Symptom (Screenshot v3.0.11.4, 04:09):
+  ```
+  00:00  PAUSE  -148.0 A  80.0%   <- war +7840 Wh / 53V = 147.9 A
+  01:00  PAUSE    -5.3 A  78.0%   <- korrekt
+  ```
 
-  → Fix: `surplus_from_pv` und `battery_charge_w` entfernt. Der Fallback verwendet jetzt direkt `raw_surplus_w`:
-  ```python
-  # Vorher:
-  battery_charge_w = max(0.0, self.state.battery_power_w)
-  surplus_from_pv  = max(0.0, pv_w - load_w - battery_charge_w)
+- `version.py`: VERSION auf 3.0.11.5 aktualisiert.
+
+---
+
+## v3.0.11.4 — Bugfix: Unnötige Stromrampe beim Übergang FULL_CHARGE→TRICKLE (2026-06-16)
+
+Fixed:
+- `controller.py` (`run_cycle`): Beim Übergang von VOLLLADUNG (50A) zu TRICKLE
+  (20A) wurde das Optimal-Fenster fälschlicherweise noch aktiv, obwohl
+  `needs_full=True` und `soc >= max_soc - hyst` (≥97%). Das führte zur
+  Modbus-Sequenz 50A→40A→30A→20A→10A (Optimal-Fenster-Plan) gefolgt von
+  sofortigem 10A→20A (Trickle-Rampe hoch).
+
+  Fix: Am Eingang des Optimal-Fenster-Blocks prüfen ob `needs_full`.
+  Bei aktiver Vollladung überspringt der Block komplett (`if not needs_full:`),
+  sodass `decide()` den Volllade-Strom (max_a) und den Trickle-Pfad direkt
+  steuert. Die ursprüngliche Bedingung `soc >= max_soc - hyst` war zu eng
+  — das Optimal-Fenster hätte schon bei z.B. 90% SOC störend auf 15A
+  reduziert, bevor dann Trickle wieder auf 20A hochrampt.
+
+- `controller.py` (`_simulate_hour`): Simulation modellierte den Trickle-/
+  Balancing-Haltezeit-Pfad nicht. Bei `needs_full and soc_sim >= max_soc - hyst`
+  wurde `_apply_deficit()` aufgerufen (3A `min_charge_current`), statt
+  `trickle_current` (20A). Fix: Neuer Pfad vor dem bestehenden `needs_full`-Block:
+  wenn `soc_sim >= max_soc - hyst` → `trickle_current` für diese Stunde simulieren,
+  SOC geclampt auf `[floor_soc, max_soc]`. Vereinfachung gegenüber realem
+  `_balancing_hold_until` (Laufzeit-State), aber korrekt für Anzeigezwecke.
+
+- `version.py`: VERSION auf 3.0.11.4 aktualisiert.
+
+---
+
+## v3.0.11.3 — Bugfix: Doppel-Heartbeat im Journal (2026-06-16)
+
+Fixed:
+- `logging_setup.py` (`DeduplicatingFilter.emit_heartbeat_if_due`): Bei
+  nicht-HTTP-Nachrichten (z.B. `[FULL_CHARGE] ... [KEIN WRITE]`) wurden
+  Heartbeats doppelt geschrieben — einmal durch `filter()` (appended
+  `(Heartbeat)` an `record.msg`) und gleichzeitig durch den
+  Hintergrund-Thread via `emit_heartbeat_if_due()` (schreibt
+  `- (Heartbeat: kein Browser-Request seit 20min)`). Ursache: Race
+  Condition — beide Pfade pruefen `_last_ts` fast gleichzeitig und
+  sehen es als faellig.
+
+  Fix: `emit_heartbeat_if_due()` feuert nur noch fuer `HTTP_ACCESS`-
+  Nachrichten. Fuer alle anderen Nachrichten ist `filter()` allein
+  zustaendig. Das `else`-Branch (`text = last_msg + " (Heartbeat)"`)
+  in `emit_heartbeat_if_due()` ist damit entfallen.
+
+  Beobachtetes Symptom im Journal (vor Fix):
+  ```
+  [FULL_CHARGE] 50A | ... [KEIN WRITE] (Heartbeat)
+  - (Heartbeat: kein Browser-Request seit 20min)
+  ```
+
+- `version.py`: VERSION auf 3.0.11.3 aktualisiert.
+
+---
+
+## v3.0.11.2 — Bugfix: Simulations-SOC ueber 100% (2026-06-16)
+
+Fixed:
+- `controller.py` (`_simulate_hour`): Der projizierte SOC im Ladeplan konnte
+  im PAUSE-Zustand (nach Erreichen von `dyn_target`) ueber 100% bzw. ueber
+  `max_soc` (98%) ansteigen. Ursache: `_apply_deficit()` kappte `new_soc`
+  zwar nach unten auf `floor_soc`, aber nicht nach oben. Bei positivem
+  PV-Ueberschuss (`deficit = 0`) addierte der Trickle-Strom (`min_charge_a`)
+  den SOC jede Stunde leicht — unkontrolliert bis >105%.
+
+  Fix an zwei Stellen:
+  1. `_apply_deficit()`: `new_soc = min(max_soc, new_soc)` nach dem
+     `floor_soc`-Clamp.
+  2. `soc_sim >= dyn_target`-Block: `soc_sim = min(soc_sim, max_soc)` nach
+     dem `floor_soc`-Clamp, vor dem `return`.
+
+- `version.py`: VERSION auf 3.0.11.2 aktualisiert.
+
+---
+
+## v3.0.11.1 — Bugfix: Phantomstrom bei Stundenbeginn (2026-06-15)
+
+Fixed:
+- `controller.py` (`_update_history`): In den ersten Minuten einer neuen
+  Stunde wurde `charge_current_a` durch ein winziges `elapsed_h` dividiert,
+  was Phantomwerte erzeugte (z.B. **-69.3 A** bei 00:00 statt der erwarteten
+  ~6 A). Ursache: `elapsed_h = minute/60 + second/3600` ist bei xx:00:30
+  ca. 0.0083 h; der frühere Schutz `max(elapsed_h, 1/60)` klemmte nur auf
+  1 Minute, was den Fehler noch um Faktor 5 magnifizierte.
+
+  Fix: Unter 5 Minuten (`elapsed_h < 5/60`) wird `charge_current_a = 0.0`
+  gesetzt. In diesem Zeitraum ist die Anzeige ohnehin nicht aussagekräftig;
+  ab Minute 5 greift die normale Berechnung. Die abgeschlossene Stunde
+  (Stundenabschluss-Pfad, `elapsed_h = 1.0`) ist nicht betroffen.
+
+- `version.py`: VERSION auf 3.0.11.1 aktualisiert.
+
+---
+
+## v3.0.11 — Optimal-Fenster: Prognose-basierte Stundensteuerung (2026-06-14)
+
+Changed:
+- `controller.py`: Optimal-Fenster-Logik grundlegend neu geschrieben.
+
+  **Alt (v3.0.10.x):** Ladestrom wurde jeden Zyklus aus dem Momentan-Überschuss
+  (Grid-Messung) berechnet, mit Quantisierung (5A-Stufen), `_smooth_required_a`-
+  Filter (3-Zyklen-Mittelwert) und `write_deadband` (3A) gegen Modbus-Flood.
+  Ursache aller Komplexität: Grid-Messung rauscht ±2000W → Strom schwankte
+  ständig, musste künstlich stabilisiert werden.
+
+  **Neu (v3.0.11):** Strom wird aus der **Prognose** und dem **Bedarf bis
+  Ziel-SOC** gesetzt — kein Momentanwert, kein Filter, kein Deadband.
+
+  Steuerprinzip:
+  - **Stundenbeginn** (Fenstereintritt oder volle Stunde xx:00):
+    ```
+    missing_wh  = (dyn_target - soc) / 100 * capacity_wh
+    needed_wh   = missing_wh / hours_left          # gleichmäßig verteilen
+    planned_wh  = min(forecast_surplus_wh,         # nie mehr als PV liefert
+                      needed_wh + deficit_share_wh)
+    charge_a    = planned_wh / battery_voltage     # clamp: min_a..max_a
+    ```
+    `dyn_target` ist echte Steuergröße: wenig Reststunden → höherer Strom,
+    Ziel fast erreicht → niedrigerer Strom. Kein fester `reduced_charge_current_a`
+    mehr nötig.
+  - **Innerhalb der Stunde:** Strom bleibt konstant, Rampe läuft schrittweise
+    zum neuen Zielwert. Kein Modbus-Write wenn Rampe abgeschlossen.
+  - **SOC-Guard** (`soc > dyn_target`): sofort auf `min_charge_current`,
+    Plan wird zurückgesetzt.
+  - **Stundenwechsel – Defizit-Ausgleich:**
+    Tatsächlich geladene Energie (`bat_wh_total`, signed — Entladung zählt mit)
+    wird mit dem Plan verglichen. Defizit kumuliert, beim nächsten Stundenbeginn
+    auf Reststunden verteilt und zum Bedarf addiert:
+    ```
+    deficit_wh    = planned_wh - actual_wh        # signed
+    carried_wh   += deficit_wh
+    deficit_share = carried_wh / hours_left       # nächste Stunde
+    ```
+  - **Rampe:** Stromänderungen weiterhin schrittweise (+/- `current_ramp_step`
+    A/Zyklus). Hysterese 1A verhindert Modbus-Write wenn Rampe abgeschlossen.
+  - **Midnight-Reset:** `_opt_plan_hour`, `_opt_carried_wh` etc. bei
+    Tageswechsel geleert.
+
+  Entfernte Config-Keys (können in `config.yaml` stehen bleiben, werden
+  stillschweigend ignoriert):
+  - `optimal_window_write_deadband_a`
+  - `optimal_window_current_step_a`
+  - `required_a_smooth_window`
+  - `optimal_window_min_current_a`
+
+  Log-Beispiel (Normalbetrieb, SOC 46%→79%, 5h Fenster):
+  ```
+  Optimal-Fenster H11 neuer Plan: Prognose=5336Wh, Bedarf=924Wh/h (4620Wh/5h), Defizitanteil=+0Wh, Plan=924Wh -> 19.2A
+  [CHARGING] 19A | Optimal-Fenster H11: 19A (Plan 924Wh, Übertrag +0Wh, SOC 46.0%→79%)
+  Optimal-Fenster H11 abgeschlossen: Plan=924Wh, Ist=900Wh, Defizit=+24Wh, Übertrag=+24Wh
+  Optimal-Fenster H12 neuer Plan: Prognose=5571Wh, Bedarf=924Wh/h (3696Wh/4h), Defizitanteil=+6Wh, Plan=930Wh -> 19.4A
+  ```
+
+Fixed (während Live-Test 2026-06-14 entdeckt):
+- **Rampe im Optimal-Fenster fehlte** (v3.0.11-Erbschaft aus v3.0.10.7):
+  `run_cycle()` setzte `ramped = target_a` direkt statt `_ramp(target_a)`.
+  Strom sprang sofort statt schrittweise. Fix: einheitliche Rampe für alle
+  Modi, `is_optimal`-Sonderbehandlung im Write-Block entfernt.
+- **Ladestrom klebte bei max_a** (50A): Ursprüngliche Formel ignorierte
+  `dyn_target` — `planned_wh = forecast_surplus_wh` ergab bei 5-6 kWh
+  Prognose immer >2400Wh → immer 50A. Fix: `planned_wh` auf `needed_wh`
+  (Bedarf bis Ziel-SOC pro Reststunde) gedeckelt, Prognose als Obergrenze.
+
+- **Ladeplan zeigt echten Sollwert für laufende Stunde**: `build_schedule()`
+  verwendete für die aktuelle Stunde den simulierten Strom aus
+  `_simulate_hour()`, der keine Defizit-Korrekturen aus Vorjahr-Stunden kennt.
+  Fix: wenn `_opt_plan_hour == now_h`, wird `_opt_setpoint_a` direkt eingesetzt.
+  Nach Stundenabschluss greift wie bisher der History-Wert (`bat_energy_wh`-
+  integrierter Ist-Strom). Kein Dashboard-Update nötig.
+
+- `dashboard.py`: Stromwerte im Ladeplan ohne Vorzeichen für laufende und
+  zukünftige Stunden (Sollwerte/Prognose). Vergangene Stunden zeigen weiterhin
+  vorzeichenbehafteten Ist-Strom (`+9.3 A` laden / `-16.7 A` entladen).
+  Nur `dashboard.py` betroffen, kein `controller.py`-Update.
+
+- `version.py`: VERSION auf 3.0.11 aktualisiert.
+
+---
+
+## v3.0.10.7 — Write-Hysterese Regression-Fix (2026-06-14)
+
+Fixed:
+- `controller.py` (v3.0.10.6 Regression): Die reine Hysterese auf
+  `target_a` brach bei **Idle/Nacht** und **Morgen-Notladung/Nachmittag**.
+
+  Ursache: `target_a = 0` bei Idle wurde einmalig mit dem gerampeten
+  Zwischenwert (z.B. 40A) geschrieben, weil `abs(0 - 50) >= 1` zutraf.
+  Danach wurde `_last_quantized_target_a = 0` gesetzt. Alle folgenden
+  Zyklen sahen `abs(0 - 0) = 0 < 1` → **kein Write**. `_ramp_current`
+  lief weiter herunter (35, 30, 25...A), aber nie wieder an den Modbus.
+  Ergebnis: Setpoint blieb auf 40A statt 0A (oder min_charge_current).
+
+  Beobachtet im Log (2026-06-13 22:03 ff.):
+  ```
+  [IDLE] 40A | Nacht: kein Laden (SOC 61.0%)
+  [IDLE] 40A | Nacht: kein Laden (SOC 61.0%) (Hysterese) [KEIN WRITE]
   ...
-  else:
-      surplus_w      = surplus_from_pv
-      surplus_source = "PV-Load-Batt"
-
-  # Nachher:
-  raw_surplus_w = max(0.0, pv_w - load_w)
-  ...
-  else:
-      surplus_w      = raw_surplus_w
-      surplus_source = "PV-Load"
+  [IDLE] 40A | Nacht: kein Laden (SOC 52.0%) (Hysterese) [KEIN WRITE]
   ```
 
-- **Hysterese fror falsche Entscheidung bis zu 10 Minuten ein (Bug #3)**
+  Fix: Kombinierte Hysterese:
+  - **Optimal-Fenster** (`mode="charging"` + `"Optimal-Fenster" in reason`):
+    Hysterese auf `target_a` (wie v3.0.10.6), aber mit **sofortigem Rampen**
+    (`ramped = target_a`, `_ramp_current = target_a`). Verhindert, dass
+    ein gerampeter Zwischenwert geschrieben und eingefroren wird.
+  - **Alle anderen Modi** (Idle, Nachmittag, Morgen-Notladung, Trickle,
+    Full-Charge): Hysterese auf **gerampetem Wert** (wie vor v3.0.10.6).
+    Schrittweises Herunter-/Hochrampen funktioniert korrekt.
 
-  `force_new` in `run_cycle()` wurde nur bei SOC-Notfällen gesetzt. Massiver Export ins Netz (z.B. −1500 W nach evcc-Stop) und evcc-Statuswechsel lösten kein `force_new` aus — die veraltete Trickle- oder Idle-Entscheidung blieb bis zu `min_charge_duration_s` (~10 Minuten) aktiv, während der Wechselrichter Überschuss ins Netz einspeiste statt die Batterie zu laden.
-
-  → Fix: Zwei neue `force_new`-Trigger:
+  Alt (v3.0.10.6, defekt):
   ```python
-  # Massiver Export → sofort neu entscheiden
-  if self.state.grid_power_w < -1000:
-      force_new = True
-
-  # evcc-Statuswechsel (Start/Stop) → sofort neu entscheiden
-  evcc_now = self.state.evcc_active
-  if evcc_now != getattr(self, "_last_evcc_active", evcc_now):
-      force_new = True
-  self._last_evcc_active = evcc_now
+  if target_a >= 0:
+      ramped = self._ramp(target_a)
+      if abs(target_a - self._last_quantized_target_a) >= write_threshold:
+          ...
   ```
-  `_last_evcc_active` wird mit dem aktuellen Wert initialisiert, um beim ersten Zyklus kein false positive auszulösen.
+  Neu (v3.0.10.7):
+  ```python
+  is_optimal = mode == "charging" and "Optimal-Fenster" in reason
+  if is_optimal:
+      ramped = target_a          # sofortiges Rampen
+      self._ramp_current = target_a
+  else:
+      ramped = self._ramp(target_a)  # schrittweises Rampen
 
-### Changed
-
-- **Debug-Log `Surplus`-Zeile: `BattCharge=` → `raw=`**
-
-  Der Debug-Log in `decide()` referenzierte die entfernte Variable `battery_charge_w`. Ersetzt durch `raw_surplus_w`:
+  if is_optimal:
+      should_write = abs(target_a - self._last_quantized_target_a) >= threshold
+  else:
+      should_write = abs(ramped - self._last_written_ramped_a) >= threshold
   ```
-  # Vorher:
-  Surplus: Grid=0W, PV=2619W, Load=2526W, BattCharge=174W → surplus=0W (Quelle: PV-Load-Batt)
 
-  # Nachher:
-  Surplus: Grid=0W, PV=2619W, Load=2526W, raw=93W → surplus=0W (Quelle: PV-Load)
-  ```
+Changed:
+- `version.py`: VERSION auf 3.0.10.7 aktualisiert.
 
 ---
 
-## [3.0.9.19] – 2026-06-07
+## v3.0.10.6 — Optimal-Fenster Write-Stabilisierung (2026-06-13)
 
-### Fixed
-- **Heartbeat-Thread erhielt NameError weil dedup_stream nicht in start_dashboard() sichtbar war**
+Fixed:
+- `controller.py` (Fix 1 — Kimi): `run_cycle()`: Schreib-Hysterese prüfte den
+  **gerampten** Wert (`ramped`) statt des **quantisierten Sollwerts** (`target_a`).
 
-  `dedup_stream` wurde in `main()` als lokale Variable erzeugt, war aber in `start_dashboard()` nicht sichtbar. Der Versuch, den Heartbeat-Thread in `start_dashboard()` zu starten, scheiterte mit `NameError: name 'dedup_stream' is not defined`.
+  `_ramp()` steigert den Strom in Schritten pro Zyklus. Wenn `decide()` zwischen
+  10A und 15A oszillierte, durchlief `_ramp_current` bei jedem Wechsel die
+  Zwischenstufen. Die Hysterese `abs(ramped - last_written) >= 3` löste bei
+  **jedem Ramp-Schritt** einen Write aus — statt nur wenn sich die quantisierte
+  Stufe ändert.
 
-  → Fix: `setup_logging()` gibt jetzt ein Tuple `(logger, dedup_file, dedup_stream)` zurück. `dedup_stream` wird als Parameter an `start_dashboard()` übergeben. `dedup_file` wird ebenfalls zurückgegeben für zukünftige Erweiterungen (sauberere API).
+  Neu: Variable `_last_quantized_target_a` trackt den quantisierten Sollwert.
+  Hysterese prüft jetzt `abs(target_a - self._last_quantized_target_a)`.
+  Der gerampte Wert wird weiterhin an `set_max_charge_current()` übergeben
+  (sanftes Rampen bleibt erhalten).
 
+  Alt:
   ```python
-  # Vorher:
-  logger = setup_logging(cfg)
-  # ...
-  start_dashboard(cfg, state, logger)
-
-  # Nachher:
-  logger, dedup_file, dedup_stream = setup_logging(cfg)
-  # ...
-  start_dashboard(cfg, state, logger, dedup_stream)
+  if abs(ramped - self._last_written_ramped_a) >= write_threshold:
+      if self.victron.set_max_charge_current(ramped):
+          self._last_written_ramped_a = self.state.charge_current_setpoint
   ```
-
-- **Heartbeat-Timer wurde bei Bucket-Wechsel zurückgesetzt — Heartbeat-Zeitpunkt verschob sich**
-
-  In v3.0.9.15 wurde bei einer neuen Nachricht (`msg != _last_msg`) der Timer `_last_ts = now` zurückgesetzt. Wenn zwischen zwei identischen [IDLE]-Einträgen z.B. ein einzelner Modbus-Fehler geloggt wurde, startete der 20-Minuten-Heartbeat-Timer von vorne. Ergebnis: Der [IDLE]-Heartbeat erschien deutlich später als erwartet (oder gar nicht, wenn ständig andere Nachrichten dazwischenkamen).
-
-  → Fix: Bei Bucket-Wechsel wird `_last_ts` **nicht** mehr zurückgesetzt. Der 20-Minuten-Takt läuft absolut weiter, unabhängig davon ob zwischendurch andere Nachrichten erscheinen.
-
+  Neu:
   ```python
-  # Vorher:
-  else:
-      self._last_msg = msg
-      self._last_ts = now      # ← Timer zurückgesetzt
-      return True
-
-  # Nachher:
-  else:
-      self._last_msg = msg
-      # Timer NICHT zurücksetzen — absoluter Takt bleibt erhalten
-      return True
+  if abs(target_a - self._last_quantized_target_a) >= write_threshold:
+      self._last_quantized_target_a = target_a
+      if self.victron.set_max_charge_current(ramped):
+          self._last_written_ramped_a = self.state.charge_current_setpoint
   ```
 
-- **FileHandler und StreamHandler teilten dieselbe DeduplicatingFilter-Instanz — Timer-Konflikt**
-
-  In v3.0.9.15 wurde eine einzelne `DeduplicatingFilter`-Instanz auf **beide** Handler (FileHandler + StreamHandler/journald) angewendet. Wenn ein [IDLE]-Eintrag über den FileHandler lief, aktualisierte er `_last_ts` — und der StreamHandler sah den Timer als frisch zurückgesetzt. Der Journal-Heartbeat verschob sich dadurch systematisch, weil der FileHandler bei jedem Zyklus (alle 60s) einen Eintrag schrieb.
-
-  → Fix: Je **eigene** `DeduplicatingFilter`-Instanz pro Handler:
-  ```python
-  dedup_file   = DeduplicatingFilter(...)   # nur für RotatingFileHandler
-  dedup_stream = DeduplicatingFilter(...)   # nur für StreamHandler (journald)
-  ```
-  Beide Timer laufen völlig unabhängig. Der Journal-Heartbeat erscheint exakt alle 20 Minuten, auch wenn das Logfile ständig beschrieben wird.
-
-- **Kein Heartbeat wenn Browser geschlossen und kein [IDLE]-Eintrag kam**
-
-  Der `DeduplicatingFilter.filter()` wird nur aufgerufen wenn ein Log-Eintrag **eingeht**. Wenn der Browser-Tab geschlossen ist, kommen keine HTTP-Requests → Werkzeug loggt nichts. Wenn gleichzeitig der BatteryManager im stabilen Zustand ist (keine neuen Entscheidungen), kommt auch kein [IDLE]-Eintrag. Der Heartbeat-Timer läuft ab, aber niemand prüft ihn — es erscheint **gar kein** Heartbeat im Journal.
-
-  → Fix: Neuer Hintergrund-Thread `_HeartbeatThread`, der alle 60 Sekunden `emit_heartbeat_if_due()` auf allen Dedup-Instanzen aufruft:
-  ```python
-  class _HeartbeatThread(threading.Thread):
-      def run(self):
-          while not self._stop.is_set():
-              self._stop.wait(self._interval)
-              for f in self._filters:
-                  f.emit_heartbeat_if_due()
-  ```
-  Der Thread überwacht **beide** Dedup-Instanzen:
-  - `dedup_stream` → [IDLE]-Heartbeats im Journal (BatteryManager-Logs)
-  - `dedup_werkzeug` → HTTP-Heartbeats im Journal (Werkzeug-Access-Logs)
-
-  Ergebnis: Auch bei geschlossenem Browser und stillem Betrieb erscheint alle 20 Minuten ein Heartbeat.
-
-- **Thread-Safety: Race-Condition bei gleichzeitigem Log-Zugriff**
-
-  `DeduplicatingFilter` wurde von mehreren Threads gleichzeitig aufgerufen (Hauptschleife + Flask-Worker-Threads für Dashboard-Requests). `_last_msg` und `_last_ts` wurden ohne Locking gelesen/geschrieben → theoretische Race-Condition bei gleichzeitigem Zugriff.
-
-  → Fix: `threading.Lock()` um alle Zugriffe auf `_last_msg` und `_last_ts` in `filter()` und `emit_heartbeat_if_due()`.
-
-### Added
-- **`DeduplicatingFilter.emit_heartbeat_if_due()` — Hintergrund-Heartbeat ohne eingehenden Log-Eintrag**
-
-  Neue Methode, die vom `_HeartbeatThread` aufgerufen wird. Prüft ob der Heartbeat fällig ist und schreibt einen **synthetischen** `LogRecord` direkt an `self._handler` — ohne erneut durch `filter()` zu laufen.
-
-  ```python
-  def emit_heartbeat_if_due(self) -> None:
-      if not self._enabled or self._handler is None:
-          return
-      now = time.monotonic()
-      with self._lock:
-          if not self._last_msg:
-              return
-          if (now - self._last_ts) < self._heartbeat_s:
-              return
-          self._last_ts = now
-          last_msg = self._last_msg
-      # Direkt an Handler emitieren, Filter wird übersprungen
-      if last_msg == "HTTP_ACCESS":
-          text = "- (Heartbeat: kein Browser-Request seit 20min)"
-      else:
-          text = last_msg + " (Heartbeat)"
-      r = logging.LogRecord(name="heartbeat", level=logging.INFO,
-                            pathname="", lineno=0, msg=text, args=None, exc_info=None)
-      self._handler.emit(r)
-  ```
-
-  Vorteil: `_last_msg` wird nicht durch einen Fremd-String korrumpiert. Der nächste echte Log-Eintrag wird weiterhin korrekt dedupliziert.
-
-- **`DeduplicatingFilter._handler` — Handler-Referenz für synthetische Heartbeats**
-
-  Nach der Handler-Erstellung in `setup_logging()` wird die Handler-Referenz in die Dedup-Instanz geschrieben:
-  ```python
-  dedup_stream._handler = ch   # StreamHandler
-  dedup_file._handler = fh     # RotatingFileHandler
-  ```
-  Ermöglicht `emit_heartbeat_if_due()` das direkte Emitieren ohne Umweg über den Logger.
-
-### Changed
-- **`setup_logging()` Rückgabetyp: `tuple[Logger, DeduplicatingFilter, DeduplicatingFilter]`**
-
-  Statt nur `Logger` wird jetzt ein Tuple zurückgegeben, damit `main()` die `dedup_stream`-Instanz an `start_dashboard()` übergeben kann.
-
-- **`start_dashboard()` Signatur erweitert um `dedup_stream: DeduplicatingFilter`**
-
-  Nimmt die BatteryManager-Stream-Dedup-Instanz entgegen und übergibt sie zusammen mit der neu erzeugten `dedup_werkzeug` an den `_HeartbeatThread`.
-
-### Notes
-- Die Zwischenversionen 3.0.9.16–3.0.9.18 wurden nie released. Alle Änderungen sind in dieser Version zusammengefasst.
-- Der `_HeartbeatThread` läuft als `daemon=True` und beendet sich beim Programmende automatisch.
-- Heartbeat-Intervall bleibt konfigurierbar via `config.yaml`: `logging.dedup_heartbeat_minutes` (Default: 20.0).
-
----
-
-## [3.0.9.15] – 2026-06-06
-
-### Fixed
-
-- **Werkzeug Heartbeat-Zeilen erschienen als `"%s" %s %s (Heartbeat)` im Journal**
-
-  Ursache: Werkzeug speichert Access-Log-Einträge intern als unformatiertes
-  Template (`record.msg = '"%s" %s %s'`, `record.args = (method, url, status)`).
-  Der alte Code hängte `" (Heartbeat)"` an `record.msg` *vor* der Expansion
-  an und löschte danach `record.args`. Das Ergebnis war der literal
-  unformatierte String im Journal statt des erwarteten Requests:
-  ```
-  # Vorher (falsch):
-  Jun 06 14:00:15 ... "%s" %s %s (Heartbeat)
-
-  # Jetzt (korrekt):
-  Jun 06 14:00:15 ... "GET /api/state HTTP/1.1" 200 - (Heartbeat)
-  ```
-  Fix in `DeduplicatingFilter.filter()`: `formatted = record.getMessage()`
-  wird *zuerst* aufgerufen (expandiert args), danach wird
-  `record.msg = formatted + " (Heartbeat)"` gesetzt. So ist `record.msg`
-  bereits der fertige String wenn der Handler ihn ausgibt.
-
-- **`GET /` und `GET /api/state` lösten unabhängige Heartbeat-Timer aus**
-
-  Da `_normalize()` bisher Methode + Pfad + Status als Schlüssel nutzte,
-  wurden alle Dashboard-Routen (`/`, `/api/state`, …) als verschiedene
-  Nachrichten behandelt und bekamen je einen eigenen 20-Minuten-Timer.
-  Im Journal erschienen dadurch zu jedem Heartbeat-Zeitpunkt mehrere
-  Einträge statt einem.
-
-  Fix in `DeduplicatingFilter._normalize()`: Alle HTTP-Access-Log-Zeilen
-  werden auf den einheitlichen Bucket `"HTTP_ACCESS"` normalisiert —
-  unabhängig von Methode, Pfad und Statuscode. Zusätzlich wird Werkzeugs
-  `%s`-Template-Format als zweites Muster abgefangen:
-  ```python
-  # Muster 1: vollständig formatierter Access-Log
-  if re.match(r'^[\d\.]+\s+-\s+-\s+\[.+?\]\s+"(?:GET|...)...', msg):
-      return "HTTP_ACCESS"
-  # Muster 2: Werkzeug-internes %s-Format (Sicherheitsnetz)
-  if re.match(r'^"%s"\s+%s\s+%s', msg):
-      return "HTTP_ACCESS"
-  ```
-  Alle Dashboard-Requests teilen jetzt denselben Heartbeat-Bucket →
-  genau ein Eintrag alle 20 Minuten im Journal.
-
-### Changed
-
-- **GUI-Footer Versionsstring entfernt**
-
-  Die Zeile `v3.0.9.10 | Aktualisiert: HH:MM:SS – nächste in Xs` im
-  Footer des Dashboards wurde entfernt. Der Header zeigt die Version
-  bereits (`⚡ Solar Batterie Manager v3.0.9.15`), ein zweiter
-  Versionsstring im Footer war redundant und zeigte zudem eine veraltete
-  Versionsnummer (`v3.0.9.10`).
-
-  Entfernt: CSS-Klasse `.ft`, HTML-Element `<div class="ft" id="ft">`,
-  JS-Zeile `document.getElementById('ft').textContent = ...`.
-
----
-
-## [3.0.9.14] – 2026-06-06
-
-### Fixed
-- **Werkzeug/Flask Access-Logs fluteten journalctl alle 30 Sekunden**
-  Das Dashboard-JavaScript pollt `/api/state` alle 30 Sekunden. Der Werkzeug-
-  Logger (`logging.getLogger('werkzeug')`) schrieb jede Request-Zeile
-  ungefiltert ins Journal:
-  ```
-  192.168.168.60 - - [06/Jun/2026 11:26:03] "GET /api/state HTTP/1.1" 200 -
-  ```
-  Obwohl das Logfile (RotatingFileHandler) bereits vom `DeduplicatingFilter`
-  gefiltert wurde, lief der Werkzeug-Logger über einen eigenen Handler
-  (StreamHandler → journald) und ignorierte den Filter.
-
-  → Fix: Zwei unabhängige Änderungen:
-
-  **1. `DeduplicatingFilter._normalize()`**
-  Neue Methode extrahiert den statischen Kern aus bekannten variablen
-  Log-Mustern, bevor der Vergleich stattfindet:
-  ```python
-  def _normalize(self, msg: str) -> str:
-      # Flask/Werkzeug Access-Log:
-      # "192.168.168.60 - - [06/Jun/2026 11:26:03] \"GET /api/state HTTP/1.1\" 200 -"
-      m = re.match(
-          r'^[\d\.]+\s+-\s+-\s+\[.+?\]\s+"(GET|POST|...)\s+(\S+)\s+HTTP/\d\.\d"\s+(\d+)',
-          msg)
-      if m:
-          method, path, status = m.groups()
-          return f"{method} {path} HTTP/1.x {status}"
-      return msg
-  ```
-  Variable Teile (IP, Datum, Uhrzeit) werden entfernt → alle 30-Sekunden-
-  Requests auf `/api/state` werden als identisch erkannt.
-
-  **2. `start_dashboard()`: Werkzeug-Logger mit dedupliziertem Handler**
-  ```python
-  werkzeug_log = logging.getLogger('werkzeug')
-  werkzeug_log.handlers.clear()          # Default-Handler entfernen
-  werkzeug_log.setLevel(logging.INFO)
-  werkzeug_log.propagate = False         # Nicht zum Root-Logger durchreichen
-
-  dedup_werkzeug = DeduplicatingFilter(...)
-  ch_werkzeug = logging.StreamHandler()
-  ch_werkzeug.addFilter(dedup_werkzeug)
-  werkzeug_log.addHandler(ch_werkzeug)
-  ```
-  Der Werkzeug-Logger bekommt jetzt denselben `DeduplicatingFilter` mit
-  Heartbeat wie die BatteryManager-Logs. Identische Requests werden
-  unterdrückt, alle 20 Minuten (konfigurierbar) erscheint ein Heartbeat
-  mit `(Heartbeat)`-Marker.
-
-  **Ergebnis im Journal:**
-  ```
-  # Vorher (alle 30s):
-  Jun 06 11:26:03 ... "GET /api/state HTTP/1.1" 200 -
-  Jun 06 11:26:33 ... "GET /api/state HTTP/1.1" 200 -
-  Jun 06 11:27:03 ... "GET /api/state HTTP/1.1" 200 -
-  ...
-
-  # Nachher (nur alle 20 Minuten):
-  Jun 06 11:26:03 ... "GET /api/state HTTP/1.1" 200 - (Heartbeat)
-  Jun 06 11:46:03 ... "GET /api/state HTTP/1.1" 200 - (Heartbeat)
-  ```
-  Das Logfile `battery_manager.log` war bereits clean (kein Werkzeug-Output),
-  daher betraf das Problem nur journalctl / stdout.
-
-### Notes
-- `_normalize()` ist erweiterbar: weitere variable Log-Muster können bei
-  Bedarf hinzugefügt werden (z.B. Modbus-Retry-Timestamps).
-- Keine neue Config-Option nötig — `dedup_enabled` und `dedup_heartbeat_minutes`
-  aus `config.yaml` greifen auch für Werkzeug-Logs.
-
----
-
-## [3.0.9.13] – 2026-06-06
-
-### Fixed
-- **DeprecationWarning: `datetime.utcfromtimestamp()` ist deprecated**
-  Python 3.12+ warnt: `datetime.datetime.utcfromtimestamp() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC`.
-
-  Aufgetreten in `VrmForecastManager.fetch()` bei der Log-Ausgabe der UTC-Zeitbereiche:
-  ```python
-  # Vorher (deprecated):
-  datetime.utcfromtimestamp(start_unix)
-
-  # Nachher (timezone-aware):
-  datetime.fromtimestamp(start_unix, tz=timezone.utc)
-  ```
-
-  Zusätzlich: `timezone` zum `datetime`-Import hinzugefügt:
-  ```python
-  from datetime import datetime, timedelta, date, timezone
-  ```
-
-  Keine funktionale Änderung — die Log-Ausgabe bleibt identisch, nur ohne Deprecation-Warnung.
-
-### Added
-- **Deduplizierungs-Filter mit Heartbeat — eingebautes `reduce_log_file.sh`**
-  Die Idee aus `reduce_log_file.sh` (aufeinanderfolgende identische Zeilen filtern) ist jetzt direkt im Python-Logging eingebaut. Statt externer Post-Processing entsteht das reduzierte Log bereits beim Schreiben.
-
-  **Problem:** Bei stabilem Zustand (z.B. 10 Minuten "[IDLE] 3A | Nacht: kein Laden (SOC 55.0%)") produziert das Log 10 identische Zeilen pro Stunde. Bei 24h Betrieb entstehen so leicht 500+ Zeilen, die identisch sind.
-
-  **Lösung:** Neuer `DeduplicatingFilter` (logging.Filter-Subclass):
-  - Vergleicht nur den Nachrichtentext (ohne Zeitstempel/Level, wie `reduce_log_file.sh`)
-  - Identische Nachrichten werden unterdrückt
-  - **Heartbeat:** Alle 20 Minuten (konfigurierbar) wird trotzdem eine Zeile ausgegeben, damit man sieht dass das Programm noch lebt — mit "(Heartbeat)"-Suffix
-
-  **Konfiguration** (optional in `config.yaml`):
-  ```yaml
-  logging:
-    dedup_enabled: true              # Default: true
-    dedup_heartbeat_minutes: 20.0    # Default: 20 Minuten
-  ```
-
-  **Beispiel-Log-Ausgabe:**
-  ```
-  2026-06-06 10:00:15 [INFO] [IDLE] 3A | Nacht: kein Laden (SOC 55.0%)
-  2026-06-06 10:20:15 [INFO] [IDLE] 3A | Nacht: kein Laden (SOC 55.0%) (Heartbeat)
-  2026-06-06 10:21:15 [INFO] [IDLE] 3A | Nacht: kein Laden (SOC 54.0%)
-  2026-06-06 10:41:15 [INFO] [IDLE] 3A | Nacht: kein Laden (SOC 54.0%) (Heartbeat)
-  ```
-
-  **Vorteile gegenüber externem `reduce_log_file.sh`:**
-  - Kein zusätzlicher Cronjob oder manueller Aufruf nötig
-  - Heartbeat zeigt Lebendigkeit auch bei langem IDLE-Zustand
-  - FileHandler und StreamHandler (journalctl) werden gleichermaßen gefiltert
-  - Rückwärtskompatibel: fehlende Config-Einträge → Defaults greifen
-
-  **Implementierung:**
-  - `DeduplicatingFilter`: Filter-Unterklasse, speichert `_last_msg` und `_last_ts`, prüft `time.monotonic()` gegen Heartbeat-Intervall
-  - Wird auf **jeden Handler** (File + Stream) angewendet, damit sowohl Logfile als auch journalctl/journalctl dedupliziert werden
-  - Bei Programmstart wird eine Info-Zeile ausgegeben: `Deduplizierung aktiv: identische Zeilen werden unterdrückt, Heartbeat alle 20 Minuten`
-  - Heartbeat-Marker wird direkt ins `record.msg` geschrieben (`+ " (Heartbeat)"`), kein separater Formatter nötig — `record.args = None` verhindert %-formatting-Probleme mit den Klammern im Marker
-
-### Notes
-- `reduce_log_file.sh` kann weiterhin verwendet werden (z.B. für alte Logs), ist aber für den laufenden Betrieb nicht mehr nötig.
-- Die Deduplizierung betrifft nur identische Nachrichten. Unterschiedliche SOC-Werte, Stromwerte oder Modi werden wie gewohnt geloggt.
-- Heartbeat-Intervall sollte länger sein als `control_interval_seconds` (Default 60s), sonst hat der Filter praktisch keine Wirkung. 20 Minuten ist ein guter Kompromiss zwischen Log-Größe und Beobachtbarkeit.
-
-### Fixed
-- **Unnötiges Hoch-/Runterrampen bei PV-Überschuss — Ladestrom nicht an tatsächlichem Überschuss orientiert**
-  Bei geringem PV-Überschuss (z.B. 292 W) wurde der Ladestrom trotzdem auf `max_a` (50 A) hochgerampet, weil `surplus_w > 200` direkt `max_a` zurückgab. Der Ramp-Mechanismus führte das dann in 5-Schritten hoch (10→20→30→40→50 A), obwohl 292 W / 50 V = 5,8 A → maximal ~6 A sinnvoll gewesen wären. Anschließend fiel die Entscheidung zurück auf IDLE (kein Überschuss mehr) und der Strom wurde in gleichen Schritten wieder heruntergerampet — völlig unnötige Modbus-Schreibvorgänge und Netzbezug.
-
-  Ursache: Die Überschuss-Berechnung `surplus_w = max(0.0, pv_w - load_w)` berücksichtigte den **aktuellen Batterieladestrom nicht**. Wenn der Akku bereits mit z.B. 10 A lädt, fließen diese ~500 W in `pv_w` mit rein, werden aber nicht abgezogen — der vermeintliche Überschuss bleibt hoch, obwohl gar keiner mehr da ist. Zudem wurde der Ladestrom nie an den tatsächlich verfügbaren Überschuss gekoppelt.
-
-  → Fix: Zwei unabhängige Änderungen:
-
-  **1. Grid-basierte Überschuss-Ermittlung (zuverlässiger)**
-  ```python
-  grid_w = self.state.grid_power_w
-  # Export = negativer Grid-Wert = wirklicher Überschuss
-  surplus_from_grid = max(0.0, -grid_w) if grid_w < -50 else 0.0
-  ```
-  Grid-Power ist die zuverlässigste Quelle für "wirklicher Überschuss", weil sie alle Verluste, DC-Lasten und den aktuellen Batterieladestrom automatisch mitberücksichtigt. Negativer Grid-Wert = Export = verfügbarer Überschuss. Positiver Grid-Wert = Import = kein Überschuss.
-
-  **2. Ladestrom auf tatsächlichen Überschuss limitiert**
-  ```python
-  max_from_surplus = surplus_w / actual_v if surplus_w > 0 else 0.0
-  charge_a = min(max_from_surplus, max_a)
-  # Beispiel: 292W / 50V = 5,8A → max 6A, nicht 50A!
-  ```
-  Der Ladestrom wird jetzt nie höher gesetzt als der verfügbare Überschuss erlaubt. Überschuss < 200 W → kein Laden. Überschuss 500 W → ~10 A. Überschuss 2500 W → 50 A (oder was `max_a` erlaubt).
-
-  **3. PV-basierter Fallback (wenn Grid-Messung unzuverlässig)**
-  ```python
-  battery_charge_w = max(0.0, self.state.battery_power_w)
-  surplus_from_pv = max(0.0, pv_w - load_w - battery_charge_w)
-  ```
-  Wenn die Grid-Messung nahe 0 oder unzuverlässig ist, wird als Fallback `PV - Load - Battery_Charge` verwendet. Der aktuelle Batterieladestrom wird explizit abgezogen, damit derselbe Strom nicht doppelt gezählt wird.
-
-  **4. Korrekte Log-Ausgabe**
-  Statt irreführender Meldungen wie `PV-Ueberschuss 292 W -> 50 A` jetzt transparent:
-  ```
-  PV-Überschuss 292W [Grid] → max 5.8A, setze 6A (SOC 68.0% → Ziel 73%)
-  ```
-  Die Quelle des Überschusswerts (`[Grid]` oder `[PV-Load-Batt]`) wird mitgeloggt.
-
-  **5. Auch im Optimal-Fenster durch Überschuss limitiert**
-  Bisher wurde im Optimal-Fenster der dynamisch berechnete Strom (`required_a`) gesetzt, ohne zu prüfen ob überhaupt so viel Überschuss vorhanden ist. Jetzt:
-  ```python
-  charge_a = min(max_from_surplus, required_a, reduced_a)
-  ```
-  Der Strom ist jetzt in allen Pfaden durch den verfügbaren Überschuss begrenzt — nie mehr Strom aus dem Netz ziehen als nötig.
-
-### Changed
-- **Surplus-Berechnung: Grid-Bezug als primäre Quelle**
-  Die Reihenfolge der Überschuss-Ermittlung wurde umgedreht: Grid-basiert (zuverlässig) hat Priorität, PV-basiert (Fallback) nur wenn Grid-Messung unzuverlässig. Die Grid-Messung reflektiert die physikalische Realität am Hausanschluss — alles was exportiert wird, könnte stattdessen in den Akku fließen.
-
-### Notes
-- Grid-basierte Überschuss-Ermittlung funktioniert nur wenn ein bidirektionaler Zähler vorhanden ist (typisch bei Victron ESS-Installationen). Bei fehlendem/inkorrektem Grid-Meter fällt der Code automatisch auf PV-Load-Battery zurück.
-- Die Änderung ist rückwärtskompatibel — keine neuen Config-Optionen nötig.
-
-### Fixed
-- **Asymmetrische Hysterese beim Ziel-SOC — systematischer 2%-Unterschuss**
-  Der "Ziel erreicht"-Block verwendete `soc >= dyn_target - hyst` als Abschalt-
-  bedingung. Bei `dyn_target = 66%` und `hyst = 2%` wurde bereits bei `SOC = 64%`
-  als "Ziel erreicht" gewertet und der Ladestrom auf 0 gesetzt. Da der SOC danach
-  weiter in die Nacht entlud, startete die nächste Nacht systematisch 2% unter dem
-  berechneten Ziel.
-
-  Ursache: Die Hysterese wirkte symmetrisch — sowohl als Einschaltschwelle
-  (`soc < dyn_target - hyst` → wieder laden) als auch als Abschaltschwelle
-  (`soc >= dyn_target - hyst` → Ziel "erreicht"). Das führte dazu, dass der
-  Sollwert nie wirklich erreicht wurde, nur die untere Hysterese-Grenze.
-
-  → Fix: Abschaltschwelle auf `soc >= dyn_target` angehoben (kein Unterschuss
-  mehr). Einschaltschwelle bleibt bei `soc < dyn_target - hyst` — die Hysterese
-  wirkt jetzt asymmetrisch, nur als Schutz gegen erneutes Einschalten, nicht
-  als Abschaltschwelle.
-
-  ```python
-  # Vorher (falsch — stoppt bei dyn_target - hyst, z.B. 64% statt 66%):
-  if soc >= dyn_target - hyst:
-      return 0, "idle", ...
-
-  # Nachher (korrekt — stoppt erst wenn Ziel wirklich erreicht):
-  if soc >= dyn_target:
-      return 0, "idle", ...
-  ```
-
-  Effekt: Laden bis exakt `dyn_target`, Nachladen erst unter `dyn_target - hyst`.
-  2% mehr Energie in der Nacht, kein Oszillationsrisiko.
-
-- **Irreführender Logtext bei Morgen-Verzögerung mit ausreichender PV-Prognose**
-  Wenn `pv_in_optimal >= needed_kwh` aber `soc < min_required` (SOC zu niedrig
-  zum Warten), lautete die Log-Meldung:
-
-  ```
-  Morgen: PV nicht ausreichend im Optimal-Fenster (20.0 kWh < 5.2 kWh), fruehes Laden noetig
-  ```
-
-  Der Vergleich im Text war faktisch falsch (20.0 > 5.2) — der eigentliche
-  Ablehnungsgrund war der niedrige SOC, nicht die PV-Prognose.
-
-  → Fix: Logtext unterscheidet jetzt zwischen zwei Fällen:
-
-  ```
-  # Fall a: PV ausreichend, aber SOC zu niedrig zum Warten:
-  Morgen: SOC 33.0% < min 35%, kann nicht warten; PV im Fenster ausreichend (20.0 kWh >= 5.2 kWh), fruehes Laden noetig
-
-  # Fall b: PV wirklich nicht ausreichend:
-  Morgen: PV nicht ausreichend im Optimal-Fenster (3.1 kWh < 5.2 kWh), fruehes Laden noetig
-  ```
-
-- **`_simulate_hour()`: Ziel-SOC-Abbruch inkonsistent mit `decide()` (Nachreview)**
-  Nach dem Fix in `decide()` stand in `_simulate_hour()` noch die alte Bedingung
-  `if soc_sim >= dyn_target - hyst`. Die Simulation stoppte das Laden 2% früher
-  als die Realsteuerung — der Ladeplan zeigte "idle" obwohl der echte Regler noch
-  lud. `_simulate_hour()` verwendet jetzt ebenfalls `soc_sim >= dyn_target`.
-
-- **`_simulate_hour()` / `decide()`: `hours_left` mit Minutengenauigkeit**
-  `hours_left = max((opt_end - h_now) + 1, 0.5)` arbeitete mit ganzen Stunden.
-  Um 11:59 im Fenster 11–15 lieferte das 1.0h statt ~3.0h — der berechnete
-  Ladestrom war dreifach überhöht. Korrigiert auf:
+- `controller.py` (Fix 2): `decide()`: `hours_left` im Optimal-Fenster
+  änderte sich jede Minute minimal (z.B. 4.53h → 4.52h), was `required_a`
+  langsam driften ließ. An Quantisierungsgrenzen (z.B. `round(12.4/5)*5=10`
+  vs. `round(12.6/5)*5=15`) kippte die Stromstufe und löste einen Write aus.
+  Dieses Kippen wiederholte sich alle 6–8 Minuten (beobachtetes Muster
+  10A↔15A im Log vom 2026-06-13).
+
+  `_smooth_required_a` (v3.0.9.26) war hier kontraproduktiv: er mischte
+  Werte aus verschiedenen `hours_left`-Perioden und verzögerte das Kippen
+  um 3 Zyklen, erzeugte es aber nicht weniger oft.
+
+  Fix: `hours_left` auf 0.5h-Stufen quantisieren. Änderung nur 2× pro
+  Stunde → `required_a` ist 30 Minuten stabil → kein Stufenwechsel durch
+  Minutendrift. `_smooth_required_a` bleibt als Absicherung gegen
+  SOC-Messrauschen erhalten.
+
+  Alt:
   ```python
   hours_left = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
   ```
-
-- **`decide()`: Spannungs-Fallback mit hartem Minimum bei Modbus-Ausfall**
-  `actual_v = max(battery_voltage, nom_v * 0.9)` konnte bei Modbus-Ausfall
-  `battery_voltage = 0.0` liefern, Fallback dann `48 * 0.9 = 43.2V`. Für eine
-  14-kWh-LFP-Anlage unrealistisch niedrig, führte zu überhöhten `required_a`.
-  Neuer Boden: `max(battery_voltage, nom_v * 0.875, 42.0)` — 42V ist die absolute
-  LFP-Untergrenze (0% SOC), darunter ist kein realistischer Betrieb möglich.
-
-- **Dashboard-Versionsnummer nicht vollständig aktualisiert (Nachreview)**
-  `<h1>`-Tag und Footer-String zeigten noch `v3.0.9.9`. Alle vier Stellen
-  (HTML-Title, h1-Span, JS-Footer-String, `logger.info` in `main()`) auf
-  `v3.0.9.10` aktualisiert.
-
----
-
-### Fixed
-- **GUI zeigt 0 A obwohl Cerbo auf 3 A steht — Anzeige-Bug bei Clamping**
-  Wenn `decide()` 0 A zurückgibt (idle), aber der tatsächlich geschriebene Wert
-  durch `set_max_charge_current()` auf `min_charge_current` (z.B. 3 A) geclamped
-  wird, zeigte das Dashboard fälschlicherweise 0 A statt 3 A.
-
-  Ursache: `_last_written_ramped_a` speicherte den ungeclamppten Rampenwert
-  (z.B. 5 A), nicht den tatsächlich geschriebenen Wert (3 A). Bei der nächsten
-  Hysterese-Prüfung (`abs(ramped - last_written) >= 1.0`) driftete der Vergleich,
-  weil `last_written` 5 enthielt, aber die Hardware 3 stand.
-
-  → Fix: Nach erfolgreichem Write wird `_last_written_ramped_a` jetzt auf
-  `state.charge_current_setpoint` gesetzt (der Wert, den `set_max_charge_current()`
-  tatsächlich geschrieben hat, nach Clamping). Die Hysterese vergleicht jetzt
-  gegen den echten Hardware-Wert, nicht gegen den theoretischen Rampenwert.
-
+  Neu:
   ```python
-  # Vorher (falsch):
-  self._last_written_ramped_a = ramped  # z.B. 5 A (ungeclamppt)
-
-  # Nachher (korrekt):
-  self._last_written_ramped_a = self.state.charge_current_setpoint  # z.B. 3 A (tatsächlich geschrieben)
+  hours_left_raw = max((opt_end + 1.0) - h_now - minute_now / 60.0, 0.5)
+  hours_left = max(round(hours_left_raw * 2) / 2, 0.5)
   ```
+
+  Erwartetes Verhalten: Stufenwechsel im Optimal-Fenster maximal 2× pro
+  Stunde (bei echtem SOC-Fortschritt), statt alle 6–8 Minuten.
+
+Changed:
+- `version.py` neu eingeführt: `VERSION`-Konstante ausgelagert.
+  `battery_manager.py` importiert `from version import VERSION`.
+  Zukünftige Releases erfordern nur noch eine Änderung in `version.py` —
+  `battery_manager.py` bleibt unverändert.
+
+- `battery_manager.py`: Dateistruktur-Kommentar auf v3.0.10.6 aktualisiert
+  (9 Module inkl. `version.py`).
 
 ---
 
-## [3.0.9.8] – 2026-06-01
+## v3.0.10.5 — Code-Review Cleanup (2026-06-12)
 
-### Fixed
-- **Trickle-Block (Step 7) verwendete fälschlich `trickle_current` (20 A) statt sanftem Strom**
-  In v3.0.9.7 wurde `trickle_current` von 5 A auf 20 A erhöht, damit das Cellbalancing bei
-  SOC ≥ 98% funktioniert (BMS braucht Strom für Balancing). Der Trickle-Block (Step 7)
-  verwendete jedoch denselben Wert — bei SOC weit unter Ziel (z.B. 55% bei Ziel 80%)
-  wurde mit 20 A aus dem Netz geladen, obwohl kein PV-Überschuss vorhanden war.
+Changed:
+- `battery_manager.py`: Veralteten Header aktualisiert (v3.0.10.0 → v3.0.10.5,
+  Dateistruktur zeigt jetzt alle 8 Module).
+- `battery_manager.py`: Überflüssige Imports entfernt — `HourlyForecast`,
+  `HourlyHistory` (nirgends verwendet), `DeduplicatingFilter` (nur
+  `setup_logging()` nötig, Instanz wird zurückgegeben).
+- `battery_manager.py`: 6 Migrationskommentar-Blöcke entfernt (Relikte des
+  Refactorings, kein Mehrwert nach Abschluss der Aufteilung).
+- `battery_manager.py`: Guard `if dedup_stream is not None` vor
+  `start_dashboard()`-Aufruf (defensiv gegen theoretischen Doppel-Init).
+- `dashboard.py`: `TYPE_CHECKING`-Import korrigiert:
+  `from battery_manager import ...` → `from models import SystemState` /
+  `from logging_setup import DeduplicatingFilter` (verhindert zirkulären
+  Import bei aktiviertem Type-Checker).
+- `dashboard.py`: Ungenutzten `import re as _re` entfernt (Copy-Paste-Relikt
+  aus `DeduplicatingFilter._normalize()`).
+- `forecast.py`: Tote Methode `_sundown_unix()` entfernt (obsolet seit
+  `_get_dynamic_night_window()` astronomische Zeiten berechnet).
+- `modbus_victron.py`: Ungenutzten `ModbusException`-Import entfernt
+  (alle Fehler werden durch generisches `except Exception` abgefangen).
+- `controller.py`: Doppelten `# Hauptprogramm`-Kommentar-Header und
+  veralteten Heartbeat-Erklärungskommentar am Dateiende entfernt
+  (Heartbeat lebt seit Refactoring in `dashboard.py`).
 
-  → Fix: Trickle-Block verwendet jetzt `min_charge_current` (z.B. 3 A) statt `trickle_a`:
+---
+
+## v3.0.10.5 (2026-06-12)
+
+Changed:
+- `controller.py` eingeführt: `EnergyAccumulator`, `PowerSmoother`, `ChargeController`
+  ausgelagert (~1190 Zeilen).
+- `battery_manager.py` ist jetzt reiner Glue-Code (360 Zeilen): nur noch `main()`,
+  `load_config()`, `validate_config()`, `_forecast_source()` und Imports.
+- Nicht mehr benötigte Imports entfernt: `json`, `re`, `math`, `logging.handlers`,
+  `threading`, `deque`, `asdict`, `timedelta`, `timezone`, `date`.
+- VERSION auf 3.0.10.5 aktualisiert.
+
+Fixed:
+- `controller.py`: `from __future__ import annotations` ergänzt (Zeile 3).
+  Ohne diesen Import wertet Python Typ-Annotationen in `ChargeController.__init__()`
+  zur Laufzeit aus — `VictronModbus` und `EvccMonitor` standen nur im
+  `TYPE_CHECKING`-Block und waren zur Laufzeit undefiniert → `NameError`.
+  Mit `from __future__ import annotations` werden alle Annotationen lazy
+  als Strings behandelt und nie ausgewertet (PEP 563, Python 3.7+).
+
+---
+
+## v3.0.10.4 (2026-06-12)
+
+Changed:
+- `modbus_victron.py` eingeführt: `VictronModbus` ausgelagert inkl. pymodbus-Import
+  (try/except für pymodbus 3.x / 2.x Fallback).
+- `evcc.py` eingeführt: `EvccMonitor` ausgelagert.
+- `battery_manager.py`: pymodbus try/except-Block entfernt (nur noch in `modbus_victron.py`).
+- `from modbus_victron import VictronModbus` und `from evcc import EvccMonitor` neu.
+- VERSION auf 3.0.10.4 aktualisiert.
+
+---
+
+## v3.0.10.3 (2026-06-12)
+
+Changed:
+- `forecast.py` eingeführt: `VrmForecastManager` und `ForecastManager` ausgelagert
+  (inkl. `_calculate_sun_times`, `_get_dynamic_night_window`).
+- `battery_manager.py`: `from forecast import ForecastManager` neu.
+- `import math` bleibt in `battery_manager.py` (wird in `ChargeController._is_night()`
+  via `math.ceil`/`math.floor` noch benötigt).
+- `HourlyForecast` weiterhin via `from models import` verfügbar (in `build_schedule()` gebraucht).
+- VERSION auf 3.0.10.3 aktualisiert.
+
+---
+
+## v3.0.10.2 (2026-06-12)
+
+Changed:
+- `logging_setup.py` eingeführt: `DeduplicatingFilter` und `setup_logging()` ausgelagert.
+- `battery_manager.py`: `import re` entfernt (nur noch in `logging_setup.py` gebraucht),
+  `import os` explizit hinzugefügt (weiterhin in `_save_persistent()` gebraucht).
+- `from logging_setup import DeduplicatingFilter, setup_logging` neu.
+- VERSION auf 3.0.10.2 aktualisiert.
+
+---
+
+## v3.0.10.1 (2026-06-12)
+
+Changed:
+- `models.py` eingeführt: `SystemState`, `HourlyForecast`, `HourlyHistory` nach
+  `models.py` ausgelagert. Keine Logikänderung.
+- `EnergyAccumulator` und `PowerSmoother` bleiben in `battery_manager.py`
+  (haben update()-/reset()-Logik, kein reines Datenmodell).
+- `battery_manager.py`: `from models import SystemState, HourlyForecast, HourlyHistory`
+  ersetzt die lokalen Klassendefinitionen. `dataclass`/`field`-Import entfernt.
+- VERSION auf 3.0.10.1 aktualisiert.
+
+---
+
+## v3.0.10.0 (2026-06-12)
+
+Changed:
+- Datei aufgeteilt in `battery_manager.py`, `dashboard.py`, `CHANGELOG.md`.
+- `VERSION`-Konstante eingeführt: ein einziger Ort für alle Versionsstrings
+  (GUI-Titel, h1, logger.info, Datei-Header).
+- `DASHBOARD_HTML` und `start_dashboard()` nach `dashboard.py` ausgelagert.
+- Changelogs aus Quellcode entfernt und in diese Datei überführt.
+
+---
+
+## v3.0.9.28 (2026-06-12)
+
+Fixed:
+- `run_cycle()`: `"(Hysterese)"` wurde an alle gecachten Entscheidungen
+  angehängt, nicht nur an Warte-Entscheidungen (`mode="idle"`).
+
+  Alt:
   ```python
-  gentle_a = self.bat.get("min_charge_current", 5)
-  return gentle_a, "trickle", ...
+  elif not reason.endswith("(Hysterese)"):
+      reason = reason + " (Hysterese)"
+  ```
+  Neu:
+  ```python
+  elif mode == "idle" and not reason.endswith("(Hysterese)"):
+      reason = reason + " (Hysterese)"
   ```
 
-  - Cellbalancing-Block (SOC ≥ 98%): Weiterhin `trickle_a` = 20 A (BMS-Anforderung)
-  - Trickle-Block (SOC weit unter Ziel, kein PV): Jetzt `gentle_a` = `min_charge_current` (Default 3 A)
-  - Keine neue Config-Option nötig — verwendet bestehendes `battery.min_charge_current`
+  Begründung: Das Suffix `"(Hysterese)"` signalisiert dem Nutzer dass die
+  Entscheidung aus dem Cache stammt (kein neuer `decide()`-Aufruf wegen
+  `min_decision_interval`). Bei `mode="charging"` oder `"full_charge"` ist
+  der Zusatz semantisch falsch und suggeriert fälschlicherweise einen
+  SOC-Hysterese-Wartemodus.
 
 ---
 
-# Changelog — battery_manager.py
+## v3.0.9.27 (2026-06-12)
 
-## [3.0.9.7] – 2026-06-01
+Fixed:
+- `decide()`: `pv_in_optimal` verwendete `f.pv_kwh` (Brutto-PV) statt
+  Netto-Überschuss (PV − Verbrauch). Dadurch wurde die Warteentscheidung
+  "PV im Optimal-Fenster ausreichend" gegenüber dem tatsächlich in den
+  Akku fließenden Strom zu optimistisch.
 
-### Changed
-- **Schritt 6, Optimal-Fenster: Dynamischer Strom statt fester `reduced_a`**
-  Bisher wurde im Optimal-Fenster immer pauschal `reduced_charge_current_a` (Default 20 A) geladen.
-  Jetzt wird der Strom aus dem verbleibenden Energiebedarf berechnet:
-
+  Alt:
+  ```python
+  pv_in_optimal = sum(f.pv_kwh for f in fc_list if opt_start <= f.hour <= opt_end)
+  if pv_in_optimal >= needed_kwh and soc >= min_required:
+      return 0, "idle", "... warte"
   ```
-  missing_kwh = (dyn_target - soc) / 100 * capacity_kwh
-  hours_left  = max((opt_end - h_now) + 1, 0.5)
-  required_kw = (missing_kwh * 1.15) / hours_left   # +15% Reserve
-  required_a  = (required_kw * 1000) / actual_v
-  charge_a    = max(optimal_min_a, min(required_a, reduced_a))
+  Neu:
+  ```python
+  net_in_optimal = sum(max(0.0, f.net_kwh) for f in fc_list
+                       if opt_start <= f.hour <= opt_end)
+  if net_in_optimal >= needed_kwh and soc >= min_required:
+      return 0, "idle", "... warte"
   ```
 
-  - `actual_v`: Echte Batteriespannung aus Modbus (mit Fallback auf `nom_v * 0.9`)
-  - `optimal_min_a`: Neue Config-Option `charging.optimal_window_min_current_a` (Default 10 A)
-  - `reduced_a`: Bleibt als harte Obergrenze erhalten (Default 20 A)
-  - Guard: Wenn `missing_kwh <= 0.1` → sanftes Laden mit `min_charge_current` (z.B. 3 A)
+  Begründung: `needed_kwh` ist die Netto-Energie die der Akku benötigt
+  (SOC-Delta × Kapazität). Der Vergleichswert muss ebenfalls Netto sein.
+  Beispiel: PV 11–15 Uhr = 6,5 kWh, Verbrauch = 3,8 kWh → netto 2,7 kWh.
+  Ziel-Energie: 5,9 kWh. Vorher: 6,5 >= 5,9 → warte (falsch).
+  Nachher: 2,7 < 5,9 → frühes Laden nötig (korrekt).
 
-### Added
-- **Config-Option `charging.optimal_window_min_current_a`** (optional, Default 10 A)
-  Mindeststrom im Optimal-Fenster. Verhindert, dass der dynamische Algorithmus bei
-  geringem Energiebedarf unrealistisch niedrige Ströme (z.B. 2–3 A) vorschlägt,
-  die DVCC ignorieren würde.
+- `_simulate_hour()`: Morgen-Fenster (`h < opt_start`, `soc >= min_required`)
+  wartete immer ohne zu prüfen ob das Optimal-Fenster die benötigte
+  Netto-Energie tatsächlich liefert. Inkonsistenz zu `decide()`.
 
-### Removed
-- **Unbenutzte Variable `nom_v` aus `decide()`** entfernt.
-  Die Nennspannung wird jetzt nur noch in `_simulate_hour()` verwendet.
-
-### Notes
-- Die 15% Sicherheitsreserve (`* 1.15`) puffert typische Forecast-Abweichungen
-  und Verluste (Wirkungsgrad, Temperatur) ab.
-- Der Guard `missing_kwh <= 0.1` verhindert Überladung bei fast erreichtem Ziel.
-  Er verwendet `min_charge_current` (z.B. 3 A), nicht `trickle_a` (20 A),
-  um Verwechslung mit dem Cellbalancing-Block zu vermeiden.
-- `trickle_a` (20 A) bleibt exklusiv für den Cellbalancing-Block bei SOC >= 98%.
-
-
-============================================================
-
-# Changelog — battery_manager.py
-
-## [3.0.9.6] – 2026-06-01
-
-### Changed
-- **Proportionalladung vollständig entfernt — feste Stromwerte in allen Pfaden**  
-  Die Berechnung `surplus_a = surplus_w / nom_v` (Ladestrom proportional zum PV-Überschuss) wurde ersatzlos aus allen drei Stellen in `decide()` entfernt:
-
-  1. **Morgen-Notladung** (`soc < min_required`): Bisher wurde bei `surplus_w > 200 W` proportional geladen (`min(surplus_a, max_a)`), bei fehlendem Überschuss optional `trickle_a` oder 0 A. Das erzeugte unnötige Modbus-Schreibvorgänge und verlangsamte die SOC-Erholung in einer Notlage.  
-     → Jetzt: Immer `max_a`, kein PV-Überschuss-Check, kein `morning_trickle_on_no_pv`-Flag mehr.
-
-  2. **Schritt 6, Optimal-Fenster** (`opt_start <= h_now <= opt_end`, `pv_in_optimal >= needed_kwh * 1.5`): Bisher `min(surplus_a, reduced_a)`.  
-     → Jetzt: Direkt `reduced_a` (aus `charging.reduced_charge_current_a`, Default 20 A).
-
-  3. **Schritt 6, Normalbetrieb** (`surplus_w > 200 W`): Bisher `min(surplus_a, max_a)`.  
-     → Jetzt: Direkt `max_a`.
-
-### Removed
-- **Config-Option `charging.morning_trickle_on_no_pv`** entfällt — der zugehörige Pfad existiert nicht mehr. Bestehende Einträge in `config.yaml` werden ignoriert und können entfernt werden.
+  Neu: `net_in_opt`-Check analog zu `decide()` eingebaut, damit Entscheidung
+  und Ladeplan übereinstimmen.
 
 ---
 
-## [3.0.9.5] – 2026-06-01
+## v3.0.9.26 (2026-06-11)
 
-### Fixed
-- **`_simulate_hour()`: Notfall-SOC block ignorierte `floor_soc` (Reg 2901)**  
-  Der Ladeplan zeigte Entladung bis 15.3% (04:00), 16.9% (03:00), 18.4% (02:00) — obwohl das `ESS MinimumSocLimit` (Reg 2901) auf z.B. 20% steht. Die reale Hardware würde bei 20% stoppen (State 11), die Simulation sank aber tiefer.  
-  Ursache: Im Notfall-SOC-Block (`soc_sim <= emergency_charge_soc`) wurde `max(0.0, ...)` verwendet statt `max(floor_soc, ...)`. Der `floor_soc`-Parameter (der Reg 2901 enthält) wurde ignoriert.  
-  → Fix: `soc_sim = max(floor_soc, soc_sim - (deficit / cap) * 100)` — die Simulation sinkt jetzt korrekt nur bis zur harten Victron-Untergrenze (Reg 2901), nie darunter.
+Changed:
+- `decide()`: Optimal-Fenster-Sollwert wird jetzt auf konfigurierbare
+  Stromstufen quantisiert (`charging.optimal_window_current_step_a`, Default 5 A).
+  Begründung: `surplus_w` schwankt um ±2000 W → ohne Quantisierung ändert sich
+  `charge_a` im Minutentakt (18/19/20 A), obwohl physikalisch kein Unterschied besteht.
 
-### Verified
-- `_apply_deficit()`: ✅ verwendet `max(floor_soc, new_soc)`  
-- `needs_full`-Block: ✅ verwendet `max(floor_soc, soc_sim - ...)`  
-- Morgen-Notladung (discharging): ✅ verwendet `max(floor_soc, soc_sim - ...)`  
-- Notfall-SOC: ✅ jetzt auch `max(floor_soc, soc_sim - ...)` (v3.0.9.5 Fix)
+- `run_cycle()`: Schreib-Hysterese im Optimal-Fenster auf
+  `charging.optimal_window_write_deadband_a` angehoben (Default 3 A).
+  Netto-Effekt: Flash-Schreibrate sinkt von ~6–8 auf < 2 Writes/Stunde.
 
 ---
 
-## [3.0.9.4] – 2026-05-31
+## v3.0.9.25_fixed (2026-06-11)
 
-### Fixed
-- **`forecast_pv_remaining_kwh` wurde nie berechnet**  
-  Das Feld `forecast_pv_remaining_kwh` in `SystemState` wurde nur deklariert, aber **nie** aktualisiert. Das Dashboard zeigte daher permanent "Verbleibend: 0.0 kWh", obwohl die VRM-Prognose deutlich höhere Restwerte lieferte.  
-  → Fix: `forecast_pv_remaining_kwh` wird jetzt bei jedem Prognose-Update berechnet als Summe der PV-Prognose ab aktueller Stunde (`sum(f.pv_kwh for f in fc if f.hour >= now_h)`). Auch beim Programmstart wird der Wert korrekt vorbelegt.
-
-- **VRM-Prognose wurde bei Wetteränderung nicht aktualisiert**  
-  Die PV-Prognose im Dashboard zeigte z.B. **53.2 kWh**, während die VRM-Realität (rechts im Screenshot) bereits auf **32–39 kWh** korrigiert hatte. Ursache: `ForecastManager.get_forecast()` lieferte seinen eigenen lokalen Cache, auch wenn VRM neue Daten hatte. Der `force=True`-Parameter wurde nur beim Tageswechsel oder manuellem Aufruf übergeben, nicht bei regulären Updates.  
-  → Fix: Wenn VRM aktiviert ist (`forecast.vrm.enabled == True`), wird bei jedem Prognose-Update-Intervall `force=True` an `get_forecast()` übergeben. VRM's Server cached selbst und gibt bei identischer Anfrage schnell eine 304-ähnliche Antwort zurück — kein Performance-Problem. Die lokale Cache-Invalidierung stellt sicher, dass der `ForecastManager`-Cache ebenfalls aktualisiert wird, wenn VRM neue Daten liefert.
-
-- **VRM-Cache ohne Debug-Transparenz**  
-  Es war nicht ersichtlich, ob VRM-Daten aus dem lokalen Cache oder vom Server kamen.  
-  → Fix: `VrmForecastManager.fetch()` loggt jetzt im DEBUG-Level "VRM: liefere gecachte Prognose" wenn der lokale Cache verwendet wird, und "VRM-Prognose aktualisiert: X.X kWh heute" wenn der Server neu abgefragt wurde.
-
-### Changed
-- **Prognose-Update-Intervall: VRM bevorzugt**  
-  Wenn VRM als Prognosequelle aktiv ist, wird bei jedem konfigurierten `update_interval_minutes`-Zyklus der VRM-Server direkt abgefragt (`force=True`). Der lokale Cache im `ForecastManager` wird entsprechend invalidiert. Open-Meteo/Solcast-Fallback bleibt unverändert (Cache nach Intervall).
+Fixed:
+- `_simulate_hour()`: PV-Überschuss-Block außerhalb Optimal-Fenster
+  war inkonsistent mit `decide()`. `decide()` setzt bei `soc < dyn_target`
+  `max_a` ohne Netz-kWh-Cap — ESS/DVCC begrenzen physikalisch.
 
 ---
 
-## [3.0.9.3] – 2026-05-31
+## v3.0.9.25 (2026-06-11)
 
-### Fixed
-- **`decide()`: `PowerSmoother.update()` dezentral aufgerufen — Refactoring**  
-  In v3.0.9.2 wurde `_power_smoother.update()` an zwei Stellen in `decide()` aufgerufen: Morgen-Notladung und PV-Überschuss (Schritt 6). Beide Pfade teilten sich denselben Smoother-State, ohne dass das strukturell erzwungen wurde. Bei zukünftigen Erweiterungen bestand die Gefahr eines echten Doppelaufrufs.  
-  → Fix: `update()` wird jetzt **einmal zentral** am Anfang von `decide()` aufgerufen, vor allen Verzweigungen. Alle nachfolgenden Blöcke (Morgen-Notladung, PV-Überschuss, Trickle, Warten) nutzen dieselben geglätteten Werte (`pv_w`, `load_w`, `surplus_w`). Keine Fragilität mehr.
-
-- **`ChargeController.__init__()`: `_power_smoother` außerhalb des Hauptblocks**  
-  In v3.0.9.2 wurde `_power_smoother` nach dem Haupt-Init-Block (nach `_balancing_reset_date`) instanziiert. Stilistisch unordentlich, Wartbarkeit leidet.  
-  → Fix: `_power_smoother` ist jetzt im Haupt-Init-Block, vor `_balancing_reset_date`.
-
-### Changed
-- **`decide()`: Morgen-Notladung ohne Überschuss — konfigurierbar**  
-  In v3.0.9.2 wurde bei fehlendem PV-Überschuss im Morgenfenster immer `trickle_a` zurückgegeben (statt 0 A). Das verhindert zwar Oszillation, lädt aber auch um 6:30 Uhr ohne jede PV-Erzeugung mit 5 A (~240 W) aus dem Netz — eine Verhaltensänderung gegenüber dem ursprünglichen Design (0 A = warte auf PV).  
-  → Fix: Neuer optionaler Config-Parameter `charging.morning_trickle_on_no_pv` (Default: `true`). Bei `true` = trickle bei fehlendem Überschuss (v3.0.9.2-Verhalten). Bei `false` = 0 A, warte auf PV (ursprüngliches Verhalten). Rückwärtskompatibel: fehlender Eintrag = `true`.
-
-### Added
-- **Config-Option `charging.morning_trickle_on_no_pv`** (optional, Default `true`): Steuert ob bei Morgen-Notladung ohne PV-Überschuss trickle geladen oder gewartet wird.
+Changed:
+- `decide()`: Pfad 6 (PV-Überschuss außerhalb Optimal-Fenster) und
+  Pfad 7 (Trickle) entfernt, ersetzt durch einfachen Block:
+  `soc < dyn_target → charge_a = max_a, mode="charging"`.
+  Begründung: 200W-Schwelle verursachte ständiges Flackern (3A ↔ 10A)
+  bei wolkenbedingten Schwankungen. Victron ESS/DVCC begrenzen automatisch.
 
 ---
 
-## [3.0.9.2] – 2026-05-31
+## v3.0.9.24 (2026-06-10)
 
-### Fixed
-- **`run_cycle()`: `force_new` deaktiviert Hysterese bei knapp unter `min_soc`**  
-  Wenn der SOC knapp unter `min_soc` lag (z.B. 19 % bei `min_soc = 20 %`), wurde bei **jedem Zyklus** (jede Minute) eine komplett neue Entscheidung erzwungen (`force_new = True`). Die konfigurierte Hysterese (`min_charge_duration_minutes`, default 10 Minuten) war damit wirkungslos. `decide()` lieferte bei jedem Zyklus einen neuen Zielstrom basierend auf ungeglätteten Momentanwerten (PV-Leistung, Last, ESS-State). Die `_ramp()` konnte diesem Ziel nicht folgen und erzeugte das wellenartige Hoch-/Runterfahren (z.B. 10→20→30→20→30→40→30→20→10→0 A).  
-  → Fix: `force_new` wird erst bei deutlicher Unterschreitung (`min_soc - 2 %`) sofort ausgelöst. Knapp darunter nur noch alle **2 Minuten** neu entschieden (nicht jede Minute). Die 10-Minuten-Hysterese kann endlich wirken.
-
-- **`decide()`: Morgen-Notladung als harter 0/50-A-Schalter**  
-  Die Bedingung `if pv_w > load_w + 200: return max_a else: return 0` war ein harter Ein/Aus-Schalter. Wenn eine Wolke vorbeizog oder der Kühlschrank ansprang (`load_w` stieg kurz), fiel die Entscheidung innerhalb einer Minute von 50 A auf 0 A. Dann rampte `_ramp()` 5 A pro Zyklus runter. Wolke weg → wieder hoch. Das erklärte exakt das Log-Muster (10→20→30→20→30→40→30→20→10→0…).  
-  → Fix: Statt `max_a` wird der **proportionale Überschussstrom** geladen (`surplus_a = surplus_w / nom_v`), nie unter `trickle_a` (z.B. 5 A). Kurze Wolken oder Lastspitzen führen nicht mehr zum sofortigen Abschalten. Der Sollwert bleibt in einem stabilen Band statt zwischen 0 und 50 A zu springen.
-
-- **`decide()`: PV-Überschuss basiert auf ungeglätteten Momentanwerten**  
-  Der Ladestrom wurde direkt aus dem **aktuellen** PV-Überschuss berechnet (`pv_power_w - load_power_w`). Bei wechselhaftem Wetter oszillierte der Sollwert ständig. Kombiniert mit `force_new` (weil SOC < min_soc) entstand das Ping-Pong.  
-  → Fix: Neue Klasse `PowerSmoother` mit gleitendem Durchschnitt über **3 Zyklen** (konfigurierbar via `power_smooth_window_cycles` in `config.yaml`, Default 3). PV- und Last-Leistung werden geglättet, bevor der Überschuss berechnet wird. Ein kurzer Wolkenbruch (1 Zyklus = 1 Minute) wird auf 1/3 des Wertes gedämpft. Der Ladestrom sinkt sanft statt abrupt. Bei dauerhaftem Wetterwechsel reagiert er trotzdem innerhalb von 3 Zyklen voll. Der Glättungspuffer wird bei **Tageswechsel automatisch geleert**.
-
-### Added
-- **`PowerSmoother`**: Gleitender Durchschnitt für PV- und Last-Leistung. Geglättete Werte für stabileren Ladestrom ohne Reaktionsverlust.
-- **Config-Option `charging.power_smooth_window_cycles`** (optional, Default 3): Anzahl der Zyklen für die Glättung. 1 = keine Glättung, 3 = empfohlen, 5 = sehr träge.
-
-### Notes
-- Fix C (ESS-State-Hysterese) wurde bewusst **nicht** umgesetzt. Victron hat interne Hysterese für State 10↔11 (mindestens +3 % SOC), ein zusätzlicher Software-Timer ist überflüssig.
-- Die drei Fixes (A, B, D) greifen zusammen: **A** gibt der Hysterese Zeit zu wirken, **B** verhindert das harte Ein/Aus-Schalten, **D** dämpft kurzzeitige Messwertschwankungen.
+Changed:
+- `_simulate_hour()`: bei `action=idle` und `SOC > floor_soc` wird jetzt
+  `current_a = min_charge_current` (z.B. 3 A) statt 0,0 A verwendet.
+  Physikalisch korrekt: Reg. 2705 steht auch im idle-Zustand auf
+  mindestens `min_charge_current`. SOC steigt leicht (~1 %/h bei 3 A / 48 V / 100 Ah).
+  Ausnahme: `SOC <= floor_soc` → `current_a=0`, SOC eingefroren (ESS State 11/12).
+- `_apply_deficit()` gibt jetzt 3-Tupel `(action, current_a, new_soc)` zurück
+  (vorher 2-Tupel). Alle internen Aufrufe angepasst.
 
 ---
 
-## [3.0.9] – 2026-05-30
+## v3.0.9.23 (2026-06-10)
 
-### Added
-- **Morgen-Verzögerung dynamisch (Sonnenaufgang)**  
-  `morning_delay_start_hour` / `morning_delay_end_hour` entfallen. Stattdessen neuer Parameter `morning_delay_h` (Default: 4h). Das Morgenfenster beginnt jetzt automatisch beim Sonnenaufgang (GPS+Datum) und dauert `morning_delay_h` Stunden. `effective_morn_e = max(morn_e, opt_start)` bleibt erhalten, damit keine Lücke zum Optimal-Fenster entsteht.
-
-- **`_get_optimal_charge_window()`: Dynamischer Sonnenhöchststand**  
-  Bisher hardcoded `noon = 13`. Jetzt wird der Sonnenhöchststand aus `_calculate_sun_times()` übernommen (lokale Zeit, gerundet). Sommer-/Winterzeit und Längengrad werden korrekt berücksichtigt. `solar_noon_offset_hours` bleibt konfigurierbar.
-
-- **`ForecastManager._calculate_sun_times()`**: Astronomische Berechnung von Sonnenaufgang/-untergang aus GPS-Koordinaten und Datum (vereinfachte NOAA-Formel, Fehler < 2 Min). Sommer-/Winterzeit wird via `zoneinfo` korrekt berücksichtigt.
-- **Dashboard-Header**: Versionsnummer `v3.0.9` wird jetzt im Titel und Footer angezeigt.
-
-### Changed
-- **`_get_dynamic_night_window()`**: Fallback komplett auf astronomische Zeiten umgestellt. Entfernt die statischen Config-Werte `night_start_hour` / `night_end_hour`. Clamps sind nun weich (±3h um Sonnenauf-/untergang) statt harter 16–21 / 6–10 Uhr.
-- **`ChargeController._is_night()`**: Nutzt jetzt ebenfalls `_calculate_sun_times()` statt der statischen Config-Werte. Nacht-Erkennung passt sich somit automatisch jahreszeitlich an (z.B. 17–08h im Dezember, 21–05h im Juni).
-- **Config (`config.yaml`)**: Felder `night_start_hour`, `night_end_hour` und `default_night_consumption_kwh` entfernt. Werden nicht mehr benötigt.
-
-### Notes
-- Jahreszeitliche Nachtfenster-Beispiele (Stuttgart): Dez 17–08h (15h), Jun 21–05h (8h), Mär 19–07h (12h).
-- Die dynamische PV/Verbrauchs-Logik (PV < Verbrauch ab 12 Uhr / PV > Verbrauch vor 12 Uhr) bleibt erhalten und modifiziert das astronomische Fenster fein.
+Fixed:
+- `build_schedule()`: `planned_current_a` universell korrekt berechnet.
+  Formel: `min(surplus_current_a, max(current_a, min_charge_current))` für alle Stunden.
+  Bisher wurde bei idle-Stunden mit positivem Überschuss `surplus_current_a`
+  ungecappt ausgegeben (z.B. +28 A statt +3 A).
 
 ---
-## Aeltere Changes Log gelöscht
 
+## v3.0.9.22 (2026-06-09)
 
+Changed:
+- Ladeplanung: `charge_current_a` zeigt jetzt tatsächlichen/erwarteten
+  Stromfluss (signed) statt Reg-2705-Setpoint.
+  Vergangenheit: Integration Reg. 842 (`battery_power_w`) → Wh / nom_v = mittlerer Strom [A].
+  Zukunft: `min(surplus_kwh * 1000 / nom_v, setpoint_a)`.
+- `EnergyAccumulator`: neues Feld `bat_wh` (signed Wh, + = Laden).
+- `HourlyHistory`: neue Felder `_hour_start_bat_wh`, `bat_energy_wh`.
+- Dashboard: Spalte "Strom" mit Vorzeichen, grün/rot für Laden/Entladen.
+
+---
+
+## v3.0.9.21 (2026-06-09)
+
+Fixed:
+- `_simulate_hour()`: verwendete `max(0.0, ...)` statt `max(floor_soc, ...)`
+  im Notfall-SOC-Block → Simulation unterschritt Reg 2901 ESS MinimumSocLimit.
+
+---
+
+## v3.0.9.20 (2026-06-08)
+
+Fixed:
+- Trickle-Pfad griff auch bei vorhandenem PV-Überschuss: `decide()` Pfad 7
+  hatte keinen Überschuss-Check. Fix: Guard `raw_surplus_w < 200 W`.
+- Hysterese fror falsche Entscheidung ein: `force_new` jetzt auch bei
+  `grid_power_w < -1000 W` (massiver Export) und bei evcc-Statuswechsel.
+
+---
+
+## v3.0.9.19 (2026-06-07)
+
+Fixed:
+- Heartbeat-Thread erhielt `NameError` weil `dedup_stream` nicht in
+  `start_dashboard()` sichtbar war. Fix: als Parameter übergeben.
+  Ergebnis: Journal zeigt alle 20 Minuten `[IDLE]`-Heartbeat unabhängig
+  von Browser-Aktivität.

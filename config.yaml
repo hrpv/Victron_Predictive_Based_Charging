@@ -33,6 +33,17 @@ battery:
  target_soc_normal: 80 # (veraltet, bleibt für Rückwärtskompatibilität)
  target_soc_full: 98 # Vollladen-Ziel [%]
  full_charge_interval_days: 10 # Spätestens alle N Tage auf max_soc laden (Zellbalancing)
+ # v3.0.13: Vollladung gilt erst als erreicht, wenn SOC >= 98% UND
+ # battery_voltage >= full_charge_min_voltage gleichzeitig anliegen.
+ # Reiner SOC-Wert reicht nicht (flache Spannungskurve bei LiFePO4 um 98% SOC,
+ # ein kurzer SOC-Peak ohne erreichte Zellspannung ist kein abgeschlossener
+ # Balancing-Zyklus, siehe CHANGELOG v3.0.13.0).
+ full_charge_min_voltage: 55.0 # [V] Trigger-Schwelle, passend zu 16S LiFePO4 (Vollladung ca. 54,4-56V)
+ # Hysterese für das HALTEN der Trickle-Phase (nicht für den Trigger selbst):
+ # während balancing_hold_hours darf battery_voltage nicht unter
+ # (full_charge_min_voltage - full_charge_voltage_hysteresis) fallen,
+ # sonst bricht der Hold sofort ab und days_since_full_charge bleibt unverändert.
+ full_charge_voltage_hysteresis: 0.1 # [V] z.B. 55.0V Trigger -> 54.9V Abbruchschwelle
  min_charge_current: 0 # Minimaler Ladestrom [A]
  max_charge_current: 50 # Maximaler Ladestrom [A]
  # Stromstärke für Laden nach Fullcharge-Cycle SOC >= 98% 
@@ -111,6 +122,14 @@ charging:
  # power_smooth_window_cycles: 3   # 1 = keine Glättung, 3 = Default, 5 = sehr träge
  # optional, Default: 10 A ab v3.0.9.7
  # optimal_window_min_current_a: 10  # Mindeststrom im Optimal-Fenster
+
+ # --- Winterpause: Regelung komplett aussetzen ---
+ # Zwischen winter_pause_start und winter_pause_end (MM-DD, jahresunabhängig,
+ # läuft über den Jahreswechsel) wird einmalig max_charge_current geschrieben
+ # und danach KEINE Regelung mehr vorgenommen (kein Management, kein weiterer Write).
+ winter_pause_enabled: false
+ winter_pause_start: "11-01"
+ winter_pause_end: "02-28"
 
 # --- Dashboard / Web GUI ---
 dashboard:
