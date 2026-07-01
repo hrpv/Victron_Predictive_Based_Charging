@@ -392,7 +392,7 @@ mkdir -p /home/pi/solar_battery
 # install.sh          – Installationsskript
 ```
 
-### ab Version 3.0.10.5 ff: alle *.py Dateien aus dem Verzeichnis 3.0.10.5/ des Repos kopieren:
+### ab Version 3.0.10.5 ff: alle *.py Dateien des Repos kopieren
 
 ```bash
 # battery_manager.py  – Einstiegspunkt / Hauptskript
