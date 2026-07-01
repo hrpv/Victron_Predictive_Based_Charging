@@ -1,3 +1,5 @@
+> Letzter Stand vor Aufteilung in mehrere Module (veraltete Version)
+
 # Changelog — battery_manager.py
 
 
