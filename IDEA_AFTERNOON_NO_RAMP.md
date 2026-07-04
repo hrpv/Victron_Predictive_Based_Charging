@@ -45,18 +45,22 @@ Zeitfenster.
   diesem Fenster nicht der limitierende Faktor — der Verbrauch übersteigt die
   verfügbare Gesamtleistung. Ein Verzicht auf das Hochrampen (Strom halten statt weiter
   zu rampen) würde den SOC-Verlauf daher vermutlich kaum verschlechtern.
-- **Write-Ersparnis quantifiziert:** Im Beobachtungszeitraum verursachten die
-  Nachmittag-Ramp-Episoden im ≤3.5h-Fenster 39 echte Modbus-Writes über 14 Episoden
-  (~2.6 Writes/Tag im Schnitt). Das sind nur **~1.9% aller 2107 Writes** im
-  Log-Zeitraum — hochgerechnet ~900–950 Writes/Jahr. Die Ersparnis ist real, aber
-  klein; der Hauptnutzen der Änderung wäre nicht der Flash-Schutz selbst (da anderswo,
-  z. B. IDLE/TRICKLE-Feinjustierung, deutlich mehr Writes anfallen), sondern dass sie
-  SOC-neutral ist.
+- **Write-Ersparnis quantifiziert (korrigiert 04.07.2026):** Erste Zählung basierte
+  fälschlich auf dem `[KEIN WRITE]`-Tag, das nur im Nachmittag-Block konsequent gesetzt
+  wird — dadurch wurden IDLE/TRICKLE-Zeilen massiv als "Write" fehlgezählt (Ergebnis
+  damals: 2107 Gesamt-Writes, Fenster-Anteil 1.9%). Korrekte Zählung anhand der
+  eindeutigen Log-Zeile `Modbus WRITE MaxChargeCurrent = X A`:
+  - **Gesamt echte Modbus-Writes im Log (15 Tage, 20.06.–04.07.): 185**, im Schnitt
+    **~12–13.5 Writes/Tag** (13.5/Tag über die 13 vollständigen Tage).
+  - Davon entfallen **37 Writes (~20%)** auf Nachmittag-Ramp-Episoden im
+    ≤3.5h-vor-Sonnenuntergang-Fenster.
+  - Die geplante Änderung würde also **rund ein Fünftel** aller täglichen Writes
+    einsparen — deutlich mehr als ursprünglich angenommen, kein marginaler Effekt mehr.
 
 ## Entscheidung (Stand 04.07.2026)
 
-Änderung wird vorerst **nicht umgesetzt**. Der Nutzen (kleine Write-Ersparnis,
-SOC-neutral) rechtfertigt aktuell nicht den Aufwand/das Risiko einer Codeänderung.
-Idee bleibt für später festgehalten, falls sich die Priorität ändert oder weitere Daten
-den ~3–3.5h-Schwellenwert erhärten. Die Implementierung selbst gilt als einfach, sobald
-die Datenlage klar ist.
+Änderung wird vorerst **nicht umgesetzt**, obwohl die korrigierte Write-Ersparnis
+(~20% aller Writes) deutlich relevanter ist als ursprünglich berechnet. Vor einer
+Umsetzung sollte der Schwellenwert (~3–3.5h statt 2h vor SU) und die SOC-Neutralität
+noch anhand weiterer Tage bestätigt werden. Die Implementierung selbst gilt als
+einfach, sobald die Datenlage klar ist.
