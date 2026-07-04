@@ -98,7 +98,7 @@ charging:
  # Minimale Ladedauer bevor Entscheidung neu getroffen wird [Minuten]
  min_charge_duration_minutes: 10
  # Strom-Rampe: Änderung pro Schritt [A] (sanftes Hochfahren)
- current_ramp_step: 10
+ current_ramp_step: 20
  # Durchschnittlicher Tagesverbrauch [kWh]. Wird für stündlichen Verbrauchs-Fallback
  # (Open-Meteo/Solcast/Dummy) und Nachtverbrauchsberechnung verwendet.
  avg_daily_consumption_kwh: 12.0
