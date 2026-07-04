@@ -57,6 +57,33 @@ Zeitfenster.
   - Die geplante Änderung würde also **rund ein Fünftel** aller täglichen Writes
     einsparen — deutlich mehr als ursprünglich angenommen, kein marginaler Effekt mehr.
 
+## Verteilung aller 185 Writes nach Auslöser (04.07.2026)
+
+| Kategorie | Writes | Anteil |
+|---|---:|---:|
+| Nachmittag | 50 | 27.0% |
+| Ziel erreicht (Ramp-down zurück auf Idle-Strom) | 37 | 20.0% |
+| Morgen (inkl. 2× Morgen-Notladung) | 31 | 16.8% |
+| Optimal-Fenster (gesamt) | 35 | 18.9% |
+| &nbsp;&nbsp;└ H11 | 15 | 8.1% |
+| &nbsp;&nbsp;└ H15 | 10 | 5.4% |
+| &nbsp;&nbsp;└ H14 | 6 | 3.2% |
+| &nbsp;&nbsp;└ H12 | 3 | 1.6% |
+| &nbsp;&nbsp;└ H13 | 1 | 0.5% |
+| Nacht | 13 | 7.0% |
+| ESS State (Notfall, State 11) | 7 | 3.8% |
+| Cellbalancing | 7 | 3.8% |
+| FULL_CHARGE (Vollladung fällig) | 3 | 1.6% |
+| ohne eindeutigen Kontext | 2 | 1.1% |
+
+Einordnung: Nachmittag ist der größte Einzelblock (27%), dicht gefolgt von den
+"Ziel erreicht"-Ramp-downs (20% — das Gegenstück zum Hochrampen, wenn der Strom nach
+Erreichen des SOC-Ziels wieder auf Idle zurückgefahren wird und von der hier
+vorgeschlagenen Änderung nicht betroffen wäre). Optimal-Fenster (alle Stunden
+zusammen, ~19%) und Morgen (~17%) sind ähnlich groß. FULL_CHARGE selbst verursacht
+mit nur 3 Writes kaum Last, da die Vollladung meist einmal anläuft und dann stabil
+bei 50A bleibt.
+
 ## Entscheidung (Stand 04.07.2026)
 
 Änderung wird vorerst **nicht umgesetzt**, obwohl die korrigierte Write-Ersparnis
