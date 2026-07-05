@@ -864,11 +864,35 @@ class ChargeController:
                 # soc_sim <= floor_soc: SOC eingefroren
             return action, current_a, soc_sim
 
-        if needs_full and soc_sim >= max_soc - hyst:
-            # v3.0.11.4: Balancing-Haltezeit simulieren (Trickle-Pfad).
-            # decide() haelt trickle_current fuer balancing_hold_hours; die Simulation
-            # kennt _balancing_hold_until nicht, modelliert es vereinfacht als:
-            # sobald soc_sim >= max_soc - hyst -> trickle_current fuer diese Stunde.
+        # ── Vollladungs-Pfad (v3.0.13.4) ──────────────────────────────────────
+        # An decide() Block 3 gekoppelt: decide() erzwingt max_a immer dann, wenn
+        # dyn_target >= 98.0 - UNABHAENGIG davon, ob dieser Zielwert durch das
+        # Vollladungs-Intervall (_needs_full_charge) ODER durch hohen Nachtverbrauch
+        # zustande kommt (_calculate_target_soc deckelt beide Faelle auf 98 %).
+        # Bisher gate-te die Simulation ausschliesslich auf needs_full (reines
+        # Intervall-Kriterium). An Tagen, an denen der 98-%-Zielwert nur vom
+        # Nachtverbrauch getrieben ist (needs_full == False), lief die Simulation
+        # deshalb in die normale Optimal-Fenster-/Deficit-Logik und zeigte PAUSE
+        # bzw. eine 20-A-Rampe, waehrend die Realsteuerung durchgaengig max_a hielt
+        # (Symptom: SOC-Trajektorie und Aktion im Ladeplan passten nicht zur
+        # Realitaet).
+        #
+        # Die Simulation kann die Batteriespannung nicht abbilden, spiegelt aber das
+        # SOC-Kriterium exakt: max_a bis soc_sim >= 98 %, danach Trickle-Hold. Der
+        # Spannungsanteil (U >= full_charge_min_voltage) von decide()s
+        # full_charge_complete entfaellt in der Projektion notgedrungen -> der Plan
+        # kann den Uebergang max_a -> Trickle geringfuegig frueher zeigen als die
+        # Realsteuerung, die zusaetzlich auf 55 V wartet. Die alte 96-%-Grenze
+        # (max_soc - hyst) entfaellt; sie hatte denselben 2-%-Frueh-Uebergang wie
+        # der in v3.0.13.1 in decide() beseitigte Luecken-Bug.
+        # needs_full bleibt referenziert (Intervall-Fall ist Teilmenge von >=98 %).
+        target_full = dyn_target >= 98.0 or needs_full
+        full_soc_reached = soc_sim >= 98.0
+
+        if target_full and full_soc_reached:
+            # Trickle-Hold (Cellbalancing) - decide() haelt hier trickle_current.
+            # Die Simulation kennt _balancing_hold_until nicht und modelliert die
+            # Haltephase vereinfacht: sobald soc_sim >= 98 % -> trickle_current.
             trickle_a = float(self.bat.get("trickle_current", 5))
             trickle_kwh = trickle_a * nom_v / 1000.0
             deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
@@ -876,7 +900,7 @@ class ChargeController:
             new_soc = max(floor_soc, min(max_soc, new_soc))
             return "full_charge", trickle_a, new_soc
 
-        if needs_full and soc_sim < max_soc - hyst:
+        if target_full and not full_soc_reached:
             if fc.net_kwh > 0:
                 # PV-Ueberschuss: Akku laden (Vollladung/Balancing)
                 action = "full_charge"
@@ -884,11 +908,11 @@ class ChargeController:
                 charge_kwh = min(fc.net_kwh, max_charge_kwh)
                 soc_sim = min(max_soc, soc_sim + (charge_kwh / cap) * 100)
             else:
-                # Kein PV-Ueberschuss und SOC >= floor_soc:
-                # Victron ESS sperrt Batterieentladung unter floor_soc (Reg 2901) —
-                # Verbraucher werden aus dem Netz gespeist, Batterie weder geladen
-                # noch entladen. SOC friert bei floor_soc ein.
-                # Vollladung wird naechsten Tag / bei ausreichend PV nachgeholt.
+                # Kein PV-Ueberschuss: Setpoint bleibt max_a (decide() schreibt ihn
+                # ebenfalls in Block 3), aber ESS laedt nur aus PV, nicht aus dem
+                # Netz. Ohne PV deckt der Akku die Last -> SOC sinkt um das Defizit,
+                # begrenzt durch floor_soc (Reg 2901 Entladesperre). Entspricht der
+                # naechtlichen VOLLLADUNG-mit-SOC-Abfall-Darstellung der History.
                 action = "full_charge"  # Soll-Aktion bleibt (Setpoint wird geschrieben)
                 current_a = max_a       # Setpoint bleibt, aber Netz laedt nicht in Batterie
                 if soc_sim > floor_soc:

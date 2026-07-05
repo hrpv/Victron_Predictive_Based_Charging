@@ -3,6 +3,57 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.13.4 — Fix: Ladeplan-Simulation ignoriert nachtverbrauchsgetriebene Vollladung (2026-07-05)
+
+Symptom: An Tagen, an denen `decide()` durchgehend `max_charge_current` (50A)
+hält, weil `dyn_target` = 98% ist, zeigte der stündliche Ladeplan
+(`build_schedule` / `_simulate_hour`) stattdessen die normale
+Optimal-Fenster-Logik: PAUSE in den Vormittagsstunden, dann eine 20A-Rampe
+(`reduced_charge_current_a`), Übergang auf 50A erst spät am Nachmittag. Die
+projizierte SOC-Kurve und die Aktions-Labels passten damit nicht zur
+Realsteuerung, die von Beginn an 50A anlegte.
+
+Root Cause: `decide()` (Block 3) erzwingt `max_a`, sobald **`dyn_target >= 98.0`**
+— unabhängig davon, ob dieser Zielwert aus dem Vollladungs-Intervall
+(`_needs_full_charge`) ODER aus dem Nachtverbrauchspfad
+(`night_cons / capacity`, gecappt auf 98%) stammt. `_simulate_hour()` gatete
+seinen Vollladungs-Zweig jedoch ausschließlich auf `needs_full`, also auf das
+reine **Intervall**-Kriterium (`days_since_full_charge >= full_charge_interval_days`).
+
+An einem Tag, an dem der 98%-Zielwert allein vom Nachtverbrauch getrieben ist
+(`days_since_full_charge < interval` → `needs_full == False`), fiel die
+Simulation deshalb durch den Vollladungs-Zweig hindurch in die normale
+adaptive Planung — während `decide()` real 50A hielt.
+Konkreter Auslöser im Feld: `last_full_charge_date` 2026-06-28,
+`days_since_full_charge` = 7, `full_charge_interval_days` = 10 (Intervall-Vollladung
+erst am 2026-07-08 fällig), aber Nachtverbrauch 11.7 kWh / 14.0 kWh Kapazität
+hob `dyn_target` bereits auf 98%. Dass die Vollladung durch den Nachtverbrauch
+früher als das Intervall getriggert wird, ist gewolltes Verhalten — lediglich
+die Ladeplan-Projektion zog nicht mit. Es ist dasselbe „`dyn_target` = 98 aus
+Nachtverbrauch statt aus dem Intervall"-Phänomen, das bereits v3.0.13.3
+zugrunde lag, hier auf den Simulationspfad übertragen.
+
+Fixed:
+- `controller.py` (`_simulate_hour`): Der Vollladungs-Zweig gatet jetzt auf
+  `target_full = dyn_target >= 98.0 or needs_full` — exakt die Bedingung, die
+  auch `decide()` Block 3 auslöst. `needs_full` (Intervall) ist dabei eine
+  Teilmenge und bleibt referenziert.
+- Übergangsschwelle von `max_soc - hyst` (typ. 96%) auf **98%**
+  (`soc_sim >= 98.0`) angehoben — beseitigt denselben 2%-Früh-Übergang
+  max_a → Trickle, den v3.0.13.1 bereits in `decide()` geschlossen hatte.
+
+Bewusste Restunschärfe: Die Simulation kennt `battery_voltage` nicht und kann
+den Spannungsanteil (`U >= full_charge_min_voltage`) von `decide()`s
+`full_charge_complete` nicht abbilden. Der Plan kann den Übergang
+max_a → Trickle daher geringfügig früher zeigen als die Realsteuerung, die
+zusätzlich auf 55V wartet. Ohne Spannung in der Prognose nicht sauber lösbar.
+
+Nicht geändert: `decide()`, `run_cycle()`, Auto-Reset-Logik und die
+Trigger-/Hold-Bedingungen bleiben unverändert; der Fix betrifft ausschließlich
+die Projektion des Ladeplans.
+
+---
+
 ## v3.0.13.3 — Fix: Mehrfacher Cellbalancing-Hold am selben Tag (2026-06-28)
 
 Symptom: Nach einem vollständig durchlaufenen Cellbalancing-Hold (10:54–12:53,
