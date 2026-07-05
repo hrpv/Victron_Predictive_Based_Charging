@@ -3,6 +3,47 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.13.5 — Fix: TypeError (datetime - None) im Auto-Reset bei abgeschlossenem Balancing (2026-07-05)
+
+Symptom: Laufzeit-Absturz in `run_cycle()`:
+`TypeError: unsupported operand type(s) for -: 'datetime.datetime' and 'NoneType'`
+in `elapsed = (datetime.now() - self._soc_98_reached_at).total_seconds()`.
+
+Root Cause: Regression aus v3.0.13.3. Der Auto-Reset-Block hatte die Form
+`if _soc_98_reached_at is None and not _balancing_completed_today: <Timer starten>
+else: <elapsed berechnen>`. Der `else`-Zweig setzte implizit voraus, dass
+`_soc_98_reached_at` gesetzt ist — was vor 13.3 auch galt (else wurde nur bei
+laufendem Timer erreicht). Mit der in 13.3 hinzugefuegten Sperre
+`_balancing_completed_today` entstand ein dritter Zustand:
+`_soc_98_reached_at is None` UND `_balancing_completed_today is True`. Dann ist
+die if-Bedingung `False` (wegen der Sperre) und der Ablauf faellt in den
+`else`-Zweig, obwohl der Timer `None` ist -> Subtraktion `datetime.now() - None`.
+
+Ablauf im Feld (2026-07-05): Vollladungstag, SOC>=98% & U>=55V -> Auto-Reset
+nach 1h setzt `days_since_full_charge = 0` und `_soc_98_reached_at = None`; der
+5h-Cellbalancing-Hold laeuft danach natuerlich ab und `decide()` setzt
+`_balancing_completed_today = True`. SOC/U bleiben den restlichen Tag
+>=98%/55V -> jeder weitere `run_cycle` trifft exakt den dritten Zustand ->
+Crash. Am 28.06. (13.3-Release) trat das nicht auf, weil `battery_voltage`
+nachmittags um 55V pendelte (54.7-55.2V); bei jedem Dip unter 55V griff der
+aeussere `else`-Zweig und der kritische Pfad wurde nie erreicht. Ein stabil
+ueber 55V gehaltener Nachmittag legt den Bug frei.
+
+Fixed:
+- `controller.py` (`run_cycle`, Auto-Reset-Block): Verzweigung umstrukturiert.
+  `elapsed` wird jetzt ausschliesslich im Zweig `_soc_98_reached_at is not None`
+  berechnet (Timer laeuft). Timerstart nur noch via
+  `elif not _balancing_completed_today`. Der dritte Zustand
+  (`None` UND `completed`) ist ein expliziter No-op bis zum Mitternachts-Reset
+  von `_balancing_completed_today`.
+
+Verhalten sonst unveraendert: alle bisherigen Pfade (Timer laeuft / kein Timer
+und heute noch nicht abgeschlossen) verhalten sich identisch; ausschliesslich
+der bislang abstuerzende Zustand wird abgefangen. `decide()`, Trigger- und
+Hold-Logik bleiben unberuehrt.
+
+---
+
 ## v3.0.13.4 — Fix: Ladeplan-Simulation ignoriert nachtverbrauchsgetriebene Vollladung (2026-07-05)
 
 Symptom: An Tagen, an denen `decide()` durchgehend `max_charge_current` (50A)

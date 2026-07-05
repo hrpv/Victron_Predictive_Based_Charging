@@ -1375,17 +1375,8 @@ class ChargeController:
         soc_at_full = self.state.soc >= 98.0
         voltage_at_full = self.state.battery_voltage >= full_min_v
         if soc_at_full and voltage_at_full:
-            if self._soc_98_reached_at is None and not self._balancing_completed_today:
-                self._soc_98_reached_at = datetime.now()
-                # v3.0.1: Cellbalancing-Haltezeit starten.
-                # Nur starten wenn kein laufender Timer existiert (Zukunft).
-                # "== 0.0" reicht nicht: nach Auto-Reset (_soc_98_reached_at -> None)
-                # landen wir erneut hier -- ein noch laufender Timer darf nicht
-                # ueberschrieben werden (das wuerde den Countdown zuruecksetzen).
-                hold_h = self.bat.get("balancing_hold_hours", 5)
-                if self._balancing_hold_until <= time.monotonic():
-                    self._balancing_hold_until = time.monotonic() + hold_h * 3600
-            else:
+            if self._soc_98_reached_at is not None:
+                # Timer laeuft -> Fortschritt pruefen (>=1h stabil -> Auto-Reset).
                 elapsed = (datetime.now() - self._soc_98_reached_at).total_seconds()
                 if elapsed >= 3600 and self.state.days_since_full_charge > 0:
                     self.logger.info(
@@ -1396,6 +1387,25 @@ class ChargeController:
                     self.state.days_since_full_charge = 0
                     self._save_persistent()
                     self._soc_98_reached_at = None
+            elif not self._balancing_completed_today:
+                # Kein laufender Timer und heute noch kein abgeschlossener Zyklus
+                # -> Auto-Reset-Timer + Cellbalancing-Haltezeit starten.
+                self._soc_98_reached_at = datetime.now()
+                # v3.0.1: Cellbalancing-Haltezeit starten. Nur wenn kein Countdown
+                # laeuft ("== 0.0" reicht nicht: ein noch laufender Timer darf nicht
+                # ueberschrieben werden, das wuerde ihn zuruecksetzen).
+                hold_h = self.bat.get("balancing_hold_hours", 5)
+                if self._balancing_hold_until <= time.monotonic():
+                    self._balancing_hold_until = time.monotonic() + hold_h * 3600
+            # else (_soc_98_reached_at is None UND _balancing_completed_today):
+            # v3.0.13.5 - Cellbalancing heute bereits natuerlich abgeschlossen und
+            # Auto-Reset-Timer bereits genullt, SOC/U liegen aber weiterhin
+            # >=98%/55V. Kein neuer Timer, kein erneuter Reset -> No-op bis zum
+            # Mitternachts-Reset von _balancing_completed_today.
+            # (Fix TypeError: der alte gemeinsame else-Zweig rechnete
+            # datetime.now() - None, sobald das Balancing an einem Tag mit dauerhaft
+            # hoher Spannung abgeschlossen war; am 28.06. nur durch das Absinken von
+            # U unter 55V zufaellig nie getriggert.)
         else:
             # v3.0.13: SOC ODER Spannung unter Trigger-Schwelle. Fuer den
             # 60-Min-Auto-Reset-Timer (_soc_98_reached_at) gilt sofortiger
