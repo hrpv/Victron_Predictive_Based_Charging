@@ -378,7 +378,10 @@ class ForecastManager:
             from zoneinfo import ZoneInfo  # pylint: disable=import-outside-toplevel
             tz = ZoneInfo(tz_name)
             noon_local = datetime(dt.year, dt.month, dt.day, 12, 0, tzinfo=tz)
-            utc_offset_h = noon_local.utcoffset().total_seconds() / 3600.0
+            offset = noon_local.utcoffset()
+            if offset is None:
+                raise ValueError(f"utcoffset() lieferte None fuer tz={tz_name}")
+            utc_offset_h = offset.total_seconds() / 3600.0
         except Exception:
             utc_offset_h = 1.0  # Fallback CET
 
