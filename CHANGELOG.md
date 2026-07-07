@@ -3,6 +3,38 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.14.0 — Neues Feature: Kein Hochrampen kurz vor Sonnenuntergang (2026-07-07)
+
+Umsetzung der in `IDEA_AFTERNOON_NO_RAMP.md` zurückgestellten Idee, nachdem
+die zweite Log-Analyse (04.07.2026, 13 Tage) den ursprünglich vermuteten
+Effekt bestätigt hat: In den letzten ~3–3.5h vor Sonnenuntergang verhindert
+selbst `max_charge_current` (50A) den SOC-Abfall durch Abendverbrauch nicht
+mehr — Hochrampen bringt in diesem Fenster nichts, verursacht aber laut
+Analyse rund 20% aller täglichen Modbus-Writes.
+
+Added:
+- `config.yaml`: neue Keys `afternoon_no_ramp_enabled` (Default `false`) und
+  `afternoon_no_ramp_before_sunset_h` (Default `3.5`). Die Funktion ist per
+  Default deaktiviert — die Schwelle ist bisher nur an einem
+  Standort/Zeitraum bestätigt und muss explizit aktiviert werden.
+- `controller.py` (`decide`, Block 6 "Nachmittag"): Ist
+  `afternoon_no_ramp_enabled` aktiv und liegt die aktuelle Zeit innerhalb von
+  `afternoon_no_ramp_before_sunset_h` vor Sonnenuntergang, wird bei
+  `soc < dyn_target` nicht mehr auf `max_a` hochgerampt. Stattdessen liefert
+  `decide()` `(-1, "afternoon_hold", ...)` zurück — dieselbe "kein
+  Write"-Konvention wie bei `winter_pause` — und `run_cycle()` überspringt
+  den Schreib-Block komplett, der zuletzt geschriebene Ladestrom bleibt
+  unverändert aktiv. Außerhalb dieses Fensters (oder bei deaktiviertem
+  Feature) bleibt das bisherige Verhalten (Rampe auf `max_a`) unverändert.
+- Neuer `charge_mode`-Wert `afternoon_hold` fürs Dashboard/Logging, um diesen
+  Fall von normalem `charging` zu unterscheiden.
+
+Nicht geändert: `_simulate_hour()` / `build_schedule()` (Ladeplan-Projektion)
+bilden dieses Verhalten noch nicht ab — die Simulation zeigt weiterhin
+Hochrampen auf `max_a` im Nachmittagsfenster, unabhängig vom neuen Flag.
+
+---
+
 ## v3.0.13.5 — Fix: TypeError (datetime - None) im Auto-Reset bei abgeschlossenem Balancing (2026-07-05)
 
 Symptom: Laufzeit-Absturz in `run_cycle()`:

@@ -1,6 +1,7 @@
 # Idee: Kein Nachmittags-Hochrampen kurz vor Sonnenuntergang
 
-Status: **zurückgestellt, nicht umgesetzt** (Stand 04.07.2026)
+Status: **umgesetzt in v3.0.14.0** (Stand 07.07.2026), Default **deaktiviert**
+(`afternoon_no_ramp_enabled: false` in `config.yaml`) — siehe CHANGELOG.md.
 
 ## Vorschlag
 

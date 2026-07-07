@@ -754,6 +754,23 @@ class ChargeController:
         # wenn kein PV-Überschuss da ist  -  DVCC und ESS begrenzen den Strom
         # automatisch auf das, was PV tatsächlich liefert.
         if soc < dyn_target:
+            # v3.0.14.0 (optional, Default AUS - siehe IDEA_AFTERNOON_NO_RAMP.md):
+            # Kurz vor Sonnenuntergang verhindert selbst max_a den SOC-Abfall durch
+            # Abendverbrauch laut Log-Analyse nicht mehr - Hochrampen bringt in
+            # diesem Fenster nichts, kostet aber einen unnoetigen Modbus-Write.
+            # Statt auf max_a zu rampen: aktuellen Strom halten (target_a=-1,
+            # gleiche "kein Write"-Konvention wie winter_pause) bis Sonnenuntergang.
+            if self.cc.get("afternoon_no_ramp_enabled", False):
+                _, sunset, _ = self.forecast._calculate_sun_times(date.today())
+                h_now_dec = datetime.now().hour + datetime.now().minute / 60.0
+                before_sunset_h = sunset - h_now_dec
+                threshold_h = self.cc.get("afternoon_no_ramp_before_sunset_h", 3.5)
+                if 0.0 <= before_sunset_h <= threshold_h:
+                    return -1, "afternoon_hold", (
+                        f"Nachmittag: SOC {soc:.1f}% < Ziel {dyn_target:.0f}%, "
+                        f"aber {before_sunset_h:.1f}h vor Sonnenuntergang "
+                        f"(<= {threshold_h:.1f}h) -> kein Hochrampen, "
+                        f"halte aktuellen Ladestrom (afternoon_no_ramp_enabled)")
             return max_a, "charging", (
                 f"Nachmittag: SOC {soc:.1f}% < Ziel {dyn_target:.0f}% "
                 f"-> lade mit {max_a:.0f}A")

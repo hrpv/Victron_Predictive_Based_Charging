@@ -131,6 +131,19 @@ charging:
  winter_pause_start: "11-01"
  winter_pause_end: "02-28"
 
+ # --- v3.0.14.0: Kein Hochrampen kurz vor Sonnenuntergang ---
+ # Siehe IDEA_AFTERNOON_NO_RAMP.md. Log-Analyse (04.07.2026, 13 Tage) zeigt:
+ # in den letzten ~3-3.5h vor Sonnenuntergang verhindert selbst max_charge_current
+ # den SOC-Abfall durch Abendverbrauch nicht mehr - Hochrampen bringt in diesem
+ # Fenster nichts, kostet aber unnoetige Modbus-Writes (~20% aller Writes lt.
+ # Analyse). Ist der aktuelle Ladestrom bereits gesetzt, wird er nur noch
+ # gehalten (kein neuer Write) statt erneut auf max_charge_current hochgefahren.
+ # Default AUS: die 3-3.5h-Schwelle ist bisher nur an einem Standort/Zeitraum
+ # bestaetigt, muss explizit aktiviert werden.
+ afternoon_no_ramp_enabled: false
+ # Fenstergroesse vor Sonnenuntergang [Stunden], ab der nicht mehr hochgerampt wird.
+ afternoon_no_ramp_before_sunset_h: 3.5
+
 # --- Dashboard / Web GUI ---
 dashboard:
  enabled: true
