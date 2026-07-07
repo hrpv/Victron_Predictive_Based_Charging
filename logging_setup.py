@@ -130,7 +130,7 @@ class DeduplicatingFilter(logging.Filter):
 # Logging einrichten
 # ─────────────────────────────────────────────
 
-def setup_logging(cfg: dict) -> tuple[logging.Logger, DeduplicatingFilter, DeduplicatingFilter]:
+def setup_logging(cfg: dict) -> tuple[logging.Logger, Optional[DeduplicatingFilter], Optional[DeduplicatingFilter]]:
     """Konfiguriert Logger mit RotatingFileHandler und StreamHandler inkl. Deduplizierung."""
     log_cfg = cfg.get("logging", {})
     log_file = log_cfg.get("file", "battery_manager.log")
