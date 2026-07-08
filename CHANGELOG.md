@@ -3,6 +3,34 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.14.1 — Fix: `afternoon_no_ramp` griff nicht mehr direkt nach Sonnenuntergang (2026-07-08)
+
+Symptom (Log 08.07.2026): Um 21:50 Uhr Modbus-Write auf `MaxChargeCurrent = 50 A`
+trotz aktiviertem `afternoon_no_ramp_enabled`, 10 Minuten später (22:00) direkt
+wieder zurück auf 3A ("Nacht: kein Laden").
+
+Root Cause: Zwei unterschiedliche Zeitbegriffe für "Nacht" liefen auseinander.
+`_is_night()` rundet den Nachtbeginn auf volle Stunden auf (`math.ceil(sunset)`);
+bei Sonnenuntergang 21.3h begann "Nacht" für den Controller damit erst um 22:00,
+nicht um 21:18. Block 6 ("Nachmittag") rechnet dagegen mit der präzisen
+Dezimalzeit (`before_sunset_h = sunset - h_now_dec`) und verlangte zusätzlich
+`before_sunset_h >= 0.0`. Im Rest-Fenster zwischen dem tatsächlichen
+Sonnenuntergang und dem aufgerundeten `_is_night()`-Zeitpunkt (< 1h) wurde
+`before_sunset_h` negativ, die Bedingung schlug fehl, und `decide()` fiel
+zurück auf den alten Zweig (volles Rampen auf `max_a`) — exakt in dem Fenster,
+das die Funktion eigentlich abdecken soll.
+
+Fix: Untergrenze `0.0 <=` in Block 6 entfernt, Prüfung jetzt nur noch
+`before_sunset_h <= threshold_h`. Die Lücke ist durch `ceil()` auf < 1h
+begrenzt; sobald `_is_night()` (Block 1) tatsächlich greift, gibt `decide()`
+ohnehin schon vorher zurück, eine offene Untergrenze ist hier unkritisch.
+
+Nicht geändert: Die grundsätzliche Diskrepanz zwischen `_is_night()`
+(Stunden-Rundung) und der präzisen Dezimalzeit an anderen Stellen im Code
+besteht weiter fort und wurde hier nicht angefasst — siehe TODO.
+
+---
+
 ## v3.0.14.0 — Neues Feature: Kein Hochrampen kurz vor Sonnenuntergang (2026-07-07)
 
 Umsetzung der in `IDEA_AFTERNOON_NO_RAMP.md` zurückgestellten Idee, nachdem

@@ -765,7 +765,17 @@ class ChargeController:
                 h_now_dec = datetime.now().hour + datetime.now().minute / 60.0
                 before_sunset_h = sunset - h_now_dec
                 threshold_h = self.cc.get("afternoon_no_ramp_before_sunset_h", 3.5)
-                if 0.0 <= before_sunset_h <= threshold_h:
+                # v3.0.14.x Fix: keine Untergrenze bei 0.0 mehr. _is_night() rundet
+                # den Nachtbeginn auf volle Stunden auf (math.ceil(sunset)), daher
+                # gilt decide() bis zu ~1h NACH dem praezisen Sonnenuntergang noch
+                # als "Tag". In diesem Rest-Fenster wurde before_sunset_h negativ,
+                # die Bedingung schlug fehl und der Code fiel zurueck auf volles
+                # Rampen auf max_a - exakt in dem Moment, den die Funktion
+                # eigentlich abdecken soll (Log 2026-07-08 21:50: Write auf 50A,
+                # 10 Min. spaeter durch _is_night() wieder auf 3A). Sobald
+                # _is_night() greift, gibt Block 1 ohnehin schon vorher zurueck,
+                # daher ist eine offene Untergrenze hier unkritisch.
+                if before_sunset_h <= threshold_h:
                     return -1, "afternoon_hold", (
                         f"Nachmittag: SOC {soc:.1f}% < Ziel {dyn_target:.0f}%, "
                         f"aber {before_sunset_h:.1f}h vor Sonnenuntergang "
