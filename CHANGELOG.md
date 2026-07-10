@@ -3,6 +3,42 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.14.2 — Fix: Unnötiger Full-Ramp-Spike beim Übergang Optimal-Fenster → Nachmittag (2026-07-09)
+
+Symptom (Log 09.07.2026):
+```
+16:01:00  Modbus WRITE 27A  | Nachmittag: SOC 78.0% < Ziel 78% -> lade mit 50A
+16:02:01  Modbus WRITE  7A  | Ziel 78% erreicht (SOC 79.0%)
+16:03:01  Modbus WRITE  3A  | Ziel 78% erreicht (SOC 79.0%)
+```
+Drei Writes und ein kurzer Strom-Spike auf 27A für ein SOC-Defizit von
+deutlich unter 1 Prozentpunkt.
+
+Root Cause: `dyn_target` ist intern ein Float (z.B. 78.3%), das Log rundet
+für die Anzeige auf ganze Prozent ("Ziel 78%"). Block 6 "Nachmittag" prüfte
+bisher ungebremst `soc < dyn_target` und löste dafür sofort vollen Ramp auf
+`max_a` aus — auch wenn die Differenz nur im Nachkommastellenbereich lag.
+Eine Aktualisierung des SOC-Werts (hier: Sprung von 78.0% auf 79.0% durch die
+eine Ladeperiode) reichte bereits, um das Ziel zu erreichen und den Ramp
+sofort wieder zu kassieren.
+
+Der Rest des Codes folgt dafür bereits einem dokumentierten Muster
+("Asymmetrische Hysterese", siehe Kommentar bei "Ziel bereits erreicht"):
+Abschalten bei `soc >= dyn_target`, aber Nachladen erst unterhalb von
+`dyn_target - soc_hysteresis` (im Morgen-Block bereits so umgesetzt). Block 6
+wurde bei seiner Einführung in v3.0.14.0 ohne diese Marge gebaut.
+
+Fix: `if soc < dyn_target:` → `if soc < dyn_target - hyst:` in Block 6,
+konsistent mit dem bestehenden Hysterese-Muster.
+
+Trade-off (bewusst in Kauf genommen, ggf. anzupassen): Ein Rest-Defizit von
+bis zu `soc_hysteresis` (Default 2%) wird am Nachmittag jetzt nicht mehr
+aktiv nachgeladen, sondern fällt auf Block 7 ("Warten auf PV-Überschuss")
+durch. Das Sicherheitsnetz (Notladung bei `emergency_charge_soc`, Block 2)
+bleibt davon unberührt.
+
+---
+
 ## v3.0.14.1 — Fix: `afternoon_no_ramp` griff nicht mehr direkt nach Sonnenuntergang (2026-07-08)
 
 Symptom (Log 08.07.2026): Um 21:50 Uhr Modbus-Write auf `MaxChargeCurrent = 50 A`

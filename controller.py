@@ -753,7 +753,15 @@ class ChargeController:
         # schwankte. Victron ESS im Selbstverbrauchsmodus lädt nie aus dem Netz
         # wenn kein PV-Überschuss da ist  -  DVCC und ESS begrenzen den Strom
         # automatisch auf das, was PV tatsächlich liefert.
-        if soc < dyn_target:
+        if soc < dyn_target - hyst:
+            # v3.0.14.2 Fix: Hysterese-Marge ergaenzt (analog Morgen-Block Zeile
+            # ~630 und dem dokumentierten Hysterese-Muster oben bei "Ziel
+            # bereits erreicht"). Vorher stand hier nur "soc < dyn_target" -
+            # ein Bruchteil-Prozent-Rest (dyn_target ist Float, Log rundet nur
+            # die Anzeige) reichte, um vollen Ramp auf max_a auszuloesen, der
+            # eine Minute spaeter durch das naechste SOC-Update schon wieder
+            # obsolet war (Log 2026-07-09 16:01-16:03: 27A -> 7A -> 3A, drei
+            # Writes fuer ein SOC-Delta von deutlich unter 1%).
             # v3.0.14.0 (optional, Default AUS - siehe IDEA_AFTERNOON_NO_RAMP.md):
             # Kurz vor Sonnenuntergang verhindert selbst max_a den SOC-Abfall durch
             # Abendverbrauch laut Log-Analyse nicht mehr - Hochrampen bringt in
