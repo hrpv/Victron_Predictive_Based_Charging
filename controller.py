@@ -969,13 +969,25 @@ class ChargeController:
             tatsaechlich in die Batterie (~1 %/h bei 3 A / 48 V / 100 Ah).
             Die Simulation bildet das ab: current_a = min_charge_a, SOC steigt leicht.
             Ausnahme: soc <= floor_soc -> current_a = 0 (Entladesperre, kein Laden).
+
+            v3.0.14.3 Fix: trickle_kwh wurde bisher unabhaengig von fc.pv_kwh
+            angesetzt - auch nachts (PV=0), wo unmoeglich etwas nachladen kann.
+            Bei kleinen Defiziten (< trickle_kwh, z.B. nachts 20-23 Uhr) fuehrte
+            das dazu, dass der projizierte SOC einfror oder sogar leicht STIEG,
+            obwohl "discharging" angezeigt wurde (Dashboard 2026-07-09: SOC
+            22:00->23:00 blieb bei 83.7%, 20:00->21:00 stieg sogar von 83.5%
+            auf 84.2%, trotz negativem Ueberschuss in beiden Stunden). Victron
+            ESS laedt im Selbstverbrauchsmodus nie aus dem Netz (siehe Block 6
+            weiter oben) - der Trickle-Beitrag ist durch das tatsaechlich
+            verfuegbare PV der Stunde gedeckelt.
             """
             deficit = max(0.0, fc.consumption_kwh - fc.pv_kwh)
             act = "discharging" if fc.net_kwh < 0 else "idle"
             if soc > floor_soc:
-                # Trickle: min_charge_a fliesst, netto SOC-Aenderung =
-                # (min_charge_kwh - deficit_kwh), aber nie unter floor_soc.
-                trickle_kwh = min_charge_a * nom_v / 1000.0
+                # Trickle: min_charge_a fliesst NUR soweit PV das hergibt, netto
+                # SOC-Aenderung = (min(trickle_kwh, verfuegbares PV) - deficit_kwh),
+                # aber nie unter floor_soc.
+                trickle_kwh = min(min_charge_a * nom_v / 1000.0, max(0.0, fc.pv_kwh))
                 new_soc = soc + ((trickle_kwh - deficit) / cap) * 100
                 new_soc = max(floor_soc, new_soc)
                 new_soc = min(max_soc, new_soc)  # v3.0.11.2: SOC nie ueber max_soc (Simulation)

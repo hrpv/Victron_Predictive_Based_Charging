@@ -3,6 +3,29 @@
 Victron ESS / Multiplus II + Cerbo GX | Modbus TCP | Predictive Charging
 ---
 
+## v3.0.14.3 — Fix: Projizierter SOC in `_simulate_hour()` fror nachts bei kleinem Defizit ein (2026-07-09)
+
+Symptom (Dashboard-PDF, Ladeplan-Tabelle): In der letzten simulierten Stunde
+(23:00) sank der projizierte SOC trotz negativem Überschuss nicht. Bei
+genauerem Hinsehen auch: SOC stieg von 20:00 auf 21:00 sogar leicht an
+(83.5% -> 84.2%), obwohl beide Stunden als "ENTLADEN" markiert waren.
+
+Root Cause: `_apply_deficit()` rechnet in jeder Entladestunde pauschal einen
+`trickle_kwh`-Beitrag (`min_charge_a * nom_v`, 3A×48V = 0.144 kWh/h) gegen
+das Defizit, unabhängig davon, ob `fc.pv_kwh` in dieser Stunde überhaupt
+etwas liefert. Nachts ist PV=0 - dennoch floss der fiktive Trickle-Betrag
+in die Rechnung ein. Bei Defiziten kleiner als 0.144 kWh (z.B. nachts bei
+niedrigem Verbrauch) überstieg der fiktive Ladebeitrag das reale Defizit,
+wodurch der SOC in der Simulation einfror oder sogar stieg - obwohl der
+reale Controller nachts nie lädt (`decide()` Block 4: "Nacht: kein Laden",
+0A, vgl. Log vom 08./09.07., wo der SOC nachts durchgängig sinkt).
+
+Fix: Trickle-Beitrag jetzt auf das tatsächlich verfügbare PV der Stunde
+gedeckelt (`min(trickle_kwh, fc.pv_kwh)`). Nachts (PV=0) reduziert sich das
+automatisch auf reinen Entladepfad, keine explizite Nacht-Abfrage nötig.
+
+---
+
 ## v3.0.14.2 — Fix: Unnötiger Full-Ramp-Spike beim Übergang Optimal-Fenster → Nachmittag (2026-07-09)
 
 Symptom (Log 09.07.2026):
